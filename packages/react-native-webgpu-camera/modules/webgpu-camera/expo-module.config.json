@@ -1,0 +1,9 @@
+{
+  "platforms": ["ios", "android"],
+  "ios": {
+    "modules": ["WebGPUCameraModule"]
+  },
+  "android": {
+    "modules": ["expo.modules.webgpucamera.WebGPUCameraModule"]
+  }
+}

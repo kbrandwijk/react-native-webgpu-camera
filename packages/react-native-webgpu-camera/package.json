@@ -1,0 +1,26 @@
+{
+  "name": "react-native-webgpu-camera",
+  "version": "0.0.1",
+  "private": true,
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src/"
+  },
+  "peerDependencies": {
+    "react": "*",
+    "react-native": ">=0.83.0",
+    "react-native-wgpu": "^0.5.8",
+    "@shopify/react-native-skia": "*",
+    "react-native-reanimated": ">=4.2.1",
+    "react-native-worklets": ">=0.7.2",
+    "expo": ">=55.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "react-native-wgpu": "^0.5.8",
+    "@shopify/react-native-skia": "*",
+    "react-native-reanimated": ">=4.2.1"
+  }
+}
