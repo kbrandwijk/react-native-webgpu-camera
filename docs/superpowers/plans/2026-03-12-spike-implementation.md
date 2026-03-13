@@ -1606,9 +1606,6 @@ export default function CameraSpikeScreen() {
   const [results, setResults] = useState<SpikeResults | null>(null);
   const metrics = useSpikeMetrics();
   const pipeline = useGPUPipeline(CAMERA_WIDTH, CAMERA_HEIGHT);
-  const lastFrameCounter = useRef<number>(0);
-  const startTimeRef = useRef(0);
-
   // Shared values for worklet thread access (avoids stale closures)
   const isRunningRef = useSharedValue(false);
   // Use shared value (not React ref) so worklet can read recorder status
@@ -1756,8 +1753,8 @@ export default function CameraSpikeScreen() {
     setIsRunning(true);
     setResults(null);
     metrics.reset();
-    startTimeRef.current = performance.now();
-    lastFrameCounter.current = 0;
+    lastFrameCounterSV.value = 0;
+    startTimeSV.value = 0; // Will be set in startRenderLoop
 
     // Initialize GPU pipeline
     await pipeline.initialize();
