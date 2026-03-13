@@ -136,7 +136,7 @@ export function useGPUPipeline(width = 1920, height = 1080) {
 
     res.device.queue.writeTexture(
       { texture: res.inputTexture },
-      pixels,
+      pixels.buffer as ArrayBuffer,
       { bytesPerRow },
       { width: res.width, height: res.height },
     );

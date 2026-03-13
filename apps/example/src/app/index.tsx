@@ -101,14 +101,14 @@ export default function CameraSpikeScreen() {
         const w = workletResources.width.value;
         const h = workletResources.height.value;
 
-        if (pixels.length > 0 && dims.width > 0 && device && computePipeline && inputTexture) {
+        if (pixels.length > 0 && dims.width > 0 && device && computePipeline && inputTexture && bindGroup) {
           const t0 = performance.now();
 
           // Upload camera frame to input texture — THIS IS THE SPIKE 2 VALIDATION
           // WebGPU JSI calls executing on the worklet/UI thread
           device.queue.writeTexture(
             { texture: inputTexture },
-            pixels,
+            pixels.buffer as ArrayBuffer,
             { bytesPerRow: dims.bytesPerRow },
             { width: w, height: h },
           );
@@ -212,7 +212,7 @@ export default function CameraSpikeScreen() {
       spike1Path: 'copy-fallback',
       spike2Path: pipeline.state.computeSupported ? 'worklet-compute' : 'unknown',
       spike3Path: pipeline.state.deviceSource === 'graphite' ? 'graphite' : 'unknown',
-      spike4Path: recorderPathSV.value === 'pending' ? 'unknown' : recorderPathSV.value,
+      spike4Path: recorderPathSV.value === 'pending' ? 'unknown' : recorderPathSV.value as SpikeResults['spike4Path'],
     });
 
     const summary = metrics.getSummary();
@@ -222,7 +222,7 @@ export default function CameraSpikeScreen() {
         spike1Path: 'copy-fallback',
         spike2Path: pipeline.state.computeSupported ? 'worklet-compute' : 'unknown',
         spike3Path: pipeline.state.deviceSource === 'graphite' ? 'graphite' : 'unknown',
-        spike4Path: recorderPathSV.value === 'pending' ? 'unknown' : recorderPathSV.value,
+        spike4Path: recorderPathSV.value === 'pending' ? 'unknown' : recorderPathSV.value as SpikeResults['spike4Path'],
       });
     }
 
