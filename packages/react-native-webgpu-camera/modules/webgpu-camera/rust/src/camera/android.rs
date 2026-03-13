@@ -1,23 +1,9 @@
-//! Android camera implementation using Camera2.
-//!
-//! Pipeline:
-//! Camera2 -> ImageReader -> Image.getHardwareBuffer()
-//!   -> HardwareBuffer handle
-//!   -> Store handle in CURRENT_FRAME_HANDLE atomic
+//! Android camera — capture will be handled in Kotlin Expo module (Task 3).
 
-use crate::{CURRENT_FRAME_HANDLE, CURRENT_FRAME_PIXELS};
-use std::sync::atomic::Ordering;
-
-pub fn start_preview(device_id: &str, width: u32, height: u32) {
-    // TODO: Implement Camera2 setup via JNI
-    println!(
-        "[webgpu-camera/android] start_preview({}, {}x{}) — stub",
-        device_id, width, height
-    );
+pub fn start_preview(_device_id: &str, _width: u32, _height: u32) {
+    println!("[webgpu-camera/android] Camera managed by Kotlin Expo module");
 }
 
 pub fn stop_preview() {
-    CURRENT_FRAME_HANDLE.store(0, Ordering::Relaxed);
-    CURRENT_FRAME_PIXELS.lock().unwrap().clear();
-    println!("[webgpu-camera/android] stop_preview — stub");
+    println!("[webgpu-camera/android] Camera stopped by Kotlin Expo module");
 }

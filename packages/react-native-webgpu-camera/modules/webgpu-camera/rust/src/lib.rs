@@ -1,12 +1,15 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 uniffi::setup_scaffolding!();
 
-// Thread-safe slot for latest camera frame handle.
-// Camera callback updates this; JS polls it on render tick.
+// Double-buffer frame slot.
+// Camera writes to back buffer, atomically swaps index.
+// JS reads from front buffer — no lock contention.
+static FRAME_BUFFERS: [Mutex<Vec<u8>>; 2] = [Mutex::new(Vec::new()), Mutex::new(Vec::new())];
+static FRONT_INDEX: AtomicUsize = AtomicUsize::new(0);
+static FRAME_COUNTER: AtomicU64 = AtomicU64::new(0);
 static CURRENT_FRAME_HANDLE: AtomicU64 = AtomicU64::new(0);
-static CURRENT_FRAME_PIXELS: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 static FRAME_DIMS: Mutex<FrameDimensions> = Mutex::new(FrameDimensions {
     width: 0,
     height: 0,
@@ -21,16 +24,56 @@ pub struct FrameDimensions {
 }
 
 #[uniffi::export]
+pub fn deliver_frame(pixels: Vec<u8>, handle: u64) {
+    let front = FRONT_INDEX.load(Ordering::Acquire);
+    let back = 1 - front;
+
+    {
+        let mut buf = FRAME_BUFFERS[back].lock().unwrap();
+        buf.clear();
+        buf.extend_from_slice(&pixels);
+    }
+
+    CURRENT_FRAME_HANDLE.store(handle, Ordering::Relaxed);
+    FRONT_INDEX.store(back, Ordering::Release);
+    FRAME_COUNTER.fetch_add(1, Ordering::Relaxed);
+}
+
+#[uniffi::export]
+pub fn set_frame_dimensions(width: u32, height: u32, bytes_per_row: u32) {
+    let mut dims = FRAME_DIMS.lock().unwrap();
+    dims.width = width;
+    dims.height = height;
+    dims.bytes_per_row = bytes_per_row;
+}
+
+#[uniffi::export]
+pub fn get_current_frame_handle() -> u64 {
+    CURRENT_FRAME_HANDLE.load(Ordering::Relaxed)
+}
+
+#[uniffi::export]
+pub fn get_current_frame_pixels() -> Vec<u8> {
+    let front = FRONT_INDEX.load(Ordering::Acquire);
+    FRAME_BUFFERS[front].lock().unwrap().clone()
+}
+
+#[uniffi::export]
+pub fn get_frame_dimensions() -> FrameDimensions {
+    FRAME_DIMS.lock().unwrap().clone()
+}
+
+#[uniffi::export]
+pub fn get_frame_counter() -> u64 {
+    FRAME_COUNTER.load(Ordering::Relaxed)
+}
+
+#[uniffi::export]
 pub fn start_camera_preview(device_id: String, width: u32, height: u32) {
     println!(
         "[webgpu-camera] start_camera_preview({}, {}x{})",
         device_id, width, height
     );
-
-    let mut dims = FRAME_DIMS.lock().unwrap();
-    dims.width = width;
-    dims.height = height;
-    dims.bytes_per_row = width * 4;
 
     #[cfg(target_os = "ios")]
     camera::ios::start_preview(&device_id, width, height);
@@ -46,21 +89,6 @@ pub fn stop_camera_preview() {
 
     #[cfg(target_os = "android")]
     camera::android::stop_preview();
-}
-
-#[uniffi::export]
-pub fn get_current_frame_handle() -> u64 {
-    CURRENT_FRAME_HANDLE.load(Ordering::Relaxed)
-}
-
-#[uniffi::export]
-pub fn get_current_frame_pixels() -> Vec<u8> {
-    CURRENT_FRAME_PIXELS.lock().unwrap().clone()
-}
-
-#[uniffi::export]
-pub fn get_frame_dimensions() -> FrameDimensions {
-    FRAME_DIMS.lock().unwrap().clone()
 }
 
 #[uniffi::export]
