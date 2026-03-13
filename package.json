@@ -1,0 +1,18 @@
+{
+  "name": "react-native-webgpu-camera-monorepo",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "bun run --filter 'react-native-webgpu-camera' build",
+    "build:rust": "./scripts/build-rust.sh",
+    "build:bindings": "./scripts/generate-bindings.sh",
+    "build:skia": "./scripts/build-skia-graphite.sh",
+    "lint": "bun run --filter '*' lint",
+    "typecheck": "bun run --filter '*' typecheck",
+    "example:ios": "cd apps/example && eas build --platform ios --profile development",
+    "example:android": "cd apps/example && eas build --platform android --profile development"
+  }
+}

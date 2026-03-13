@@ -1,0 +1,22 @@
+node_modules/
+dist/
+.expo/
+ios/
+android/
+*.jsbundle
+bun.lock
+
+# Rust build artifacts (NOT the prebuilts — those are committed)
+**/rust/target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# EAS
+.eas/
