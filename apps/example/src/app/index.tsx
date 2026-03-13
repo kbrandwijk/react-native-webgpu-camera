@@ -9,7 +9,7 @@ import {
 } from 'react-native';
 import { useSpikeMetrics, SpikeResults } from '@/hooks/useSpikeMetrics';
 import { SOBEL_WGSL } from '@/shaders/sobel.wgsl';
-import * as FileSystem from 'expo-file-system';
+import { Paths, File } from 'expo-file-system';
 
 // These imports will be wired up during spike implementation:
 // import { Canvas } from 'react-native-wgpu';
@@ -70,7 +70,7 @@ export default function CameraSpikeScreen() {
   }, [metrics, spikeStatus]);
 
   const startRecording = useCallback(async () => {
-    const outputPath = `${FileSystem.documentDirectory}spike4_test.mp4`;
+    const outputPath = new File(Paths.document, 'spike4_test.mp4').uri;
     setIsRecording(true);
 
     // TODO: Wire up during spike implementation:

@@ -4,6 +4,7 @@
     "modules": ["WebGPUCameraModule"]
   },
   "android": {
-    "modules": ["expo.modules.webgpucamera.WebGPUCameraModule"]
+    "modules": ["expo.modules.webgpucamera.WebGPUCameraModule"],
+    "path": "modules/webgpu-camera/android"
   }
 }

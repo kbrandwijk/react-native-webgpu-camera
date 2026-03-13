@@ -19,6 +19,7 @@
   },
   "devDependencies": {
     "typescript": "^5.7.0",
+    "expo-modules-core": "*",
     "react-native-wgpu": "^0.5.8",
     "@shopify/react-native-skia": "*",
     "react-native-reanimated": ">=4.2.1"
