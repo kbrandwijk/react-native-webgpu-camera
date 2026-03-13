@@ -1,7 +1,8 @@
 {
   "platforms": ["apple", "android"],
   "apple": {
-    "modules": ["WebGPUCameraModule"]
+    "modules": ["WebGPUCameraModule"],
+    "podspecPath": "modules/webgpu-camera/ios/WebGPUCamera.podspec"
   },
   "android": {
     "modules": ["expo.modules.webgpucamera.WebGPUCameraModule"],
