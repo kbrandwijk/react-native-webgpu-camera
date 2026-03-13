@@ -1,8 +1,9 @@
 node_modules/
 dist/
 .expo/
-ios/
-android/
+# Expo prebuild generated native dirs (only in app dirs)
+apps/*/ios/
+apps/*/android/
 *.jsbundle
 bun.lock
 
