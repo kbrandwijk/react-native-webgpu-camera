@@ -1,7 +1,7 @@
 /**
- * Expo config plugin that copies Dawn/WebGPU headers from
- * react-native-skia-graphite-headers into @shopify/react-native-skia
- * so the Graphite build can find webgpu/webgpu_cpp.h.
+ * Expo config plugin that copies Dawn/WebGPU and Skia private headers from
+ * react-native-skia-graphite-headers into @shopify/react-native-skia/cpp/
+ * so the Graphite build can find webgpu/webgpu_cpp.h, ContextOptionsPriv.h, etc.
  */
 const { withDangerousMod } = require("expo/config-plugins");
 const path = require("path");
@@ -26,7 +26,6 @@ module.exports = function withSkiaGraphiteHeaders(config) {
     (config) => {
       const projectRoot = config.modRequest.projectRoot;
 
-      // Resolve package paths — works with bun hoisted node_modules
       let headersDir, skiaDir;
       try {
         headersDir = path.dirname(
@@ -47,21 +46,20 @@ module.exports = function withSkiaGraphiteHeaders(config) {
         return config;
       }
 
-      const src = path.join(headersDir, "libs", "skia", "cpp", "dawn");
-      const dest = path.join(skiaDir, "cpp", "dawn");
+      const headersCppDir = path.join(headersDir, "libs", "skia", "cpp");
+      const skiaCppDir = path.join(skiaDir, "cpp");
 
-      if (!fs.existsSync(src)) {
-        console.warn(
-          "[withSkiaGraphiteHeaders] Source headers not found at",
-          src
-        );
-        return config;
+      // Copy both dawn/ (WebGPU headers) and skia/ (Skia private headers)
+      for (const subdir of ["dawn", "skia"]) {
+        const src = path.join(headersCppDir, subdir);
+        const dest = path.join(skiaCppDir, subdir);
+        if (fs.existsSync(src)) {
+          console.log(`[withSkiaGraphiteHeaders] Copying ${subdir} headers`);
+          console.log(`  from: ${src}`);
+          console.log(`  to:   ${dest}`);
+          copyDirSync(src, dest);
+        }
       }
-
-      console.log(`[withSkiaGraphiteHeaders] Copying Dawn headers`);
-      console.log(`  from: ${src}`);
-      console.log(`  to:   ${dest}`);
-      copyDirSync(src, dest);
 
       return config;
     },
