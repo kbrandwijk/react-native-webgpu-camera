@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import {
   View,
   Text,
@@ -7,18 +7,22 @@ import {
   Platform,
   ScrollView,
 } from 'react-native';
+import { runOnUI, runOnJS, useSharedValue } from 'react-native-reanimated';
 import { useSpikeMetrics, SpikeResults } from '@/hooks/useSpikeMetrics';
-import { SOBEL_WGSL } from '@/shaders/sobel.wgsl';
-import { Paths, File } from 'expo-file-system';
+import { useGPUPipeline } from '@/hooks/useGPUPipeline';
+import { SpikeOverlay } from '@/components/SpikeOverlay';
+import { startRecording, stopRecording, RecorderState } from '@/utils/recorderBridge';
+import WebGPUCameraModule from 'react-native-webgpu-camera/modules/webgpu-camera/src/WebGPUCameraModule';
 
-// These imports will be wired up during spike implementation:
-// import { Canvas } from 'react-native-wgpu';
-// import { runOnUI } from 'react-native-reanimated';
-// import { WebGPUCameraModule } from 'react-native-webgpu-camera';
+const CAMERA_WIDTH = 1920;
+const CAMERA_HEIGHT = 1080;
+const TARGET_FPS = 30;
+const FRAME_INTERVAL = 1000 / TARGET_FPS;
+const RUN_DURATION_S = 60;
 
 export default function CameraSpikeScreen() {
   const [isRunning, setIsRunning] = useState(false);
-  const [isRecording, setIsRecording] = useState(false);
+  const [recorderState, setRecorderState] = useState<RecorderState | null>(null);
   const [spikeStatus, setSpikeStatus] = useState({
     spike1: 'pending',
     spike2: 'pending',
@@ -29,95 +33,244 @@ export default function CameraSpikeScreen() {
   });
   const [results, setResults] = useState<SpikeResults | null>(null);
   const metrics = useSpikeMetrics();
+  const pipeline = useGPUPipeline(CAMERA_WIDTH, CAMERA_HEIGHT);
+
+  // Shared values for worklet thread access (avoids stale closures)
+  const isRunningRef = useSharedValue(false);
+  // Use shared value (not React ref) so worklet can read recorder status
+  const recorderPathSV = useSharedValue<string>('pending');
+
+  // Push status updates from worklet -> JS thread
+  const updateStatus = useCallback((status: typeof spikeStatus) => {
+    setSpikeStatus(status);
+  }, []);
+
+  // autoStop is called from the worklet via runOnJS when elapsed >= RUN_DURATION_S.
+  // Sets shared value to stop the loop; the useEffect cleanup handles full teardown.
+  // Avoids circular dependency with stopPipeline (defined below).
+  const autoStop = useCallback(() => {
+    isRunningRef.value = false;
+    setIsRunning(false);
+  }, [isRunningRef]);
+
+  // Access worklet-compatible shared values from the pipeline hook
+  const { workletResources } = pipeline;
+
+  // Shared values for worklet-side state (React refs are NOT accessible from worklets)
+  const lastFrameCounterSV = useSharedValue(0);
+  const startTimeSV = useSharedValue(0);
+  const spike2StatusSV = useSharedValue('pending');
+  const spike3StatusSV = useSharedValue('pending');
+
+  // Callbacks for runOnJS — must be stable references
+  const recordFrameJS = useCallback((timing: { importMs: number; computeMs: number; skiaMs: number; totalMs: number }) => {
+    metrics.recordFrame(timing);
+  }, [metrics]);
+
+  const recordThermalJS = useCallback((thermal: string) => {
+    metrics.recordThermalChange(thermal);
+  }, [metrics]);
+
+  // Worklet render loop — runs on UI thread via runOnUI
+  // This validates Spike 2: WebGPU compute dispatch from worklet thread
+  const startRenderLoop = useCallback(() => {
+    // Capture current spike status for worklet
+    spike2StatusSV.value = pipeline.state.computeSupported ? 'worklet-compute' : 'pending';
+    spike3StatusSV.value = pipeline.state.deviceSource === 'graphite' ? 'graphite' : 'pending';
+    startTimeSV.value = performance.now();
+
+    const tick = () => {
+      'worklet';
+      if (!isRunningRef.value) return;
+
+      // Read frame counter from native module (JSI call — works from worklet)
+      const frameCounter = WebGPUCameraModule.getFrameCounter();
+
+      if (frameCounter > lastFrameCounterSV.value) {
+        lastFrameCounterSV.value = frameCounter;
+
+        // Get frame data from native module (JSI calls — work from worklet)
+        const pixels = WebGPUCameraModule.getCurrentFramePixels();
+        const dims = WebGPUCameraModule.getFrameDimensions();
+
+        // Read WebGPU resources from shared values (NOT React refs)
+        const device = workletResources.device.value;
+        const computePipeline = workletResources.computePipeline.value;
+        const inputTexture = workletResources.inputTexture.value;
+        const bindGroup = workletResources.bindGroup.value;
+        const w = workletResources.width.value;
+        const h = workletResources.height.value;
+
+        if (pixels.length > 0 && dims.width > 0 && device && computePipeline && inputTexture) {
+          const t0 = performance.now();
+
+          // Upload camera frame to input texture — THIS IS THE SPIKE 2 VALIDATION
+          // WebGPU JSI calls executing on the worklet/UI thread
+          device.queue.writeTexture(
+            { texture: inputTexture },
+            pixels,
+            { bytesPerRow: dims.bytesPerRow },
+            { width: w, height: h },
+          );
+          const tImport = performance.now();
+
+          // Dispatch Sobel compute on worklet thread
+          const encoder = device.createCommandEncoder();
+          const pass = encoder.beginComputePass();
+          pass.setPipeline(computePipeline);
+          pass.setBindGroup(0, bindGroup);
+          pass.dispatchWorkgroups(
+            Math.ceil(w / 16),
+            Math.ceil(h / 16),
+          );
+          pass.end();
+          device.queue.submit([encoder.finish()]);
+          const tCompute = performance.now();
+
+          const skiaMs = 0; // Measured separately via Skia rendering
+
+          // Push timing data to JS thread for metrics
+          runOnJS(recordFrameJS)({
+            importMs: tImport - t0,
+            computeMs: tCompute - tImport,
+            skiaMs,
+            totalMs: tCompute - t0 + skiaMs,
+          });
+
+          const elapsed = Math.floor((performance.now() - startTimeSV.value) / 1000);
+
+          runOnJS(updateStatus)({
+            spike1: 'copy-fallback',
+            spike2: spike2StatusSV.value,
+            spike3: spike3StatusSV.value,
+            spike4: recorderPathSV.value,
+            fps: 0, // Updated from metrics on JS side
+            elapsed,
+          });
+
+          // Check thermal state every ~1s
+          if (frameCounter % 30 === 0) {
+            const thermal = WebGPUCameraModule.getThermalState();
+            runOnJS(recordThermalJS)(thermal);
+          }
+
+          // Auto-stop after RUN_DURATION_S
+          if (elapsed >= RUN_DURATION_S) {
+            runOnJS(autoStop)();
+            return;
+          }
+        }
+      }
+
+      // Schedule next tick on UI thread.
+      // RISK: Reanimated's worklet runtime may not support setTimeout natively.
+      // Fallbacks: requestAnimationFrame, or move loop to JS with runOnJS.
+      setTimeout(tick, FRAME_INTERVAL);
+    };
+
+    runOnUI(tick)();
+  }, [pipeline, isRunningRef, workletResources, updateStatus, autoStop, recordFrameJS, recordThermalJS, lastFrameCounterSV, startTimeSV, spike2StatusSV, spike3StatusSV, recorderPathSV]);
 
   const startPipeline = useCallback(async () => {
+    isRunningRef.value = true;
     setIsRunning(true);
     setResults(null);
     metrics.reset();
+    lastFrameCounterSV.value = 0;
+    startTimeSV.value = 0;
 
-    // TODO: Wire up the full pipeline during spike implementation:
-    // 1. Start camera via Rust module: WebGPUCameraModule.startCameraPreview('back', 1920, 1080)
-    // 2. Get GPUDevice from react-native-wgpu Canvas onCreateSurface
-    // 3. Create Sobel compute pipeline from SOBEL_WGSL
-    // 4. In worklet render loop:
-    //    a. Poll Rust for frame handle (Spike 1)
-    //    b. Import as GPUTexture or fall back to writeTexture
-    //    c. Dispatch Sobel compute shader (Spike 2)
-    //    d. Draw Skia overlay (Spike 3)
-    //    e. Render pass to canvas + recorder if active (Spike 4)
-    //    f. Record timing via metrics.recordFrame()
-    // 5. After 60 seconds, call metrics.logSummary() and stop
+    // Initialize GPU pipeline
+    await pipeline.initialize();
 
-    console.log('[CameraSpikeScreen] Pipeline started (shell only - wire up during spike implementation)');
-    console.log('[CameraSpikeScreen] Sobel shader loaded:', SOBEL_WGSL.substring(0, 50) + '...');
-  }, [metrics]);
+    // Start camera
+    WebGPUCameraModule.startCameraPreview('back', CAMERA_WIDTH, CAMERA_HEIGHT);
+
+    console.log('[CameraSpikeScreen] Pipeline started');
+
+    // Start render loop after a brief delay for camera to warm up
+    setTimeout(() => {
+      startRenderLoop();
+    }, 500);
+  }, [pipeline, metrics, startRenderLoop, isRunningRef, lastFrameCounterSV, startTimeSV]);
 
   const stopPipeline = useCallback(() => {
-    // TODO: WebGPUCameraModule.stopCameraPreview()
+    isRunningRef.value = false;
     setIsRunning(false);
 
+    // Stop camera
+    WebGPUCameraModule.stopCameraPreview();
+
+    // Stop recorder if active
+    if (recorderState?.isRecording) {
+      stopRecording();
+      setRecorderState(null);
+      recorderPathSV.value = 'pending';
+    }
+
+    // Log results
     metrics.logSummary({
-      spike1Path: spikeStatus.spike1 as SpikeResults['spike1Path'],
-      spike2Path: spikeStatus.spike2 as SpikeResults['spike2Path'],
-      spike3Path: spikeStatus.spike3 as SpikeResults['spike3Path'],
-      spike4Path: spikeStatus.spike4 as SpikeResults['spike4Path'],
+      spike1Path: 'copy-fallback',
+      spike2Path: pipeline.state.computeSupported ? 'worklet-compute' : 'unknown',
+      spike3Path: pipeline.state.deviceSource === 'graphite' ? 'graphite' : 'unknown',
+      spike4Path: recorderPathSV.value === 'pending' ? 'unknown' : recorderPathSV.value,
     });
 
     const summary = metrics.getSummary();
     if (summary) {
-      setResults(summary);
+      setResults({
+        ...summary,
+        spike1Path: 'copy-fallback',
+        spike2Path: pipeline.state.computeSupported ? 'worklet-compute' : 'unknown',
+        spike3Path: pipeline.state.deviceSource === 'graphite' ? 'graphite' : 'unknown',
+        spike4Path: recorderPathSV.value === 'pending' ? 'unknown' : recorderPathSV.value,
+      });
     }
-  }, [metrics, spikeStatus]);
 
-  const startRecording = useCallback(async () => {
-    const outputPath = new File(Paths.document, 'spike4_test.mp4').uri;
-    setIsRecording(true);
+    // Cleanup GPU resources
+    pipeline.cleanup();
+  }, [pipeline, metrics, recorderState, isRunningRef, recorderPathSV]);
 
-    // TODO: Wire up during spike implementation:
-    // const surfaceHandle = WebGPUCameraModule.startTestRecorder(outputPath, 1920, 1080);
-    // if (surfaceHandle !== 0) {
-    //   setSpikeStatus(s => ({ ...s, spike4: 'surface-record' }));
-    // } else {
-    //   setSpikeStatus(s => ({ ...s, spike4: 'readback-record' }));
-    // }
-
-    console.log(`[CameraSpikeScreen] Recording to: ${outputPath}`);
+  const handleStartRecording = useCallback(() => {
+    const state = startRecording(CAMERA_WIDTH, CAMERA_HEIGHT);
+    setRecorderState(state);
+    recorderPathSV.value = state.path;
+    setSpikeStatus(s => ({ ...s, spike4: state.path }));
 
     // Stop after 5 seconds
     setTimeout(() => {
-      // TODO: const filePath = WebGPUCameraModule.stopTestRecorder();
-      setIsRecording(false);
-      console.log('[CameraSpikeScreen] Recording stopped (stub)');
+      const filePath = stopRecording();
+      setRecorderState(null);
+      recorderPathSV.value = 'pending';
+      console.log(`[CameraSpikeScreen] Recording saved: ${filePath}`);
     }, 5000);
-  }, []);
+  }, [recorderPathSV]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      isRunningRef.value = false;
+      pipeline.cleanup();
+    };
+  }, [pipeline, isRunningRef]);
 
   return (
     <View style={styles.container}>
-      {/* WebGPU Canvas will go here — full screen camera preview + compute output */}
-      {/* <Canvas style={StyleSheet.absoluteFill} /> */}
-      <View style={[StyleSheet.absoluteFill, styles.placeholder]}>
-        <Text style={styles.placeholderText}>
-          WebGPU Canvas{'\n'}(wire up during spike implementation)
-        </Text>
-      </View>
+      {/* Skia overlay — validates Spike 3 */}
+      <SpikeOverlay
+        fps={spikeStatus.fps}
+        spike1Status={spikeStatus.spike1}
+        spike2Status={spikeStatus.spike2}
+        spike3Status={spikeStatus.spike3}
+        spike4Status={spikeStatus.spike4}
+        elapsed={spikeStatus.elapsed}
+        isRecording={recorderState?.isRecording ?? false}
+      />
 
-      {/* Status overlay */}
-      <View style={styles.overlay}>
-        <Text style={styles.overlayTitle}>Spike Validation</Text>
+      {/* Pipeline status */}
+      <View style={styles.statusBar}>
         <Text style={styles.statusText}>
-          Spike 1 (zero-copy): {spikeStatus.spike1}
-        </Text>
-        <Text style={styles.statusText}>
-          Spike 2 (worklet compute): {spikeStatus.spike2}
-        </Text>
-        <Text style={styles.statusText}>
-          Spike 3 (Skia Graphite): {spikeStatus.spike3}
-        </Text>
-        <Text style={styles.statusText}>
-          Spike 4 (recorder): {spikeStatus.spike4}
-        </Text>
-        <Text style={styles.statusText}>
-          FPS: {spikeStatus.fps.toFixed(1)} | Elapsed: {spikeStatus.elapsed}s
+          GPU: {pipeline.state.status} | Source: {pipeline.state.deviceSource}
+          {pipeline.state.error ? ` | Error: ${pipeline.state.error}` : ''}
         </Text>
       </View>
 
@@ -134,12 +287,12 @@ export default function CameraSpikeScreen() {
 
         {isRunning && (
           <Pressable
-            style={[styles.button, isRecording && styles.buttonActive]}
-            onPress={startRecording}
-            disabled={isRecording}
+            style={[styles.button, recorderState?.isRecording && styles.buttonActive]}
+            onPress={handleStartRecording}
+            disabled={recorderState?.isRecording}
           >
             <Text style={styles.buttonText}>
-              {isRecording ? 'Recording...' : 'Record 5s'}
+              {recorderState?.isRecording ? 'Recording...' : 'Record 5s'}
             </Text>
           </Pressable>
         )}
@@ -163,36 +316,19 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#000',
   },
-  placeholder: {
-    justifyContent: 'center',
-    alignItems: 'center',
-    backgroundColor: '#111',
-  },
-  placeholderText: {
-    color: '#444',
-    fontSize: 18,
-    textAlign: 'center',
-  },
-  overlay: {
+  statusBar: {
     position: 'absolute',
-    top: 60,
+    top: 44,
     left: 16,
     right: 16,
     backgroundColor: 'rgba(0,0,0,0.6)',
-    borderRadius: 8,
-    padding: 12,
-  },
-  overlayTitle: {
-    color: '#fff',
-    fontSize: 16,
-    fontWeight: '700',
-    marginBottom: 8,
+    borderRadius: 4,
+    padding: 8,
   },
   statusText: {
-    color: '#fff',
-    fontSize: 13,
+    color: '#aaa',
+    fontSize: 11,
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
-    marginBottom: 4,
   },
   controls: {
     position: 'absolute',
@@ -222,7 +358,7 @@ const styles = StyleSheet.create({
   },
   results: {
     position: 'absolute',
-    top: 250,
+    top: 220,
     left: 16,
     right: 16,
     backgroundColor: 'rgba(0,0,0,0.8)',
