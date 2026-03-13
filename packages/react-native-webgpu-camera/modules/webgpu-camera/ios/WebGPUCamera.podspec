@@ -19,9 +19,11 @@ Pod::Spec.new do |s|
 
   s.dependency 'ExpoModulesCore'
 
+  s.source_files = "**/*.{h,m,mm,swift,hpp,cpp}"
+  s.vendored_libraries = 'rust/libwebgpu_camera.a'
+
   s.pod_target_xcconfig = {
     'DEFINES_MODULE' => 'YES',
+    'SWIFT_INCLUDE_PATHS' => '$(PODS_TARGET_SRCROOT)/rust',
   }
-
-  s.source_files = "**/*.{h,m,mm,swift,hpp,cpp}"
 end
