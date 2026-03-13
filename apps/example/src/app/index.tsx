@@ -8,19 +8,20 @@ import {
   ScrollView,
   useWindowDimensions,
 } from 'react-native';
-import { Canvas, Fill, Group, Image as SkImage, Skia, type SkImage as SkImageType } from '@shopify/react-native-skia';
+import { Canvas, Fill, Group, Image as SkImage, type SkImage as SkImageType } from '@shopify/react-native-skia';
 import { useSpikeMetrics, SpikeResults } from '@/hooks/useSpikeMetrics';
 import { startRecording, stopRecording, RecorderState } from '@/utils/recorderBridge';
 import WebGPUCameraModule from 'react-native-webgpu-camera/modules/webgpu-camera/src/WebGPUCameraModule';
 import { SOBEL_WGSL } from '@/shaders/sobel.wgsl';
 
 declare global {
-  function __webgpuCamera_getOutputTexture(): GPUTexture | null;
+  // Returns a JsiSkImage (SkImage host object) directly — no MakeImageFromTexture needed
+  function __webgpuCamera_nextImage(): SkImageType | null;
 }
 
-const CAMERA_WIDTH = 1920;
-const CAMERA_HEIGHT = 1080;
-const RUN_DURATION_S = 60;
+const CAMERA_WIDTH = 3840;
+const CAMERA_HEIGHT = 2160;
+const CAMERA_FPS = 60;
 
 function PreviewCanvas({ previewImage }: { previewImage: SkImageType | null }) {
   const { width: screenW, height: screenH } = useWindowDimensions();
@@ -67,39 +68,25 @@ export default function CameraSpikeScreen() {
 
         const t0 = performance.now();
 
-        // Get the compute output texture from native (zero-copy GPU path)
-        const outputTexture = globalThis.__webgpuCamera_getOutputTexture?.();
-        const tTexture = performance.now();
+        // Get the compute output as JsiSkImage directly (no MakeImageFromTexture needed)
+        const img = globalThis.__webgpuCamera_nextImage?.();
+        const tNextImage = performance.now();
 
-        if (outputTexture) {
-          // Wrap GPU texture as SkImage (texture bind only, no pixel copy)
-          const skImage = Skia.Image.MakeImageFromTexture(outputTexture);
-          const tSkia = performance.now();
-
-          if (skImage) {
-            prevImageRef.current?.dispose();
-            prevImageRef.current = skImage;
-            setPreviewImage(skImage);
-          }
+        if (img) {
+          prevImageRef.current?.dispose();
+          prevImageRef.current = img;
+          setPreviewImage(img);
 
           metrics.recordFrame({
-            importMs: tTexture - t0,
+            importMs: tNextImage - t0,
             computeMs: 0, // compute runs on native thread, not measured here
-            skiaMs: tSkia - tTexture,
-            totalMs: tSkia - t0,
+            skiaMs: 0, // SkImage created natively, no JS-side Skia work
+            totalMs: tNextImage - t0,
           });
         }
 
-        const elapsed = Math.floor((performance.now() - startTimeRef.current) / 1000);
-
         if (frameCounter % 30 === 0) {
           metrics.recordThermalChange(WebGPUCameraModule.getThermalState());
-        }
-
-        if (elapsed >= RUN_DURATION_S) {
-          isRunningRef.current = false;
-          setIsRunning(false);
-          return;
         }
       }
       rafRef.current = requestAnimationFrame(tick);
@@ -126,11 +113,11 @@ export default function CameraSpikeScreen() {
     }
     setStatus('compute ready');
 
-    // 2. Start camera — each frame runs compute on native thread
-    WebGPUCameraModule.startCameraPreview('back', CAMERA_WIDTH, CAMERA_HEIGHT);
+    // 2. Start camera with fps — each frame runs compute on native thread
+    WebGPUCameraModule.startCameraPreview('back', CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS);
     console.log('[CameraSpikeScreen] Native pipeline started');
 
-    // 3. Start JS render loop to poll output texture
+    // 3. Start JS render loop
     startRenderLoop();
   }, [metrics.reset, startRenderLoop]);
 

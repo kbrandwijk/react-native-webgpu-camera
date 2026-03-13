@@ -20,3 +20,6 @@ Thumbs.db
 
 # EAS
 .eas/
+
+# Private docs (articles, content strategy)
+private-docs/

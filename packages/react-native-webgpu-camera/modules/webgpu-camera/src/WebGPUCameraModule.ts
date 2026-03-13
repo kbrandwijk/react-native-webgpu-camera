@@ -7,7 +7,7 @@ export interface FrameDimensions {
 }
 
 interface WebGPUCameraModuleInterface extends NativeModule {
-  startCameraPreview(deviceId: string, width: number, height: number): void;
+  startCameraPreview(deviceId: string, width: number, height: number, fps: number): void;
   stopCameraPreview(): void;
   getCurrentFrameHandle(): number;
   getCurrentFramePixels(): Uint8Array;

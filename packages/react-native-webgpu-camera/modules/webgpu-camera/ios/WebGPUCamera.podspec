@@ -31,7 +31,7 @@ Pod::Spec.new do |s|
   s.pod_target_xcconfig = {
     'DEFINES_MODULE' => 'YES',
     'CLANG_CXX_LANGUAGE_STANDARD' => 'c++17',
-    'GCC_PREPROCESSOR_DEFINITIONS' => '$(inherited) SK_GRAPHITE=1',
+    'GCC_PREPROCESSOR_DEFINITIONS' => '$(inherited) SK_GRAPHITE=1 RCT_NEW_ARCH_ENABLED=1',
     'SWIFT_INCLUDE_PATHS' => '$(PODS_TARGET_SRCROOT)/rust',
     'HEADER_SEARCH_PATHS' => [
       '"$(PODS_TARGET_SRCROOT)"',
@@ -45,6 +45,8 @@ Pod::Spec.new do |s|
       "\"#{skia_pkg_root}/cpp/rnwgpu/async\"",
       "\"#{skia_pkg_root}/cpp/jsi2\"",
       "\"#{skia_pkg_root}/cpp/dawn/include\"",
+      "\"#{skia_pkg_root}/apple\"",
+      "\"#{skia_pkg_root}/cpp/api\"",
     ].join(' '),
   }
 end

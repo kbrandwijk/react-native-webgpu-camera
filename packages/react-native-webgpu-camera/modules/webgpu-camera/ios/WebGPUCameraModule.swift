@@ -24,8 +24,8 @@ public class WebGPUCameraModule: Module {
   public func definition() -> ModuleDefinition {
     Name("WebGPUCamera")
 
-    Function("startCameraPreview") { (deviceId: String, width: Int, height: Int) in
-      self.startCapture(deviceId: deviceId, width: width, height: height)
+    Function("startCameraPreview") { (deviceId: String, width: Int, height: Int, fps: Int) in
+      self.startCapture(deviceId: deviceId, width: width, height: height, fps: fps)
     }
 
     Function("stopCameraPreview") {
@@ -81,7 +81,7 @@ public class WebGPUCameraModule: Module {
       if ok {
         self.dawnBridge = bridge
         self.computeSetup = true
-        // Install JSI bindings so JS can call __webgpuCamera_getOutputTexture()
+        // Install JSI bindings so JS can call __webgpuCamera_nextImage()
         if let runtime = try? self.appContext?.runtime {
           bridge.installJSIBindings(runtime)
         }
@@ -104,7 +104,7 @@ public class WebGPUCameraModule: Module {
     }
   }
 
-  private func startCapture(deviceId: String, width: Int, height: Int) {
+  private func startCapture(deviceId: String, width: Int, height: Int, fps: Int) {
     sessionQueue.async {
       let session = AVCaptureSession()
       session.sessionPreset = .hd1920x1080
@@ -121,6 +121,36 @@ public class WebGPUCameraModule: Module {
         if session.canAddInput(input) {
           session.addInput(input)
         }
+
+        // Configure requested frame rate
+        try camera.lockForConfiguration()
+        let targetFPS = Double(fps)
+        var bestFormat: AVCaptureDevice.Format?
+        var bestRange: AVFrameRateRange?
+
+        for format in camera.formats {
+          let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+          if dims.width == Int32(width) && dims.height == Int32(height) {
+            for range in format.videoSupportedFrameRateRanges {
+              if range.maxFrameRate >= targetFPS {
+                if bestRange == nil || range.maxFrameRate > bestRange!.maxFrameRate {
+                  bestFormat = format
+                  bestRange = range
+                }
+              }
+            }
+          }
+        }
+
+        if let format = bestFormat, let range = bestRange {
+          camera.activeFormat = format
+          camera.activeVideoMinFrameDuration = CMTime(value: 1, timescale: CMTimeScale(min(targetFPS, range.maxFrameRate)))
+          camera.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: CMTimeScale(min(targetFPS, range.maxFrameRate)))
+          print("[WebGPUCamera] Configured \(min(targetFPS, range.maxFrameRate))fps")
+        } else {
+          print("[WebGPUCamera] \(fps)fps not available at \(width)x\(height), using default")
+        }
+        camera.unlockForConfiguration()
       } catch {
         print("[WebGPUCamera] Failed to create camera input: \(error)")
         return

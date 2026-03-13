@@ -1,13 +1,20 @@
 #include "DawnComputePipeline.h"
 
 #include "rnskia/RNDawnContext.h"
+#include "rnskia/RNSkPlatformContext.h"
 #include "include/core/SkImage.h"
-#include "rnwgpu/api/GPUTexture.h"
+
+// Skia JSI host objects — needed to return JsiSkImage from nextImage()
+#include "api/JsiSkHostObjects.h"
+#include "api/JsiSkImage.h"
 
 #include <jsi/jsi.h>
 #include <atomic>
 #include <CoreVideo/CoreVideo.h>
 #include <CoreVideo/CVPixelBufferIOSurface.h>
+
+// Access SkiaManager singleton (New Architecture) to get RNSkPlatformContext
+#import "SkiaManager.h"
 
 using namespace RNSkia;
 
@@ -309,18 +316,26 @@ void dawn_pipeline_install_jsi(DawnComputePipelineRef ref, void *jsiRuntime) {
   auto *pipeline = static_cast<dawn_pipeline::DawnComputePipeline *>(ref);
 
   // Capture a shared_ptr<atomic<bool>> for liveness check — survives pipeline destruction.
-  // The lambda may outlive the pipeline (it lives in the JS runtime), so we can't capture
-  // the raw pipeline pointer without a guard.
   auto alive = pipeline->getAliveFlag();
 
-  // Install global.__webgpuCamera_getOutputTexture()
-  // Returns a GPUTexture JSI host object wrapping the compute output texture.
-  // JS then calls Skia.Image.MakeImageFromTexture(texture) to get an SkImage.
-  auto getOutputTexture = facebook::jsi::Function::createFromHostFunction(
+  // Get RNSkPlatformContext from Skia's SkiaManager singleton (New Architecture).
+  // This is needed to construct JsiSkImage host objects that Skia Canvas can render.
+  std::shared_ptr<RNSkia::RNSkManager> skManager = [SkiaManager latestActiveSkManager];
+  if (!skManager) {
+    printf("[DawnPipeline] WARNING: SkiaManager not available — JSI bindings not installed\n");
+    return;
+  }
+  auto platformContext = skManager->getPlatformContext();
+
+  // Install global.__webgpuCamera_nextImage()
+  // Returns a JsiSkImage host object wrapping the compute output texture.
+  // Designed to be called from useFrameCallback (UI thread worklet).
+  // Pattern follows JsiVideo::nextImage() from react-native-skia.
+  auto nextImage = facebook::jsi::Function::createFromHostFunction(
       runtime,
-      facebook::jsi::PropNameID::forAscii(runtime, "__webgpuCamera_getOutputTexture"),
+      facebook::jsi::PropNameID::forAscii(runtime, "__webgpuCamera_nextImage"),
       0,
-      [pipeline, alive](facebook::jsi::Runtime &rt,
+      [pipeline, alive, platformContext](facebook::jsi::Runtime &rt,
                  const facebook::jsi::Value &,
                  const facebook::jsi::Value *,
                  size_t) -> facebook::jsi::Value {
@@ -328,19 +343,28 @@ void dawn_pipeline_install_jsi(DawnComputePipelineRef ref, void *jsiRuntime) {
         if (!alive->load()) {
           return facebook::jsi::Value::null();
         }
-        void *texPtr = pipeline->getOutputTexturePtr();
-        if (!texPtr) {
+
+        // Get the sk_sp<SkImage> from the compute pipeline (mutex-protected)
+        void *imgPtr = pipeline->getOutputSkImage();
+        if (!imgPtr) {
           return facebook::jsi::Value::null();
         }
-        // texPtr is a pointer to wgpu::Texture — dereference to get the actual texture
-        wgpu::Texture texture = *static_cast<wgpu::Texture *>(texPtr);
-        auto gpuTexture = std::make_shared<rnwgpu::GPUTexture>(texture, "compute-output");
-        return rnwgpu::GPUTexture::create(rt, gpuTexture);
+
+        // imgPtr points to sk_sp<SkImage> inside the pipeline — copy it (bumps refcount)
+        sk_sp<SkImage> image = *static_cast<sk_sp<SkImage> *>(imgPtr);
+        if (!image) {
+          return facebook::jsi::Value::null();
+        }
+
+        // Wrap as JsiSkImage — same pattern as JsiVideo::nextImage()
+        auto hostObject = std::make_shared<RNSkia::JsiSkImage>(
+            platformContext, std::move(image));
+        return jsi::Object::createFromHostObject(rt, hostObject);
       });
 
   auto global = runtime.global();
-  global.setProperty(runtime, "__webgpuCamera_getOutputTexture", std::move(getOutputTexture));
-  printf("[DawnPipeline] JSI bindings installed\n");
+  global.setProperty(runtime, "__webgpuCamera_nextImage", std::move(nextImage));
+  printf("[DawnPipeline] JSI bindings installed (nextImage → JsiSkImage)\n");
 }
 
 } // extern "C"
