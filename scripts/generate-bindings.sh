@@ -20,4 +20,17 @@ cargo run --bin uniffi-bindgen -- generate \
   --out-dir "../generated/kotlin"
 cd -
 
-echo "=== Bindings generated ==="
+echo "=== Copying artifacts into native modules ==="
+MODULE_DIR="packages/react-native-webgpu-camera/modules/webgpu-camera"
+PREBUILT_DIR="packages/react-native-webgpu-camera/prebuilt"
+
+# iOS: copy generated Swift + FFI header/modulemap + static lib into ios/rust/
+mkdir -p "$MODULE_DIR/ios/rust"
+cp "$GEN_DIR/swift/webgpu_camera.swift" "$MODULE_DIR/ios/rust/"
+cp "$GEN_DIR/swift/webgpu_cameraFFI.h" "$MODULE_DIR/ios/rust/"
+cp "$GEN_DIR/swift/webgpu_cameraFFI.modulemap" "$MODULE_DIR/ios/rust/"
+cp "$PREBUILT_DIR/ios/libwebgpu_camera.a" "$MODULE_DIR/ios/rust/"
+
+# TODO: Android — copy generated Kotlin + .so into android module when wired
+
+echo "=== Bindings generated and copied ==="
