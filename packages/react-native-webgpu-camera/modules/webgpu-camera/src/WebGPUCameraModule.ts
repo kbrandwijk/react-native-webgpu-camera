@@ -15,6 +15,7 @@ interface WebGPUCameraModuleInterface extends NativeModule {
   getFrameCounter(): number;
   startTestRecorder(outputPath: string, width: number, height: number): number;
   stopTestRecorder(): string;
+  appendFrameToRecorder(pixels: Uint8Array, width: number, height: number): void;
   getThermalState(): string;
 }
 

@@ -18,6 +18,15 @@ class WebGPUCameraModule : Module() {
   private var backgroundThread: HandlerThread? = null
   private var backgroundHandler: Handler? = null
 
+  // --- Recorder (Spike 4) ---
+  private var mediaCodec: android.media.MediaCodec? = null
+  private var mediaMuxer: android.media.MediaMuxer? = null
+  private var videoTrackIndex = -1
+  private var isRecording = false
+  private var isMuxerStarted = false
+  private var recordingOutputPath: String = ""
+  private var recordedFrameCount: Long = 0
+
   override fun definition() = ModuleDefinition {
     Name("WebGPUCamera")
 
@@ -47,11 +56,15 @@ class WebGPUCameraModule : Module() {
     }
 
     Function("startTestRecorder") { outputPath: String, width: Int, height: Int ->
-      uniffi.webgpu_camera.startTestRecorder(outputPath, width.toUInt(), height.toUInt()).toLong()
+      startRecorder(outputPath, width, height)
     }
 
     Function("stopTestRecorder") {
-      uniffi.webgpu_camera.stopTestRecorder()
+      stopRecorder()
+    }
+
+    Function("appendFrameToRecorder") { pixels: ByteArray, width: Int, height: Int ->
+      appendFrameToRecorder(pixels, width, height)
     }
 
     Function("getThermalState") {
@@ -204,5 +217,156 @@ class WebGPUCameraModule : Module() {
       }
     }
     return bgra
+  }
+
+  // MARK: - Recorder
+
+  private fun startRecorder(outputPath: String, width: Int, height: Int): Long {
+    try {
+      val format = android.media.MediaFormat.createVideoFormat(
+        android.media.MediaFormat.MIMETYPE_VIDEO_AVC, width, height
+      ).apply {
+        setInteger(android.media.MediaFormat.KEY_BIT_RATE, 10_000_000)
+        setInteger(android.media.MediaFormat.KEY_FRAME_RATE, 30)
+        setInteger(android.media.MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+        setInteger(
+          android.media.MediaFormat.KEY_COLOR_FORMAT,
+          android.media.MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible
+        )
+      }
+
+      val codec = android.media.MediaCodec.createEncoderByType(
+        android.media.MediaFormat.MIMETYPE_VIDEO_AVC
+      )
+      codec.configure(format, null, null, android.media.MediaCodec.CONFIGURE_FLAG_ENCODE)
+      codec.start()
+
+      val muxer = android.media.MediaMuxer(
+        outputPath,
+        android.media.MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4
+      )
+
+      mediaCodec = codec
+      mediaMuxer = muxer
+      isRecording = true
+      isMuxerStarted = false
+      videoTrackIndex = -1
+      recordingOutputPath = outputPath
+      recordedFrameCount = 0
+
+      println("[WebGPUCamera] Recorder started: $outputPath")
+      return 0L
+    } catch (e: Exception) {
+      println("[WebGPUCamera] Recorder setup failed: $e")
+      return 0L
+    }
+  }
+
+  fun appendFrameToRecorder(bgraPixels: ByteArray, width: Int, height: Int) {
+    val codec = mediaCodec ?: return
+    if (!isRecording) return
+
+    val inputBufferIndex = codec.dequeueInputBuffer(0)
+    if (inputBufferIndex < 0) return
+
+    val inputBuffer = codec.getInputBuffer(inputBufferIndex) ?: return
+
+    val yuvSize = width * height * 3 / 2
+    val yuv = ByteArray(yuvSize)
+    bgraToNv21(bgraPixels, yuv, width, height)
+
+    inputBuffer.clear()
+    inputBuffer.put(yuv, 0, minOf(yuv.size, inputBuffer.remaining()))
+
+    val presentationTimeUs = recordedFrameCount * 1_000_000L / 30
+    codec.queueInputBuffer(inputBufferIndex, 0, yuvSize, presentationTimeUs, 0)
+    recordedFrameCount++
+
+    drainEncoder(false)
+  }
+
+  private fun drainEncoder(endOfStream: Boolean) {
+    val codec = mediaCodec ?: return
+    val muxer = mediaMuxer ?: return
+    val bufferInfo = android.media.MediaCodec.BufferInfo()
+
+    while (true) {
+      val outputIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
+      when {
+        outputIndex == android.media.MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+          videoTrackIndex = muxer.addTrack(codec.outputFormat)
+          muxer.start()
+          isMuxerStarted = true
+        }
+        outputIndex >= 0 -> {
+          if (!isMuxerStarted) break
+          val outputBuffer = codec.getOutputBuffer(outputIndex) ?: break
+          if (bufferInfo.flags and android.media.MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
+            bufferInfo.size = 0
+          }
+          if (bufferInfo.size > 0) {
+            outputBuffer.position(bufferInfo.offset)
+            outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
+            muxer.writeSampleData(videoTrackIndex, outputBuffer, bufferInfo)
+          }
+          codec.releaseOutputBuffer(outputIndex, false)
+          if (bufferInfo.flags and android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) return
+        }
+        else -> break
+      }
+    }
+  }
+
+  private fun bgraToNv21(bgra: ByteArray, nv21: ByteArray, width: Int, height: Int) {
+    var yIndex = 0
+    var uvIndex = width * height
+    for (j in 0 until height) {
+      for (i in 0 until width) {
+        val px = (j * width + i) * 4
+        val b = bgra[px].toInt() and 0xFF
+        val g = bgra[px + 1].toInt() and 0xFF
+        val r = bgra[px + 2].toInt() and 0xFF
+
+        val y = ((66 * r + 129 * g + 25 * b + 128) shr 8) + 16
+        nv21[yIndex++] = y.coerceIn(0, 255).toByte()
+
+        if (j % 2 == 0 && i % 2 == 0) {
+          val v = ((112 * r - 94 * g - 18 * b + 128) shr 8) + 128
+          val u = ((-38 * r - 74 * g + 112 * b + 128) shr 8) + 128
+          nv21[uvIndex++] = v.coerceIn(0, 255).toByte()
+          nv21[uvIndex++] = u.coerceIn(0, 255).toByte()
+        }
+      }
+    }
+  }
+
+  private fun stopRecorder(): String {
+    if (!isRecording) return ""
+    isRecording = false
+
+    try {
+      val codec = mediaCodec
+      if (codec != null) {
+        val inputIndex = codec.dequeueInputBuffer(5000)
+        if (inputIndex >= 0) {
+          codec.queueInputBuffer(
+            inputIndex, 0, 0, 0,
+            android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM
+          )
+        }
+        drainEncoder(true)
+        codec.stop()
+        codec.release()
+      }
+      mediaMuxer?.stop()
+      mediaMuxer?.release()
+    } catch (e: Exception) {
+      println("[WebGPUCamera] Recorder stop error: $e")
+    }
+    mediaCodec = null
+    mediaMuxer = null
+
+    println("[WebGPUCamera] Recording finished: $recordedFrameCount frames, $recordingOutputPath")
+    return recordingOutputPath
   }
 }

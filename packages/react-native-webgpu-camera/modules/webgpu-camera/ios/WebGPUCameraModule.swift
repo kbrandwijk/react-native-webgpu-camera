@@ -9,6 +9,14 @@ public class WebGPUCameraModule: Module {
   private let sessionQueue = DispatchQueue(label: "webgpu-camera-session")
   private let frameQueue = DispatchQueue(label: "webgpu-camera-frame", qos: .userInteractive)
 
+  // --- Recorder (Spike 4) ---
+  private var assetWriter: AVAssetWriter?
+  private var writerInput: AVAssetWriterInput?
+  private var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
+  private var isRecording = false
+  private var recordedFrameCount: Int64 = 0
+  private var recordingOutputPath: String = ""
+
   public func definition() -> ModuleDefinition {
     Name("WebGPUCamera")
 
@@ -39,11 +47,15 @@ public class WebGPUCameraModule: Module {
     }
 
     Function("startTestRecorder") { (outputPath: String, width: Int, height: Int) -> Int in
-      return Int(startTestRecorder(outputPath: outputPath, width: UInt32(width), height: UInt32(height)))
+      return self.startRecorder(outputPath: outputPath, width: width, height: height)
     }
 
     Function("stopTestRecorder") { () -> String in
-      return stopTestRecorder()
+      return self.stopRecorder()
+    }
+
+    Function("appendFrameToRecorder") { (pixels: Data, width: Int, height: Int) in
+      self.appendFrameToRecorder(pixels: pixels, width: width, height: height)
     }
 
     Function("getThermalState") { () -> String in
@@ -113,6 +125,108 @@ public class WebGPUCameraModule: Module {
       self.frameDelegate = nil
       print("[WebGPUCamera] Camera stopped")
     }
+  }
+
+  // MARK: - Recorder
+
+  private func startRecorder(outputPath: String, width: Int, height: Int) -> Int {
+    let url = URL(fileURLWithPath: outputPath)
+    try? FileManager.default.removeItem(at: url)
+
+    do {
+      let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+
+      let videoSettings: [String: Any] = [
+        AVVideoCodecKey: AVVideoCodecType.h264,
+        AVVideoWidthKey: width,
+        AVVideoHeightKey: height,
+        AVVideoCompressionPropertiesKey: [
+          AVVideoAverageBitRateKey: 10_000_000,
+          AVVideoExpectedSourceFrameRateKey: 30,
+        ]
+      ]
+
+      let input = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+      input.expectsMediaDataInRealTime = true
+
+      let sourcePixelBufferAttributes: [String: Any] = [
+        kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+        kCVPixelBufferWidthKey as String: width,
+        kCVPixelBufferHeightKey as String: height,
+      ]
+
+      let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+        assetWriterInput: input,
+        sourcePixelBufferAttributes: sourcePixelBufferAttributes
+      )
+
+      if writer.canAdd(input) {
+        writer.add(input)
+      }
+
+      writer.startWriting()
+      writer.startSession(atSourceTime: .zero)
+
+      self.assetWriter = writer
+      self.writerInput = input
+      self.pixelBufferAdaptor = adaptor
+      self.isRecording = true
+      self.recordedFrameCount = 0
+      self.recordingOutputPath = outputPath
+
+      print("[WebGPUCamera] Recorder started: \(outputPath)")
+      return 0 // Readback path
+    } catch {
+      print("[WebGPUCamera] Recorder setup failed: \(error)")
+      return 0
+    }
+  }
+
+  private func stopRecorder() -> String {
+    guard let writer = assetWriter, isRecording else { return "" }
+
+    isRecording = false
+    writerInput?.markAsFinished()
+
+    let semaphore = DispatchSemaphore(value: 0)
+    let outputPath = recordingOutputPath
+
+    writer.finishWriting {
+      print("[WebGPUCamera] Recording finished: \(self.recordedFrameCount) frames, path: \(outputPath)")
+      semaphore.signal()
+    }
+    semaphore.wait()
+
+    assetWriter = nil
+    writerInput = nil
+    pixelBufferAdaptor = nil
+
+    return outputPath
+  }
+
+  func appendFrameToRecorder(pixels: Data, width: Int, height: Int) {
+    guard isRecording,
+          let adaptor = pixelBufferAdaptor,
+          let input = writerInput,
+          input.isReadyForMoreMediaData else { return }
+
+    guard let pool = adaptor.pixelBufferPool else { return }
+
+    var pixelBuffer: CVPixelBuffer?
+    let status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pixelBuffer)
+
+    guard status == kCVReturnSuccess, let buffer = pixelBuffer else { return }
+
+    CVPixelBufferLockBaseAddress(buffer, [])
+    defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+
+    if let baseAddress = CVPixelBufferGetBaseAddress(buffer) {
+      pixels.copyBytes(to: baseAddress.assumingMemoryBound(to: UInt8.self), count: min(pixels.count, width * height * 4))
+    }
+
+    let frameTime = CMTime(value: recordedFrameCount, timescale: 30)
+    adaptor.append(buffer, withPresentationTime: frameTime)
+    recordedFrameCount += 1
   }
 }
 
