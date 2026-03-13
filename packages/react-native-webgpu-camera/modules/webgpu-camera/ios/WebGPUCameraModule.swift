@@ -1,42 +1,49 @@
 import ExpoModulesCore
+import AVFoundation
+import CoreVideo
 
 public class WebGPUCameraModule: Module {
+  private var captureSession: AVCaptureSession?
+  private var dataOutput: AVCaptureVideoDataOutput?
+  private var frameDelegate: FrameDelegate?
+  private let sessionQueue = DispatchQueue(label: "webgpu-camera-session")
+  private let frameQueue = DispatchQueue(label: "webgpu-camera-frame", qos: .userInteractive)
+
   public func definition() -> ModuleDefinition {
     Name("WebGPUCamera")
 
     Function("startCameraPreview") { (deviceId: String, width: Int, height: Int) in
-      // TODO: Call Rust start_camera_preview via UniFFI bindings
-      print("[WebGPUCamera] startCameraPreview(\(deviceId), \(width)x\(height))")
+      self.startCapture(deviceId: deviceId, width: width, height: height)
     }
 
     Function("stopCameraPreview") {
-      // TODO: Call Rust stop_camera_preview
-      print("[WebGPUCamera] stopCameraPreview")
+      self.stopCapture()
     }
 
     Function("getCurrentFrameHandle") { () -> Int in
-      // TODO: Call Rust get_current_frame_handle
-      return 0
+      return Int(getCurrentFrameHandle())
     }
 
     Function("getCurrentFramePixels") { () -> Data in
-      // TODO: Call Rust get_current_frame_pixels
-      return Data()
+      let pixels = getCurrentFramePixels()
+      return Data(pixels)
     }
 
     Function("getFrameDimensions") { () -> [String: Any] in
-      // TODO: Call Rust get_frame_dimensions
-      return ["width": 0, "height": 0, "bytesPerRow": 0]
+      let dims = getFrameDimensions()
+      return ["width": dims.width, "height": dims.height, "bytesPerRow": dims.bytesPerRow]
+    }
+
+    Function("getFrameCounter") { () -> Int in
+      return Int(getFrameCounter())
     }
 
     Function("startTestRecorder") { (outputPath: String, width: Int, height: Int) -> Int in
-      // TODO: Call Rust start_test_recorder
-      return 0
+      return Int(startTestRecorder(outputPath: outputPath, width: UInt32(width), height: UInt32(height)))
     }
 
     Function("stopTestRecorder") { () -> String in
-      // TODO: Call Rust stop_test_recorder
-      return ""
+      return stopTestRecorder()
     }
 
     Function("getThermalState") { () -> String in
@@ -49,5 +56,97 @@ public class WebGPUCameraModule: Module {
       @unknown default: return "nominal"
       }
     }
+  }
+
+  private func startCapture(deviceId: String, width: Int, height: Int) {
+    sessionQueue.async {
+      let session = AVCaptureSession()
+      session.sessionPreset = .hd1920x1080
+
+      // Find camera device
+      let position: AVCaptureDevice.Position = deviceId == "front" ? .front : .back
+      guard let camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position) else {
+        print("[WebGPUCamera] No camera found for position: \(position)")
+        return
+      }
+
+      do {
+        let input = try AVCaptureDeviceInput(device: camera)
+        if session.canAddInput(input) {
+          session.addInput(input)
+        }
+      } catch {
+        print("[WebGPUCamera] Failed to create camera input: \(error)")
+        return
+      }
+
+      let output = AVCaptureVideoDataOutput()
+      output.videoSettings = [
+        kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+      ]
+      output.alwaysDiscardsLateVideoFrames = true
+
+      // Retain delegate as instance property to prevent deallocation
+      let delegate = FrameDelegate(width: UInt32(width), height: UInt32(height))
+      self.frameDelegate = delegate
+      output.setSampleBufferDelegate(delegate, queue: self.frameQueue)
+
+      if session.canAddOutput(output) {
+        session.addOutput(output)
+      }
+
+      // Update frame dimensions in Rust
+      setFrameDimensions(width: UInt32(width), height: UInt32(height), bytesPerRow: UInt32(width * 4))
+
+      session.startRunning()
+      self.captureSession = session
+      self.dataOutput = output
+      print("[WebGPUCamera] Camera started: \(width)x\(height)")
+    }
+  }
+
+  private func stopCapture() {
+    sessionQueue.async {
+      self.captureSession?.stopRunning()
+      self.captureSession = nil
+      self.dataOutput = nil
+      self.frameDelegate = nil
+      print("[WebGPUCamera] Camera stopped")
+    }
+  }
+}
+
+private class FrameDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+  let width: UInt32
+  let height: UInt32
+
+  init(width: UInt32, height: UInt32) {
+    self.width = width
+    self.height = height
+  }
+
+  func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+    guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+
+    CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+    guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else { return }
+    let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+    let dataSize = bytesPerRow * Int(height)
+
+    // Capture IOSurface handle FIRST for zero-copy investigation
+    var surfaceHandle: UInt64 = 0
+    if let ioSurface = CVPixelBufferGetIOSurface(pixelBuffer) {
+      surfaceHandle = UInt64(IOSurfaceGetID(ioSurface.takeUnretainedValue()))
+      // Log once for zero-copy follow-up
+      if getCurrentFrameHandle() == 0 {
+        print("[WebGPUCamera] IOSurface handle available: \(surfaceHandle) (logged for zero-copy follow-up)")
+      }
+    }
+
+    // Copy pixel data to Rust frame slot, passing the IOSurface handle
+    let data = Data(bytes: baseAddress, count: dataSize)
+    deliverFrame(pixels: [UInt8](data), handle: surfaceHandle)
   }
 }
