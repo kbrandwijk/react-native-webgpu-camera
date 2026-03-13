@@ -17,6 +17,10 @@ interface WebGPUCameraModuleInterface extends NativeModule {
   stopTestRecorder(): string;
   appendFrameToRecorder(pixels: Uint8Array, width: number, height: number): void;
   getThermalState(): string;
+  // Dawn compute pipeline
+  setupComputePipeline(wgslCode: string, width: number, height: number): boolean;
+  cleanupComputePipeline(): void;
+  isComputeReady(): boolean;
 }
 
 export default requireNativeModule<WebGPUCameraModuleInterface>(

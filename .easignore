@@ -1,0 +1,33 @@
+# Exclude react-native-skia submodule pieces not needed for iOS EAS build
+# The submodule is only needed locally for `bun run build:skia`
+
+# Git internals
+packages/react-native-skia/.git
+
+# Example apps and dev tooling
+packages/react-native-skia/apps
+packages/react-native-skia/externals
+
+# Skia package: tests, scripts, TS source (JS is in dist)
+packages/react-native-skia/packages/skia/scripts
+packages/react-native-skia/packages/skia/__tests__
+
+# Exclude src/ except specs/ (codegen needs it for Turbo Module bindings)
+packages/react-native-skia/packages/skia/src/skia
+packages/react-native-skia/packages/skia/src/__tests__
+packages/react-native-skia/packages/skia/src/renderer
+packages/react-native-skia/packages/skia/src/sksg
+packages/react-native-skia/packages/skia/src/dom
+packages/react-native-skia/packages/skia/src/external
+packages/react-native-skia/packages/skia/src/views
+packages/react-native-skia/packages/skia/src/animation
+packages/react-native-skia/packages/skia/src/Platform
+
+# Android libs (1.2 GB) — not needed for iOS build
+packages/react-native-skia/packages/skia/libs/android
+
+# macOS libs needed by Skia podspec prepare_command (checks hasIos && hasMacos)
+# packages/react-native-skia/packages/skia/libs/macos
+
+# Android native code
+packages/react-native-skia/packages/skia/android

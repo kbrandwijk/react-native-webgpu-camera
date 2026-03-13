@@ -1,0 +1,3 @@
+[submodule "packages/react-native-skia"]
+	path = packages/react-native-skia
+	url = https://github.com/Shopify/react-native-skia.git

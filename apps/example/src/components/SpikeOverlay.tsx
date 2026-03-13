@@ -1,6 +1,5 @@
 import React from 'react';
-import { StyleSheet } from 'react-native';
-import { Canvas, Text, RoundedRect, useFont } from '@shopify/react-native-skia';
+import { StyleSheet, View, Text as RNText } from 'react-native';
 
 interface SpikeOverlayProps {
   fps: number;
@@ -60,32 +59,48 @@ export function SpikeOverlay({
   elapsed,
   isRecording,
 }: SpikeOverlayProps) {
-  const font = useFont(null, 13);
-
-  if (!font) return null;
-
-  const x = 16;
-  const y = 60;
-  const lineHeight = 18;
-
   return (
-    <Canvas style={styles.overlay} pointerEvents="none">
-      <RoundedRect x={x} y={y} width={260} height={140} r={8} color="rgba(0,0,0,0.6)" />
-      <Text x={x + 12} y={y + 20} text="Spike Validation" font={font} color="white" />
-      <Text x={x + 12} y={y + 20 + lineHeight} text={`S1 (camera→GPU): ${spike1Status}`} font={font} color="white" />
-      <Text x={x + 12} y={y + 20 + lineHeight * 2} text={`S2 (compute): ${spike2Status}`} font={font} color="white" />
-      <Text x={x + 12} y={y + 20 + lineHeight * 3} text={`S3 (Skia): ${spike3Status}`} font={font} color="white" />
-      <Text x={x + 12} y={y + 20 + lineHeight * 4} text={`S4 (recorder): ${spike4Status}`} font={font} color="white" />
-      <Text x={x + 12} y={y + 20 + lineHeight * 5} text={`FPS: ${fps.toFixed(1)} | ${elapsed}s`} font={font} color="white" />
-      {isRecording && (
-        <RoundedRect x={0} y={0} width={9999} height={9999} r={0} color="rgba(255,0,0,0.15)" />
-      )}
-    </Canvas>
+    <View style={styles.overlay} pointerEvents="none">
+      <View style={styles.box}>
+        <RNText style={styles.title}>Spike Validation</RNText>
+        <RNText style={styles.line}>S1 (camera→GPU): {spike1Status}</RNText>
+        <RNText style={styles.line}>S2 (compute): {spike2Status}</RNText>
+        <RNText style={styles.line}>S3 (Skia): {spike3Status}</RNText>
+        <RNText style={styles.line}>S4 (recorder): {spike4Status}</RNText>
+        <RNText style={styles.line}>FPS: {fps.toFixed(1)} | {elapsed}s</RNText>
+      </View>
+      {isRecording && <View style={styles.recordingFlash} />}
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
   overlay: {
     ...StyleSheet.absoluteFillObject,
+    zIndex: 10,
+  },
+  box: {
+    position: 'absolute',
+    top: 60,
+    left: 16,
+    width: 260,
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    borderRadius: 8,
+    padding: 12,
+  },
+  title: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: '700',
+    marginBottom: 4,
+  },
+  line: {
+    color: '#fff',
+    fontSize: 13,
+    lineHeight: 18,
+  },
+  recordingFlash: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(255,0,0,0.15)',
   },
 });

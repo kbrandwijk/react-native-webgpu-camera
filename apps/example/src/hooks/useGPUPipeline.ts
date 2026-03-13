@@ -1,5 +1,4 @@
 import { useRef, useState, useCallback } from 'react';
-import { useSharedValue } from 'react-native-reanimated';
 import { SOBEL_WGSL } from '@/shaders/sobel.wgsl';
 
 export interface GPUPipelineState {
@@ -26,16 +25,6 @@ export function useGPUPipeline(width = 1920, height = 1080) {
     computeSupported: false,
   });
   const resources = useRef<GPUResources | null>(null);
-
-  // Shared values for worklet access — WebGPU JSI host objects pass directly to worklets.
-  // Declared before initialize() so the closure captures them.
-  const deviceSV = useSharedValue<GPUDevice | null>(null);
-  const computePipelineSV = useSharedValue<GPUComputePipeline | null>(null);
-  const inputTextureSV = useSharedValue<GPUTexture | null>(null);
-  const outputTextureSV = useSharedValue<GPUTexture | null>(null);
-  const bindGroupSV = useSharedValue<GPUBindGroup | null>(null);
-  const widthSV = useSharedValue(width);
-  const heightSV = useSharedValue(height);
 
   const initialize = useCallback(async () => {
     setState(s => ({ ...s, status: 'initializing' }));
@@ -110,15 +99,6 @@ export function useGPUPipeline(width = 1920, height = 1080) {
         device, computePipeline, inputTexture, outputTexture, bindGroup, width, height,
       };
 
-      // Populate shared values for worklet access (Task 9 render loop)
-      deviceSV.value = device;
-      computePipelineSV.value = computePipeline;
-      inputTextureSV.value = inputTexture;
-      outputTextureSV.value = outputTexture;
-      bindGroupSV.value = bindGroup;
-      widthSV.value = width;
-      heightSV.value = height;
-
       setState({ status: 'ready', deviceSource, computeSupported: true });
       console.log('[GPUPipeline] Pipeline ready');
     } catch (error) {
@@ -167,16 +147,5 @@ export function useGPUPipeline(width = 1920, height = 1080) {
     setState({ status: 'idle', deviceSource: 'unknown', computeSupported: false });
   }, []);
 
-  return {
-    state, initialize, processFrame, cleanup, resources,
-    workletResources: {
-      device: deviceSV,
-      computePipeline: computePipelineSV,
-      inputTexture: inputTextureSV,
-      outputTexture: outputTextureSV,
-      bindGroup: bindGroupSV,
-      width: widthSV,
-      height: heightSV,
-    },
-  };
+  return { state, initialize, processFrame, cleanup, resources };
 }

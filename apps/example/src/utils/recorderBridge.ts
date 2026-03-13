@@ -15,7 +15,10 @@ export function startRecording(
   height: number,
   filename = 'spike4_test.mp4'
 ): RecorderState {
-  const outputPath = `${Paths.document}/${filename}`;
+  const docUri = Paths.document.uri;
+  // Paths.document.uri is a file:// URI — strip scheme for native path
+  const docPath = docUri.startsWith('file://') ? docUri.slice(7) : docUri;
+  const outputPath = `${docPath}${filename}`;
   const surfaceHandle = WebGPUCameraModule.startTestRecorder(outputPath, width, height);
 
   const path = surfaceHandle !== 0 ? 'surface-record' : 'readback-record';

@@ -9,6 +9,10 @@ public class WebGPUCameraModule: Module {
   private let sessionQueue = DispatchQueue(label: "webgpu-camera-session")
   private let frameQueue = DispatchQueue(label: "webgpu-camera-frame", qos: .userInteractive)
 
+  // --- Dawn compute pipeline ---
+  var dawnBridge: DawnPipelineBridge?
+  private var computeSetup = false
+
   // --- Recorder (Spike 4) ---
   private var assetWriter: AVAssetWriter?
   private var writerInput: AVAssetWriterInput?
@@ -68,6 +72,36 @@ public class WebGPUCameraModule: Module {
       @unknown default: return "nominal"
       }
     }
+
+    // --- Dawn compute pipeline ---
+
+    Function("setupComputePipeline") { (wgslCode: String, width: Int, height: Int) -> Bool in
+      let bridge = DawnPipelineBridge()
+      let ok = bridge.setup(withWGSL: wgslCode, width: Int32(width), height: Int32(height))
+      if ok {
+        self.dawnBridge = bridge
+        self.computeSetup = true
+        // Install JSI bindings so JS can call __webgpuCamera_getOutputTexture()
+        if let runtime = try? self.appContext?.runtime {
+          bridge.installJSIBindings(runtime)
+        }
+        print("[WebGPUCamera] Compute pipeline setup OK: \(width)x\(height)")
+      } else {
+        print("[WebGPUCamera] Compute pipeline setup FAILED")
+      }
+      return ok
+    }
+
+    Function("cleanupComputePipeline") {
+      self.dawnBridge?.cleanup()
+      self.dawnBridge = nil
+      self.computeSetup = false
+      print("[WebGPUCamera] Compute pipeline cleaned up")
+    }
+
+    Function("isComputeReady") { () -> Bool in
+      return self.computeSetup
+    }
   }
 
   private func startCapture(deviceId: String, width: Int, height: Int) {
@@ -99,7 +133,7 @@ public class WebGPUCameraModule: Module {
       output.alwaysDiscardsLateVideoFrames = true
 
       // Retain delegate as instance property to prevent deallocation
-      let delegate = FrameDelegate(width: UInt32(width), height: UInt32(height))
+      let delegate = FrameDelegate(width: UInt32(width), height: UInt32(height), module: self)
       self.frameDelegate = delegate
       output.setSampleBufferDelegate(delegate, queue: self.frameQueue)
 
@@ -233,14 +267,19 @@ public class WebGPUCameraModule: Module {
 private class FrameDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
   let width: UInt32
   let height: UInt32
+  weak var module: WebGPUCameraModule?
 
-  init(width: UInt32, height: UInt32) {
+  init(width: UInt32, height: UInt32, module: WebGPUCameraModule) {
     self.width = width
     self.height = height
+    self.module = module
   }
 
   func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
     guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+
+    // Run Dawn compute pipeline on the raw CVPixelBuffer (zero-copy via IOSurface)
+    module?.dawnBridge?.processFrame(pixelBuffer)
 
     CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
     defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
@@ -261,6 +300,9 @@ private class FrameDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferDeleg
 
     // Copy pixel data to Rust frame slot, passing the IOSurface handle
     let data = Data(bytes: baseAddress, count: dataSize)
-    deliverFrame(pixels: [UInt8](data), handle: surfaceHandle)
+    deliverFrame(pixels: data, handle: surfaceHandle)
+
+    // Feed frames to recorder when active
+    module?.appendFrameToRecorder(pixels: data, width: Int(width), height: Int(height))
   }
 }

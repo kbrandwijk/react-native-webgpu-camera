@@ -1,7 +1,16 @@
 /**
- * Expo config plugin that copies Dawn/WebGPU and Skia private headers from
- * react-native-skia-graphite-headers into @shopify/react-native-skia/cpp/
- * so the Graphite build can find webgpu/webgpu_cpp.h, ContextOptionsPriv.h, etc.
+ * Expo config plugin that copies Skia private headers from the submodule's
+ * externals/skia into @shopify/react-native-skia/cpp/skia/ so the Graphite
+ * build can find ContextOptionsPriv.h and other private headers.
+ *
+ * With the submodule approach, Dawn/WebGPU headers and xcframeworks are
+ * handled by `install-skia-graphite` / `build-skia`. This plugin only
+ * needs to ensure Skia private headers are in place if they weren't
+ * copied by the install script.
+ *
+ * Previous workarounds (sk_sp<const SkData> patching, graphite-headers
+ * package copying) are no longer needed since we build/install from the
+ * submodule where headers and binaries always match.
  */
 const { withDangerousMod } = require("expo/config-plugins");
 const path = require("path");
@@ -26,13 +35,8 @@ module.exports = function withSkiaGraphiteHeaders(config) {
     (config) => {
       const projectRoot = config.modRequest.projectRoot;
 
-      let headersDir, skiaDir;
+      let skiaDir;
       try {
-        headersDir = path.dirname(
-          require.resolve("react-native-skia-graphite-headers/package.json", {
-            paths: [projectRoot],
-          })
-        );
         skiaDir = path.dirname(
           require.resolve("@shopify/react-native-skia/package.json", {
             paths: [projectRoot],
@@ -40,24 +44,51 @@ module.exports = function withSkiaGraphiteHeaders(config) {
         );
       } catch (e) {
         console.warn(
-          "[withSkiaGraphiteHeaders] Could not resolve packages:",
+          "[withSkiaGraphiteHeaders] Could not resolve @shopify/react-native-skia:",
           e.message
         );
         return config;
       }
 
-      const headersCppDir = path.join(headersDir, "libs", "skia", "cpp");
-      const skiaCppDir = path.join(skiaDir, "cpp");
+      // Check if Dawn headers are in place (from install-skia-graphite)
+      const dawnDir = path.join(skiaDir, "cpp", "dawn");
+      if (!fs.existsSync(dawnDir)) {
+        console.warn(
+          "[withSkiaGraphiteHeaders] Dawn headers not found at",
+          dawnDir
+        );
+        console.warn(
+          "  Run: bun run install:skia-graphite"
+        );
+      }
 
-      // Copy both dawn/ (WebGPU headers) and skia/ (Skia private headers)
-      for (const subdir of ["dawn", "skia"]) {
-        const src = path.join(headersCppDir, subdir);
-        const dest = path.join(skiaCppDir, subdir);
-        if (fs.existsSync(src)) {
-          console.log(`[withSkiaGraphiteHeaders] Copying ${subdir} headers`);
-          console.log(`  from: ${src}`);
-          console.log(`  to:   ${dest}`);
-          copyDirSync(src, dest);
+      // Check if Skia private headers are in place
+      const skiaPrivateHeaders = path.join(
+        skiaDir,
+        "cpp",
+        "skia",
+        "src",
+        "gpu",
+        "graphite"
+      );
+      if (!fs.existsSync(skiaPrivateHeaders)) {
+        // Try copying from externals/skia in the submodule
+        const submoduleSkiaSrc = path.join(
+          skiaDir,
+          "..",
+          "..",
+          "externals",
+          "skia",
+          "src",
+          "gpu",
+          "graphite"
+        );
+        if (fs.existsSync(submoduleSkiaSrc)) {
+          console.log(
+            "[withSkiaGraphiteHeaders] Copying Skia private headers from submodule"
+          );
+          const dest = path.join(skiaDir, "cpp", "skia", "src", "gpu", "graphite");
+          copyDirSync(submoduleSkiaSrc, dest);
         }
       }
 

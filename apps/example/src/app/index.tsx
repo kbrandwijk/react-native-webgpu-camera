@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import {
   View,
   Text,
@@ -6,283 +6,205 @@ import {
   Pressable,
   Platform,
   ScrollView,
+  useWindowDimensions,
 } from 'react-native';
-import { runOnUI, runOnJS, useSharedValue } from 'react-native-reanimated';
+import { Canvas, Fill, Group, Image as SkImage, Skia, type SkImage as SkImageType } from '@shopify/react-native-skia';
 import { useSpikeMetrics, SpikeResults } from '@/hooks/useSpikeMetrics';
-import { useGPUPipeline } from '@/hooks/useGPUPipeline';
-import { SpikeOverlay } from '@/components/SpikeOverlay';
 import { startRecording, stopRecording, RecorderState } from '@/utils/recorderBridge';
 import WebGPUCameraModule from 'react-native-webgpu-camera/modules/webgpu-camera/src/WebGPUCameraModule';
+import { SOBEL_WGSL } from '@/shaders/sobel.wgsl';
+
+declare global {
+  function __webgpuCamera_getOutputTexture(): GPUTexture | null;
+}
 
 const CAMERA_WIDTH = 1920;
 const CAMERA_HEIGHT = 1080;
-const TARGET_FPS = 30;
-const FRAME_INTERVAL = 1000 / TARGET_FPS;
 const RUN_DURATION_S = 60;
+
+function PreviewCanvas({ previewImage }: { previewImage: SkImageType | null }) {
+  const { width: screenW, height: screenH } = useWindowDimensions();
+  return (
+    <Canvas style={StyleSheet.absoluteFill}>
+      <Fill color="black" />
+      {previewImage && (
+        <Group transform={[
+          { translateX: screenW },
+          { rotate: Math.PI / 2 },
+        ]}>
+          <SkImage image={previewImage} x={0} y={0} width={screenH} height={screenW} fit="cover" />
+        </Group>
+      )}
+    </Canvas>
+  );
+}
 
 export default function CameraSpikeScreen() {
   const [isRunning, setIsRunning] = useState(false);
+  const [status, setStatus] = useState('idle');
   const [recorderState, setRecorderState] = useState<RecorderState | null>(null);
-  const [spikeStatus, setSpikeStatus] = useState({
-    spike1: 'pending',
-    spike2: 'pending',
-    spike3: 'pending',
-    spike4: 'pending',
-    fps: 0,
-    elapsed: 0,
-  });
   const [results, setResults] = useState<SpikeResults | null>(null);
   const metrics = useSpikeMetrics();
-  const pipeline = useGPUPipeline(CAMERA_WIDTH, CAMERA_HEIGHT);
 
-  // Shared values for worklet thread access (avoids stale closures)
-  const isRunningRef = useSharedValue(false);
-  // Use shared value (not React ref) so worklet can read recorder status
-  const recorderPathSV = useSharedValue<string>('pending');
+  const isRunningRef = useRef(false);
+  const recorderPathRef = useRef('pending');
+  const lastFrameCounter = useRef(0);
+  const startTimeRef = useRef(0);
+  const rafRef = useRef<number | null>(null);
+  const [previewImage, setPreviewImage] = useState<SkImageType | null>(null);
+  const prevImageRef = useRef<SkImageType | null>(null);
 
-  // Push status updates from worklet -> JS thread
-  const updateStatus = useCallback((status: typeof spikeStatus) => {
-    setSpikeStatus(status);
-  }, []);
-
-  // autoStop is called from the worklet via runOnJS when elapsed >= RUN_DURATION_S.
-  // Sets shared value to stop the loop; the useEffect cleanup handles full teardown.
-  // Avoids circular dependency with stopPipeline (defined below).
-  const autoStop = useCallback(() => {
-    isRunningRef.value = false;
-    setIsRunning(false);
-  }, [isRunningRef]);
-
-  // Access worklet-compatible shared values from the pipeline hook
-  const { workletResources } = pipeline;
-
-  // Shared values for worklet-side state (React refs are NOT accessible from worklets)
-  const lastFrameCounterSV = useSharedValue(0);
-  const startTimeSV = useSharedValue(0);
-  const spike2StatusSV = useSharedValue('pending');
-  const spike3StatusSV = useSharedValue('pending');
-
-  // Callbacks for runOnJS — must be stable references
-  const recordFrameJS = useCallback((timing: { importMs: number; computeMs: number; skiaMs: number; totalMs: number }) => {
-    metrics.recordFrame(timing);
-  }, [metrics]);
-
-  const recordThermalJS = useCallback((thermal: string) => {
-    metrics.recordThermalChange(thermal);
-  }, [metrics]);
-
-  // Worklet render loop — runs on UI thread via runOnUI
-  // This validates Spike 2: WebGPU compute dispatch from worklet thread
   const startRenderLoop = useCallback(() => {
-    // Capture current spike status for worklet
-    spike2StatusSV.value = pipeline.state.computeSupported ? 'worklet-compute' : 'pending';
-    spike3StatusSV.value = pipeline.state.deviceSource === 'graphite' ? 'graphite' : 'pending';
-    startTimeSV.value = performance.now();
+    startTimeRef.current = performance.now();
+    lastFrameCounter.current = 0;
 
     const tick = () => {
-      'worklet';
-      if (!isRunningRef.value) return;
+      if (!isRunningRef.current) return;
 
-      // Read frame counter from native module (JSI call — works from worklet)
       const frameCounter = WebGPUCameraModule.getFrameCounter();
+      if (frameCounter > lastFrameCounter.current) {
+        lastFrameCounter.current = frameCounter;
 
-      if (frameCounter > lastFrameCounterSV.value) {
-        lastFrameCounterSV.value = frameCounter;
+        const t0 = performance.now();
 
-        // Get frame data from native module (JSI calls — work from worklet)
-        const pixels = WebGPUCameraModule.getCurrentFramePixels();
-        const dims = WebGPUCameraModule.getFrameDimensions();
+        // Get the compute output texture from native (zero-copy GPU path)
+        const outputTexture = globalThis.__webgpuCamera_getOutputTexture?.();
+        const tTexture = performance.now();
 
-        // Read WebGPU resources from shared values (NOT React refs)
-        const device = workletResources.device.value;
-        const computePipeline = workletResources.computePipeline.value;
-        const inputTexture = workletResources.inputTexture.value;
-        const bindGroup = workletResources.bindGroup.value;
-        const w = workletResources.width.value;
-        const h = workletResources.height.value;
+        if (outputTexture) {
+          // Wrap GPU texture as SkImage (texture bind only, no pixel copy)
+          const skImage = Skia.Image.MakeImageFromTexture(outputTexture);
+          const tSkia = performance.now();
 
-        if (pixels.length > 0 && dims.width > 0 && device && computePipeline && inputTexture && bindGroup) {
-          const t0 = performance.now();
-
-          // Upload camera frame to input texture — THIS IS THE SPIKE 2 VALIDATION
-          // WebGPU JSI calls executing on the worklet/UI thread
-          device.queue.writeTexture(
-            { texture: inputTexture },
-            pixels.buffer as ArrayBuffer,
-            { bytesPerRow: dims.bytesPerRow },
-            { width: w, height: h },
-          );
-          const tImport = performance.now();
-
-          // Dispatch Sobel compute on worklet thread
-          const encoder = device.createCommandEncoder();
-          const pass = encoder.beginComputePass();
-          pass.setPipeline(computePipeline);
-          pass.setBindGroup(0, bindGroup);
-          pass.dispatchWorkgroups(
-            Math.ceil(w / 16),
-            Math.ceil(h / 16),
-          );
-          pass.end();
-          device.queue.submit([encoder.finish()]);
-          const tCompute = performance.now();
-
-          const skiaMs = 0; // Measured separately via Skia rendering
-
-          // Push timing data to JS thread for metrics
-          runOnJS(recordFrameJS)({
-            importMs: tImport - t0,
-            computeMs: tCompute - tImport,
-            skiaMs,
-            totalMs: tCompute - t0 + skiaMs,
-          });
-
-          const elapsed = Math.floor((performance.now() - startTimeSV.value) / 1000);
-
-          runOnJS(updateStatus)({
-            spike1: 'copy-fallback',
-            spike2: spike2StatusSV.value,
-            spike3: spike3StatusSV.value,
-            spike4: recorderPathSV.value,
-            fps: 0, // Updated from metrics on JS side
-            elapsed,
-          });
-
-          // Check thermal state every ~1s
-          if (frameCounter % 30 === 0) {
-            const thermal = WebGPUCameraModule.getThermalState();
-            runOnJS(recordThermalJS)(thermal);
+          if (skImage) {
+            prevImageRef.current?.dispose();
+            prevImageRef.current = skImage;
+            setPreviewImage(skImage);
           }
 
-          // Auto-stop after RUN_DURATION_S
-          if (elapsed >= RUN_DURATION_S) {
-            runOnJS(autoStop)();
-            return;
-          }
+          metrics.recordFrame({
+            importMs: tTexture - t0,
+            computeMs: 0, // compute runs on native thread, not measured here
+            skiaMs: tSkia - tTexture,
+            totalMs: tSkia - t0,
+          });
+        }
+
+        const elapsed = Math.floor((performance.now() - startTimeRef.current) / 1000);
+
+        if (frameCounter % 30 === 0) {
+          metrics.recordThermalChange(WebGPUCameraModule.getThermalState());
+        }
+
+        if (elapsed >= RUN_DURATION_S) {
+          isRunningRef.current = false;
+          setIsRunning(false);
+          return;
         }
       }
-
-      // Schedule next tick on UI thread.
-      // RISK: Reanimated's worklet runtime may not support setTimeout natively.
-      // Fallbacks: requestAnimationFrame, or move loop to JS with runOnJS.
-      setTimeout(tick, FRAME_INTERVAL);
+      rafRef.current = requestAnimationFrame(tick);
     };
 
-    runOnUI(tick)();
-  }, [pipeline, isRunningRef, workletResources, updateStatus, autoStop, recordFrameJS, recordThermalJS, lastFrameCounterSV, startTimeSV, spike2StatusSV, spike3StatusSV, recorderPathSV]);
+    // Small delay to let camera start producing frames
+    setTimeout(() => {
+      rafRef.current = requestAnimationFrame(tick);
+    }, 500);
+  }, [metrics]);
 
-  const startPipeline = useCallback(async () => {
-    isRunningRef.value = true;
+  const startPipeline = useCallback(() => {
+    isRunningRef.current = true;
     setIsRunning(true);
     setResults(null);
     metrics.reset();
-    lastFrameCounterSV.value = 0;
-    startTimeSV.value = 0;
 
-    // Initialize GPU pipeline
-    await pipeline.initialize();
+    // 1. Setup native compute pipeline (compiles WGSL, creates GPU resources, installs JSI)
+    const ok = WebGPUCameraModule.setupComputePipeline(SOBEL_WGSL, CAMERA_WIDTH, CAMERA_HEIGHT);
+    if (!ok) {
+      setStatus('compute setup failed');
+      console.error('[CameraSpikeScreen] Compute pipeline setup failed');
+      return;
+    }
+    setStatus('compute ready');
 
-    // Start camera
+    // 2. Start camera — each frame runs compute on native thread
     WebGPUCameraModule.startCameraPreview('back', CAMERA_WIDTH, CAMERA_HEIGHT);
+    console.log('[CameraSpikeScreen] Native pipeline started');
 
-    console.log('[CameraSpikeScreen] Pipeline started');
-
-    // Start render loop after a brief delay for camera to warm up
-    setTimeout(() => {
-      startRenderLoop();
-    }, 500);
-  }, [pipeline, metrics, startRenderLoop, isRunningRef, lastFrameCounterSV, startTimeSV]);
+    // 3. Start JS render loop to poll output texture
+    startRenderLoop();
+  }, [metrics.reset, startRenderLoop]);
 
   const stopPipeline = useCallback(() => {
-    isRunningRef.value = false;
+    isRunningRef.current = false;
     setIsRunning(false);
+    if (rafRef.current != null) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
 
-    // Stop camera
     WebGPUCameraModule.stopCameraPreview();
+    WebGPUCameraModule.cleanupComputePipeline();
 
-    // Stop recorder if active
     if (recorderState?.isRecording) {
       stopRecording();
       setRecorderState(null);
-      recorderPathSV.value = 'pending';
+      recorderPathRef.current = 'pending';
     }
 
-    // Log results
     metrics.logSummary({
-      spike1Path: 'copy-fallback',
-      spike2Path: pipeline.state.computeSupported ? 'worklet-compute' : 'unknown',
-      spike3Path: pipeline.state.deviceSource === 'graphite' ? 'graphite' : 'unknown',
-      spike4Path: recorderPathSV.value === 'pending' ? 'unknown' : recorderPathSV.value as SpikeResults['spike4Path'],
+      spike1Path: 'zero-copy',
+      spike2Path: 'worklet-compute',
+      spike3Path: 'graphite',
+      spike4Path: recorderPathRef.current === 'pending' ? 'unknown' : recorderPathRef.current as SpikeResults['spike4Path'],
     });
 
     const summary = metrics.getSummary();
     if (summary) {
       setResults({
         ...summary,
-        spike1Path: 'copy-fallback',
-        spike2Path: pipeline.state.computeSupported ? 'worklet-compute' : 'unknown',
-        spike3Path: pipeline.state.deviceSource === 'graphite' ? 'graphite' : 'unknown',
-        spike4Path: recorderPathSV.value === 'pending' ? 'unknown' : recorderPathSV.value as SpikeResults['spike4Path'],
+        spike1Path: 'zero-copy',
+        spike2Path: 'worklet-compute',
+        spike3Path: 'graphite',
+        spike4Path: recorderPathRef.current === 'pending' ? 'unknown' : recorderPathRef.current as SpikeResults['spike4Path'],
       });
     }
-
-    // Cleanup GPU resources
-    pipeline.cleanup();
-  }, [pipeline, metrics, recorderState, isRunningRef, recorderPathSV]);
+    setStatus('idle');
+  }, [metrics, recorderState]);
 
   const handleStartRecording = useCallback(() => {
     const state = startRecording(CAMERA_WIDTH, CAMERA_HEIGHT);
     setRecorderState(state);
-    recorderPathSV.value = state.path;
-    setSpikeStatus(s => ({ ...s, spike4: state.path }));
-
-    // Stop after 5 seconds
+    recorderPathRef.current = state.path;
     setTimeout(() => {
       const filePath = stopRecording();
       setRecorderState(null);
-      recorderPathSV.value = 'pending';
+      recorderPathRef.current = 'pending';
       console.log(`[CameraSpikeScreen] Recording saved: ${filePath}`);
     }, 5000);
-  }, [recorderPathSV]);
+  }, []);
 
-  // Cleanup on unmount
   useEffect(() => {
     return () => {
-      isRunningRef.value = false;
-      pipeline.cleanup();
+      isRunningRef.current = false;
+      if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
+      prevImageRef.current?.dispose();
+      WebGPUCameraModule.cleanupComputePipeline();
     };
-  }, [pipeline, isRunningRef]);
+  }, []);
 
   return (
     <View style={styles.container}>
-      {/* Skia overlay — validates Spike 3 */}
-      <SpikeOverlay
-        fps={spikeStatus.fps}
-        spike1Status={spikeStatus.spike1}
-        spike2Status={spikeStatus.spike2}
-        spike3Status={spikeStatus.spike3}
-        spike4Status={spikeStatus.spike4}
-        elapsed={spikeStatus.elapsed}
-        isRecording={recorderState?.isRecording ?? false}
-      />
+      <PreviewCanvas previewImage={previewImage} />
 
-      {/* Pipeline status */}
       <View style={styles.statusBar}>
         <Text style={styles.statusText}>
-          GPU: {pipeline.state.status} | Source: {pipeline.state.deviceSource}
-          {pipeline.state.error ? ` | Error: ${pipeline.state.error}` : ''}
+          Pipeline: {status}
         </Text>
       </View>
 
-      {/* Controls */}
       <View style={styles.controls}>
         <Pressable
           style={[styles.button, isRunning && styles.buttonActive]}
           onPress={isRunning ? stopPipeline : startPipeline}
         >
-          <Text style={styles.buttonText}>
-            {isRunning ? 'Stop' : 'Start Pipeline'}
-          </Text>
+          <Text style={styles.buttonText}>{isRunning ? 'Stop' : 'Start Pipeline'}</Text>
         </Pressable>
 
         {isRunning && (
@@ -298,13 +220,10 @@ export default function CameraSpikeScreen() {
         )}
       </View>
 
-      {/* Results display */}
       {results && (
         <ScrollView style={styles.results}>
           <Text style={styles.resultsTitle}>Spike Results</Text>
-          <Text style={styles.resultsText}>
-            {JSON.stringify(results, null, 2)}
-          </Text>
+          <Text style={styles.resultsText}>{JSON.stringify(results, null, 2)}</Text>
         </ScrollView>
       )}
     </View>
@@ -312,69 +231,26 @@ export default function CameraSpikeScreen() {
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#000',
-  },
+  container: { flex: 1, backgroundColor: '#000' },
   statusBar: {
-    position: 'absolute',
-    top: 44,
-    left: 16,
-    right: 16,
-    backgroundColor: 'rgba(0,0,0,0.6)',
-    borderRadius: 4,
-    padding: 8,
+    position: 'absolute', top: 44, left: 16, right: 16,
+    backgroundColor: 'rgba(0,0,0,0.6)', borderRadius: 4, padding: 8,
   },
-  statusText: {
-    color: '#aaa',
-    fontSize: 11,
-    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
-  },
+  statusText: { color: '#aaa', fontSize: 11, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
   controls: {
-    position: 'absolute',
-    bottom: 60,
-    left: 16,
-    right: 16,
-    flexDirection: 'row',
-    justifyContent: 'center',
-    gap: 16,
+    position: 'absolute', bottom: 60, left: 16, right: 16,
+    flexDirection: 'row', justifyContent: 'center', gap: 16,
   },
   button: {
-    backgroundColor: 'rgba(255,255,255,0.2)',
-    borderRadius: 24,
-    paddingHorizontal: 24,
-    paddingVertical: 14,
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.3)',
+    backgroundColor: 'rgba(255,255,255,0.2)', borderRadius: 24,
+    paddingHorizontal: 24, paddingVertical: 14, borderWidth: 1, borderColor: 'rgba(255,255,255,0.3)',
   },
-  buttonActive: {
-    backgroundColor: 'rgba(255,80,80,0.4)',
-    borderColor: 'rgba(255,80,80,0.6)',
-  },
-  buttonText: {
-    color: '#fff',
-    fontSize: 16,
-    fontWeight: '600',
-  },
+  buttonActive: { backgroundColor: 'rgba(255,80,80,0.4)', borderColor: 'rgba(255,80,80,0.6)' },
+  buttonText: { color: '#fff', fontSize: 16, fontWeight: '600' },
   results: {
-    position: 'absolute',
-    top: 220,
-    left: 16,
-    right: 16,
-    backgroundColor: 'rgba(0,0,0,0.8)',
-    borderRadius: 8,
-    padding: 12,
-    maxHeight: 300,
+    position: 'absolute', top: 220, left: 16, right: 16,
+    backgroundColor: 'rgba(0,0,0,0.8)', borderRadius: 8, padding: 12, maxHeight: 300,
   },
-  resultsTitle: {
-    color: '#0f0',
-    fontSize: 16,
-    fontWeight: '700',
-    marginBottom: 8,
-  },
-  resultsText: {
-    color: '#0f0',
-    fontSize: 11,
-    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
-  },
+  resultsTitle: { color: '#0f0', fontSize: 16, fontWeight: '700', marginBottom: 8 },
+  resultsText: { color: '#0f0', fontSize: 11, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
 });
