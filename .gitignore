@@ -5,7 +5,6 @@ dist/
 apps/*/ios/
 apps/*/android/
 *.jsbundle
-bun.lock
 
 # Rust build artifacts (NOT the prebuilts — those are committed)
 **/rust/target/
