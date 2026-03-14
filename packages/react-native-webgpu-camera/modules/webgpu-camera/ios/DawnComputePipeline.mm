@@ -2,37 +2,59 @@
 
 #include "rnskia/RNDawnContext.h"
 #include "rnskia/RNSkPlatformContext.h"
-#include "include/core/SkImage.h"
 
-// Skia JSI host objects — needed to return JsiSkImage from nextImage()
-#include "api/JsiSkHostObjects.h"
-#include "api/JsiSkImage.h"
+#include "include/core/SkImage.h"
+#include "include/core/SkSurface.h"
+#include "include/core/SkCanvas.h"
+#include "include/gpu/graphite/BackendTexture.h"
+#include "include/gpu/graphite/Surface.h"
 
 #include <jsi/jsi.h>
-#include <atomic>
+#include "api/JsiSkImage.h"
+#include "api/JsiSkCanvas.h"
+
 #include <CoreVideo/CoreVideo.h>
 #include <CoreVideo/CVPixelBufferIOSurface.h>
+#include <vector>
 
-// Access SkiaManager singleton (New Architecture) to get RNSkPlatformContext
 #import "SkiaManager.h"
-
-using namespace RNSkia;
 
 namespace dawn_pipeline {
 
+struct StagingBuffer {
+  wgpu::Buffer gpuBuffer;
+  wgpu::Buffer staging[2];
+  int frameIndex = 0;
+  int byteSize = 0;
+  int elementSize = 0;
+  int count = 0;
+  int passIndex = 0;
+  std::atomic<bool> mapped[2] = {false, false};
+  const void* mappedData[2] = {nullptr, nullptr};
+};
+
+struct PassState {
+  wgpu::ComputePipeline pipeline;
+  wgpu::BindGroupLayout bindGroupLayout;
+  bool hasOutputBuffer = false;
+  int bufferIndex = -1;
+};
+
 struct DawnComputePipeline::Impl {
   wgpu::Device device;
-  wgpu::ComputePipeline computePipeline;
-  wgpu::BindGroupLayout bindGroupLayout;
-  wgpu::Texture outputTexture;
+  std::vector<PassState> passes;
+  wgpu::Texture texA;
+  wgpu::Texture texB;
+  std::vector<StagingBuffer> buffers;
+  bool syncMode = false;
+  bool useCanvas = false;
+  sk_sp<SkSurface> surface;
+  wgpu::Texture* finalTex = nullptr;
   sk_sp<SkImage> outputImage;
-
-  // Reusable bind group — recreated each frame with new input texture
-  wgpu::BindGroup bindGroup;
 };
 
 DawnComputePipeline::DawnComputePipeline()
-    : _alive(std::make_shared<std::atomic<bool>>(true)) {}
+  : _alive(std::make_shared<std::atomic<bool>>(true)) {}
 
 DawnComputePipeline::~DawnComputePipeline() {
   _alive->store(false);
@@ -40,58 +62,26 @@ DawnComputePipeline::~DawnComputePipeline() {
   cleanupLocked();
 }
 
-bool DawnComputePipeline::setup(const std::string &wgslCode, int width, int height) {
+bool DawnComputePipeline::setup(
+    const std::vector<std::string>& wgslShaders,
+    int width, int height,
+    const std::vector<BufferSpec>& bufferSpecs,
+    bool useCanvas, bool sync) {
   std::lock_guard<std::mutex> lock(_mutex);
-
   cleanupLocked();
+
   _width = width;
   _height = height;
   _impl = new Impl();
 
-  auto &ctx = DawnContext::getInstance();
+  auto& ctx = RNSkia::DawnContext::getInstance();
   _impl->device = ctx.getWGPUDevice();
+  _impl->syncMode = sync;
+  _impl->useCanvas = useCanvas;
 
-  if (!_impl->device) {
-    printf("[DawnPipeline] No device available from DawnContext\n");
-    delete _impl;
-    _impl = nullptr;
-    return false;
-  }
-
-  // Compile shader
-  wgpu::ShaderModuleWGSLDescriptor wgslDesc;
-  wgslDesc.code = wgslCode.c_str();
-
-  wgpu::ShaderModuleDescriptor shaderDesc;
-  shaderDesc.nextInChain = &wgslDesc;
-  wgpu::ShaderModule shaderModule = _impl->device.CreateShaderModule(&shaderDesc);
-
-  if (!shaderModule) {
-    printf("[DawnPipeline] Failed to create shader module\n");
-    delete _impl;
-    _impl = nullptr;
-    return false;
-  }
-
-  // Create compute pipeline
-  wgpu::ComputePipelineDescriptor pipelineDesc;
-  pipelineDesc.compute.module = shaderModule;
-  pipelineDesc.compute.entryPoint = "main";
-  _impl->computePipeline = _impl->device.CreateComputePipeline(&pipelineDesc);
-
-  if (!_impl->computePipeline) {
-    printf("[DawnPipeline] Failed to create compute pipeline\n");
-    delete _impl;
-    _impl = nullptr;
-    return false;
-  }
-
-  _impl->bindGroupLayout = _impl->computePipeline.GetBindGroupLayout(0);
-
-  // Create persistent output texture
-  wgpu::TextureDescriptor texDesc;
-  texDesc.label = "compute-output";
-  texDesc.size = {static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1};
+  // Create ping-pong textures
+  wgpu::TextureDescriptor texDesc{};
+  texDesc.size = {(uint32_t)width, (uint32_t)height, 1};
   texDesc.format = wgpu::TextureFormat::RGBA8Unorm;
   texDesc.usage = wgpu::TextureUsage::StorageBinding |
                   wgpu::TextureUsage::TextureBinding |
@@ -101,154 +91,292 @@ bool DawnComputePipeline::setup(const std::string &wgslCode, int width, int heig
   texDesc.mipLevelCount = 1;
   texDesc.sampleCount = 1;
 
-  _impl->outputTexture = _impl->device.CreateTexture(&texDesc);
+  texDesc.label = "PingPong A";
+  _impl->texA = _impl->device.CreateTexture(&texDesc);
+  texDesc.label = "PingPong B";
+  _impl->texB = _impl->device.CreateTexture(&texDesc);
 
-  if (!_impl->outputTexture) {
-    printf("[DawnPipeline] Failed to create output texture\n");
-    delete _impl;
-    _impl = nullptr;
+  if (!_impl->texA || !_impl->texB) {
+    cleanupLocked();
     return false;
   }
 
-  printf("[DawnPipeline] Setup complete: %dx%d\n", width, height);
+  // Compile shader passes
+  for (size_t i = 0; i < wgslShaders.size(); i++) {
+    PassState pass;
+
+    wgpu::ShaderModuleWGSLDescriptor wgslDesc{};
+    wgslDesc.code = wgslShaders[i].c_str();
+
+    wgpu::ShaderModuleDescriptor smDesc{};
+    smDesc.nextInChain = &wgslDesc;
+
+    auto shaderModule = _impl->device.CreateShaderModule(&smDesc);
+    if (!shaderModule) {
+      printf("[DawnPipeline] Failed to create shader module for pass %zu\n", i);
+      cleanupLocked();
+      return false;
+    }
+
+    wgpu::ComputePipelineDescriptor cpDesc{};
+    cpDesc.compute.module = shaderModule;
+    cpDesc.compute.entryPoint = "main";
+
+    pass.pipeline = _impl->device.CreateComputePipeline(&cpDesc);
+    if (!pass.pipeline) {
+      printf("[DawnPipeline] Failed to create compute pipeline for pass %zu\n", i);
+      cleanupLocked();
+      return false;
+    }
+
+    pass.bindGroupLayout = pass.pipeline.GetBindGroupLayout(0);
+    _impl->passes.push_back(std::move(pass));
+  }
+
+  // Create staging buffers for readback
+  _impl->buffers.resize(bufferSpecs.size());
+  for (size_t i = 0; i < bufferSpecs.size(); i++) {
+    auto& spec = bufferSpecs[i];
+    auto& sb = _impl->buffers[i];
+
+    sb.passIndex = spec.passIndex;
+    sb.elementSize = spec.elementSize;
+    sb.count = spec.count;
+    sb.byteSize = spec.elementSize * spec.count;
+
+    wgpu::BufferDescriptor bufDesc{};
+    bufDesc.size = sb.byteSize;
+    bufDesc.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc;
+    bufDesc.label = "OutputBuffer";
+    sb.gpuBuffer = _impl->device.CreateBuffer(&bufDesc);
+
+    wgpu::BufferDescriptor stagingDesc{};
+    stagingDesc.size = sb.byteSize;
+    stagingDesc.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
+    stagingDesc.label = "StagingA";
+    sb.staging[0] = _impl->device.CreateBuffer(&stagingDesc);
+    stagingDesc.label = "StagingB";
+    sb.staging[1] = _impl->device.CreateBuffer(&stagingDesc);
+
+    if (spec.passIndex >= 0 && spec.passIndex < (int)_impl->passes.size()) {
+      _impl->passes[spec.passIndex].hasOutputBuffer = true;
+      _impl->passes[spec.passIndex].bufferIndex = (int)i;
+    }
+  }
+
+  // Determine final output texture
+  _impl->finalTex = (wgslShaders.size() % 2 != 0) ? &_impl->texA : &_impl->texB;
+
+  // Create persistent SkSurface for canvas if needed
+  if (useCanvas) {
+    skgpu::graphite::BackendTexture backendTex =
+      skgpu::graphite::BackendTextures::MakeDawn(_impl->finalTex->Get());
+    _impl->surface = SkSurfaces::WrapBackendTexture(
+      ctx.getRecorder(), backendTex,
+      kRGBA_8888_SkColorType, nullptr, nullptr
+    );
+  }
+
+  printf("[DawnPipeline] Multi-pass setup complete: %zu passes, %dx%d\n",
+         wgslShaders.size(), width, height);
   return true;
 }
 
 bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   std::lock_guard<std::mutex> lock(_mutex);
-
   if (!_impl || !pixelBuffer) return false;
 
-  // Validate pixel buffer dimensions match setup
-  int bufWidth = static_cast<int>(CVPixelBufferGetWidth(pixelBuffer));
-  int bufHeight = static_cast<int>(CVPixelBufferGetHeight(pixelBuffer));
-  if (bufWidth != _width || bufHeight != _height) {
-    printf("[DawnPipeline] Frame size mismatch: got %dx%d, expected %dx%d\n",
-           bufWidth, bufHeight, _width, _height);
-    return false;
-  }
+  auto& ctx = RNSkia::DawnContext::getInstance();
+  auto& device = _impl->device;
 
-  // 1. Import camera frame via IOSurface (zero-copy)
   IOSurfaceRef ioSurface = CVPixelBufferGetIOSurface(pixelBuffer);
-  if (!ioSurface) {
-    printf("[DawnPipeline] No IOSurface on pixel buffer\n");
-    return false;
-  }
+  if (!ioSurface) return false;
 
-  wgpu::SharedTextureMemoryIOSurfaceDescriptor platformDesc;
-  platformDesc.ioSurface = ioSurface;
+  wgpu::SharedTextureMemoryIOSurfaceDescriptor ioDesc{};
+  ioDesc.ioSurface = ioSurface;
 
-  wgpu::SharedTextureMemoryDescriptor memDesc = {};
-  memDesc.nextInChain = &platformDesc;
+  wgpu::SharedTextureMemoryDescriptor sharedDesc{};
+  sharedDesc.nextInChain = &ioDesc;
 
-  wgpu::SharedTextureMemory sharedMemory =
-      _impl->device.ImportSharedTextureMemory(&memDesc);
+  auto sharedMemory = device.ImportSharedTextureMemory(&sharedDesc);
+  if (!sharedMemory) return false;
 
-  if (!sharedMemory) {
-    printf("[DawnPipeline] Failed to import SharedTextureMemory\n");
-    return false;
-  }
-
-  // Create input texture from shared memory
-  // Camera is BGRA8Unorm on iOS
-  wgpu::TextureDescriptor inputTexDesc;
-  inputTexDesc.label = "camera-input";
+  // Create input texture with RGBA view format compatibility
+  wgpu::TextureFormat viewFormats[] = {wgpu::TextureFormat::RGBA8Unorm};
+  wgpu::TextureDescriptor inputTexDesc{};
+  inputTexDesc.size = {(uint32_t)_width, (uint32_t)_height, 1};
   inputTexDesc.format = wgpu::TextureFormat::BGRA8Unorm;
-  inputTexDesc.dimension = wgpu::TextureDimension::e2D;
   inputTexDesc.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc;
-  inputTexDesc.size = {static_cast<uint32_t>(bufWidth),
-                       static_cast<uint32_t>(bufHeight), 1};
+  inputTexDesc.dimension = wgpu::TextureDimension::e2D;
+  inputTexDesc.mipLevelCount = 1;
+  inputTexDesc.sampleCount = 1;
+  inputTexDesc.label = "CameraInput";
+  inputTexDesc.viewFormatCount = 1;
+  inputTexDesc.viewFormats = viewFormats;
 
-  wgpu::Texture inputTexture = sharedMemory.CreateTexture(&inputTexDesc);
-  if (!inputTexture) {
-    printf("[DawnPipeline] Failed to create input texture from SharedTextureMemory\n");
-    return false;
-  }
+  auto inputTexture = sharedMemory.CreateTexture(&inputTexDesc);
+  if (!inputTexture) return false;
 
-  // Begin access
-  wgpu::SharedTextureMemoryBeginAccessDescriptor beginDesc;
+  wgpu::SharedTextureMemoryBeginAccessDescriptor beginDesc{};
   beginDesc.initialized = true;
-  beginDesc.fenceCount = 0;
+  sharedMemory.BeginAccess(inputTexture, &beginDesc);
 
-  bool success = sharedMemory.BeginAccess(inputTexture, &beginDesc);
-  if (!success) {
-    printf("[DawnPipeline] BeginAccess failed\n");
-    return false;
-  }
+  // RGBA view override for pass 0
+  wgpu::TextureViewDescriptor inputViewDesc{};
+  inputViewDesc.format = wgpu::TextureFormat::RGBA8Unorm;
+  auto inputView = inputTexture.CreateView(&inputViewDesc);
 
-  // From here, we MUST call EndAccess before returning
-  bool result = false;
+  auto encoder = device.CreateCommandEncoder();
 
-  // 2. Create bind group with input + output textures
-  wgpu::BindGroupEntry entries[2];
-  entries[0].binding = 0;
-  entries[0].textureView = inputTexture.CreateView();
-  entries[1].binding = 1;
-  entries[1].textureView = _impl->outputTexture.CreateView();
+  wgpu::TextureView readView = inputView;
+  bool writeToA = true;
 
-  wgpu::BindGroupDescriptor bgDesc;
-  bgDesc.layout = _impl->bindGroupLayout;
-  bgDesc.entryCount = 2;
-  bgDesc.entries = entries;
+  for (size_t i = 0; i < _impl->passes.size(); i++) {
+    auto& pass = _impl->passes[i];
 
-  _impl->bindGroup = _impl->device.CreateBindGroup(&bgDesc);
-  if (!_impl->bindGroup) {
-    printf("[DawnPipeline] Failed to create bind group\n");
-    goto end_access;
-  }
+    wgpu::Texture& writeTex = writeToA ? _impl->texA : _impl->texB;
+    auto writeView = writeTex.CreateView();
 
-  {
-    // 3. Dispatch compute shader
-    wgpu::CommandEncoder encoder = _impl->device.CreateCommandEncoder();
-    if (!encoder) {
-      printf("[DawnPipeline] Failed to create command encoder\n");
-      goto end_access;
+    std::vector<wgpu::BindGroupEntry> entries;
+
+    wgpu::BindGroupEntry entry0{};
+    entry0.binding = 0;
+    entry0.textureView = readView;
+    entries.push_back(entry0);
+
+    wgpu::BindGroupEntry entry1{};
+    entry1.binding = 1;
+    entry1.textureView = writeView;
+    entries.push_back(entry1);
+
+    if (pass.hasOutputBuffer && pass.bufferIndex >= 0) {
+      auto& sb = _impl->buffers[pass.bufferIndex];
+      wgpu::BindGroupEntry entry2{};
+      entry2.binding = 2;
+      entry2.buffer = sb.gpuBuffer;
+      entry2.size = sb.byteSize;
+      entries.push_back(entry2);
     }
 
-    wgpu::ComputePassEncoder pass = encoder.BeginComputePass();
-    pass.SetPipeline(_impl->computePipeline);
-    pass.SetBindGroup(0, _impl->bindGroup);
-    pass.DispatchWorkgroups(
-        (_width + 15) / 16,
-        (_height + 15) / 16);
-    pass.End();
+    wgpu::BindGroupDescriptor bgDesc{};
+    bgDesc.layout = pass.bindGroupLayout;
+    bgDesc.entryCount = entries.size();
+    bgDesc.entries = entries.data();
+    auto bindGroup = device.CreateBindGroup(&bgDesc);
 
-    // Fix: store CommandBuffer in a local to avoid address-of-temporary UB
-    wgpu::CommandBuffer commands = encoder.Finish();
-    _impl->device.GetQueue().Submit(1, &commands);
+    auto computePass = encoder.BeginComputePass();
+    computePass.SetPipeline(pass.pipeline);
+    computePass.SetBindGroup(0, bindGroup);
+    computePass.DispatchWorkgroups((_width + 15) / 16, (_height + 15) / 16);
+    computePass.End();
+
+    readView = writeView;
+    writeToA = !writeToA;
   }
 
-  {
-    // 5. Wrap output texture as SkImage
-    auto &ctx = DawnContext::getInstance();
+  // Copy output buffers to staging
+  for (auto& sb : _impl->buffers) {
+    int stagingIdx = sb.frameIndex % 2;
+
+    if (sb.mapped[stagingIdx].load()) {
+      sb.staging[stagingIdx].Unmap();
+      sb.mapped[stagingIdx].store(false);
+      sb.mappedData[stagingIdx] = nullptr;
+    }
+
+    encoder.CopyBufferToBuffer(sb.gpuBuffer, 0, sb.staging[stagingIdx], 0, sb.byteSize);
+  }
+
+  auto commands = encoder.Finish();
+  device.GetQueue().Submit(1, &commands);
+
+  // Async map staging buffers
+  for (auto& sb : _impl->buffers) {
+    int stagingIdx = sb.frameIndex % 2;
+
+    sb.staging[stagingIdx].MapAsync(
+      wgpu::MapMode::Read, 0, sb.byteSize,
+      wgpu::CallbackMode::AllowProcessEvents,
+      [&sb, stagingIdx](wgpu::MapAsyncStatus status, wgpu::StringView) {
+        if (status == wgpu::MapAsyncStatus::Success) {
+          sb.mappedData[stagingIdx] = sb.staging[stagingIdx].GetConstMappedRange(0, sb.byteSize);
+          sb.mapped[stagingIdx].store(true);
+        }
+      }
+    );
+
+    sb.frameIndex++;
+  }
+
+  // Sync mode: tick until all maps complete
+  if (_impl->syncMode) {
+    for (auto& sb : _impl->buffers) {
+      int stagingIdx = (sb.frameIndex - 1) % 2;
+      while (!sb.mapped[stagingIdx].load()) {
+        device.Tick();
+      }
+    }
+  }
+
+  // Wrap final output as SkImage
+  _impl->finalTex = writeToA ? &_impl->texB : &_impl->texA;
+  _impl->outputImage = ctx.MakeImageFromTexture(
+    *_impl->finalTex, _width, _height, wgpu::TextureFormat::RGBA8Unorm
+  );
+
+  // Cleanup IOSurface access
+  wgpu::SharedTextureMemoryEndAccessState endState{};
+  sharedMemory.EndAccess(inputTexture, &endState);
+
+  return true;
+}
+
+const void* DawnComputePipeline::readBuffer(int bufferIndex) const {
+  if (!_impl || bufferIndex < 0 || bufferIndex >= (int)_impl->buffers.size())
+    return nullptr;
+
+  auto& sb = _impl->buffers[bufferIndex];
+  int readIdx = sb.frameIndex % 2;
+  if (!sb.mapped[readIdx].load()) return nullptr;
+  return sb.mappedData[readIdx];
+}
+
+int DawnComputePipeline::getBufferByteSize(int bufferIndex) const {
+  if (!_impl || bufferIndex < 0 || bufferIndex >= (int)_impl->buffers.size())
+    return 0;
+  return _impl->buffers[bufferIndex].byteSize;
+}
+
+void* DawnComputePipeline::getSkSurface() {
+  std::lock_guard<std::mutex> lock(_mutex);
+  if (!_impl) return nullptr;
+  return &_impl->surface;
+}
+
+void DawnComputePipeline::flushCanvas() {
+  std::lock_guard<std::mutex> lock(_mutex);
+  if (!_impl || !_impl->surface) return;
+
+  auto& ctx = RNSkia::DawnContext::getInstance();
+  auto recording = ctx.getRecorder()->snap();
+  if (recording) {
+    skgpu::graphite::InsertRecordingInfo insertInfo{};
+    insertInfo.fRecording = recording.get();
+    ctx.fGraphiteContext->insertRecording(insertInfo);
+    ctx.fGraphiteContext->submit(skgpu::graphite::SyncToCpu::kNo);
+  }
+
+  if (_impl->finalTex) {
     _impl->outputImage = ctx.MakeImageFromTexture(
-        _impl->outputTexture, _width, _height,
-        wgpu::TextureFormat::RGBA8Unorm);
-    result = _impl->outputImage != nullptr;
+      *_impl->finalTex, _width, _height, wgpu::TextureFormat::RGBA8Unorm
+    );
   }
-
-end_access:
-  // 4. End access to input texture — always called after BeginAccess
-  {
-    wgpu::SharedTextureMemoryEndAccessState endState = {};
-    sharedMemory.EndAccess(inputTexture, &endState);
-  }
-
-  return result;
 }
 
-void *DawnComputePipeline::getOutputSkImage() {
+void* DawnComputePipeline::getOutputSkImage() {
   std::lock_guard<std::mutex> lock(_mutex);
-  if (!_impl || !_impl->outputImage) return nullptr;
-  // Return raw pointer to sk_sp<SkImage> — caller must not free
+  if (!_impl) return nullptr;
   return &_impl->outputImage;
-}
-
-void *DawnComputePipeline::getOutputTexturePtr() {
-  std::lock_guard<std::mutex> lock(_mutex);
-  if (!_impl || !_impl->outputTexture) return nullptr;
-  // Return pointer to the wgpu::Texture — used by JSI installer to wrap as GPUTexture
-  return &_impl->outputTexture;
 }
 
 void DawnComputePipeline::cleanup() {
@@ -257,25 +385,33 @@ void DawnComputePipeline::cleanup() {
 }
 
 void DawnComputePipeline::cleanupLocked() {
-  if (_impl) {
-    _impl->outputImage.reset();
-    if (_impl->outputTexture) {
-      _impl->outputTexture.Destroy();
+  if (!_impl) return;
+
+  for (auto& sb : _impl->buffers) {
+    for (int j = 0; j < 2; j++) {
+      if (sb.mapped[j].load()) {
+        sb.staging[j].Unmap();
+        sb.mapped[j].store(false);
+        sb.mappedData[j] = nullptr;
+      }
     }
-    _impl->bindGroup = nullptr;
-    _impl->computePipeline = nullptr;
-    _impl->bindGroupLayout = nullptr;
-    _impl->device = nullptr;
-    delete _impl;
-    _impl = nullptr;
   }
-  _width = 0;
-  _height = 0;
+
+  _impl->outputImage.reset();
+  _impl->surface.reset();
+  _impl->texA = nullptr;
+  _impl->texB = nullptr;
+  _impl->passes.clear();
+  _impl->buffers.clear();
+
+  delete _impl;
+  _impl = nullptr;
 }
 
 } // namespace dawn_pipeline
 
-// C interface for Swift
+// ========== C interface ==========
+
 extern "C" {
 
 DawnComputePipelineRef dawn_pipeline_create() {
@@ -283,143 +419,232 @@ DawnComputePipelineRef dawn_pipeline_create() {
 }
 
 void dawn_pipeline_destroy(DawnComputePipelineRef ref) {
-  delete static_cast<dawn_pipeline::DawnComputePipeline *>(ref);
+  delete static_cast<dawn_pipeline::DawnComputePipeline*>(ref);
 }
 
-bool dawn_pipeline_setup(DawnComputePipelineRef ref, const char *wgslCode, int width, int height) {
-  auto *pipeline = static_cast<dawn_pipeline::DawnComputePipeline *>(ref);
-  return pipeline->setup(std::string(wgslCode), width, height);
+bool dawn_pipeline_setup_multipass(
+    DawnComputePipelineRef ref,
+    const char** shaders, int shaderCount,
+    int width, int height,
+    const int* bufferSpecsFlat, int bufferCount,
+    bool useCanvas, bool sync) {
+  auto* pipeline = static_cast<dawn_pipeline::DawnComputePipeline*>(ref);
+
+  std::vector<std::string> wgslShaders;
+  for (int i = 0; i < shaderCount; i++) {
+    wgslShaders.push_back(shaders[i]);
+  }
+
+  std::vector<dawn_pipeline::DawnComputePipeline::BufferSpec> specs;
+  for (int i = 0; i < bufferCount; i++) {
+    dawn_pipeline::DawnComputePipeline::BufferSpec s;
+    s.passIndex = bufferSpecsFlat[i * 3 + 0];
+    s.elementSize = bufferSpecsFlat[i * 3 + 1];
+    s.count = bufferSpecsFlat[i * 3 + 2];
+    specs.push_back(s);
+  }
+
+  return pipeline->setup(wgslShaders, width, height, specs, useCanvas, sync);
 }
 
 bool dawn_pipeline_process_frame(DawnComputePipelineRef ref, CVPixelBufferRef pixelBuffer) {
-  auto *pipeline = static_cast<dawn_pipeline::DawnComputePipeline *>(ref);
+  auto* pipeline = static_cast<dawn_pipeline::DawnComputePipeline*>(ref);
   return pipeline->processFrame(pixelBuffer);
 }
 
-void *dawn_pipeline_get_output_image(DawnComputePipelineRef ref) {
-  auto *pipeline = static_cast<dawn_pipeline::DawnComputePipeline *>(ref);
+const void* dawn_pipeline_read_buffer(DawnComputePipelineRef ref, int index) {
+  auto* pipeline = static_cast<dawn_pipeline::DawnComputePipeline*>(ref);
+  return pipeline->readBuffer(index);
+}
+
+int dawn_pipeline_get_buffer_byte_size(DawnComputePipelineRef ref, int index) {
+  auto* pipeline = static_cast<dawn_pipeline::DawnComputePipeline*>(ref);
+  return pipeline->getBufferByteSize(index);
+}
+
+void* dawn_pipeline_get_sk_surface(DawnComputePipelineRef ref) {
+  auto* pipeline = static_cast<dawn_pipeline::DawnComputePipeline*>(ref);
+  return pipeline->getSkSurface();
+}
+
+void dawn_pipeline_flush_canvas(DawnComputePipelineRef ref) {
+  auto* pipeline = static_cast<dawn_pipeline::DawnComputePipeline*>(ref);
+  pipeline->flushCanvas();
+}
+
+void* dawn_pipeline_get_output_image(DawnComputePipelineRef ref) {
+  auto* pipeline = static_cast<dawn_pipeline::DawnComputePipeline*>(ref);
   return pipeline->getOutputSkImage();
 }
 
-void *dawn_pipeline_get_output_texture(DawnComputePipelineRef ref) {
-  auto *pipeline = static_cast<dawn_pipeline::DawnComputePipeline *>(ref);
-  return pipeline->getOutputTexturePtr();
-}
-
 void dawn_pipeline_cleanup(DawnComputePipelineRef ref) {
-  auto *pipeline = static_cast<dawn_pipeline::DawnComputePipeline *>(ref);
+  auto* pipeline = static_cast<dawn_pipeline::DawnComputePipeline*>(ref);
   pipeline->cleanup();
 }
 
-// JSI host object for the camera stream — passable into worklets.
-// Reanimated shares JSI host objects across runtimes, so a worklet can
-// call stream.nextImage() on the UI thread even though the object was
-// created on the JS thread.  This follows the JsiVideo pattern.
+// ========== CameraStreamHostObject ==========
+
 class CameraStreamHostObject : public facebook::jsi::HostObject {
 public:
   CameraStreamHostObject(
-      dawn_pipeline::DawnComputePipeline *pipeline,
-      std::shared_ptr<std::atomic<bool>> alive,
-      std::shared_ptr<RNSkia::RNSkPlatformContext> platformContext)
-      : _pipeline(pipeline), _alive(std::move(alive)),
-        _platformContext(std::move(platformContext)) {}
+    dawn_pipeline::DawnComputePipeline* pipeline,
+    std::shared_ptr<std::atomic<bool>> alive,
+    std::shared_ptr<RNSkia::RNSkPlatformContext> platformContext)
+    : _pipeline(pipeline), _alive(alive), _platformContext(platformContext) {}
 
-  facebook::jsi::Value get(facebook::jsi::Runtime &rt,
-                           const facebook::jsi::PropNameID &name) override {
-    auto propName = name.utf8(rt);
+  facebook::jsi::Value get(
+      facebook::jsi::Runtime& runtime,
+      const facebook::jsi::PropNameID& name) override {
+    auto propName = name.utf8(runtime);
 
     if (propName == "nextImage") {
       return facebook::jsi::Function::createFromHostFunction(
-          rt, name, 0,
-          [this](facebook::jsi::Runtime &rt, const facebook::jsi::Value &,
-                 const facebook::jsi::Value *, size_t) -> facebook::jsi::Value {
-            if (!_alive->load()) return facebook::jsi::Value::null();
+        runtime, name, 0,
+        [this](facebook::jsi::Runtime& rt,
+               const facebook::jsi::Value&,
+               const facebook::jsi::Value*,
+               size_t) -> facebook::jsi::Value {
+          if (!_alive->load()) return facebook::jsi::Value::null();
 
-            void *imgPtr = _pipeline->getOutputSkImage();
-            if (!imgPtr) return facebook::jsi::Value::null();
+          auto* imgPtr = static_cast<sk_sp<SkImage>*>(
+            _pipeline->getOutputSkImage());
+          if (!imgPtr || !*imgPtr) return facebook::jsi::Value::null();
 
-            sk_sp<SkImage> image = *static_cast<sk_sp<SkImage> *>(imgPtr);
-            if (!image) return facebook::jsi::Value::null();
+          auto hostObj = std::make_shared<RNSkia::JsiSkImage>(
+            _platformContext, *imgPtr);
+          return facebook::jsi::Object::createFromHostObject(rt, hostObj);
+        });
+    }
 
-            auto hostObject = std::make_shared<RNSkia::JsiSkImage>(
-                _platformContext, std::move(image));
-            return facebook::jsi::Object::createFromHostObject(rt, hostObject);
-          });
+    if (propName == "readBuffer") {
+      return facebook::jsi::Function::createFromHostFunction(
+        runtime, name, 1,
+        [this](facebook::jsi::Runtime& rt,
+               const facebook::jsi::Value&,
+               const facebook::jsi::Value* args,
+               size_t count) -> facebook::jsi::Value {
+          if (!_alive->load() || count < 1) return facebook::jsi::Value::null();
+
+          int index = (int)args[0].asNumber();
+          const void* data = _pipeline->readBuffer(index);
+          if (!data) return facebook::jsi::Value::null();
+
+          int byteSize = _pipeline->getBufferByteSize(index);
+          if (byteSize <= 0) return facebook::jsi::Value::null();
+
+          auto arrayBuffer = rt.global()
+            .getPropertyAsFunction(rt, "ArrayBuffer")
+            .callAsConstructor(rt, byteSize)
+            .asObject(rt)
+            .getArrayBuffer(rt);
+          memcpy(arrayBuffer.data(rt), data, byteSize);
+
+          return arrayBuffer;
+        });
+    }
+
+    if (propName == "getCanvas") {
+      return facebook::jsi::Function::createFromHostFunction(
+        runtime, name, 0,
+        [this](facebook::jsi::Runtime& rt,
+               const facebook::jsi::Value&,
+               const facebook::jsi::Value*,
+               size_t) -> facebook::jsi::Value {
+          if (!_alive->load()) return facebook::jsi::Value::null();
+
+          auto* surfPtr = static_cast<sk_sp<SkSurface>*>(
+            _pipeline->getSkSurface());
+          if (!surfPtr || !*surfPtr) return facebook::jsi::Value::null();
+
+          SkCanvas* canvas = (*surfPtr)->getCanvas();
+          if (!canvas) return facebook::jsi::Value::null();
+
+          auto hostObj = std::make_shared<RNSkia::JsiSkCanvas>(
+            _platformContext, canvas);
+          return facebook::jsi::Object::createFromHostObject(rt, hostObj);
+        });
+    }
+
+    if (propName == "flushCanvas") {
+      return facebook::jsi::Function::createFromHostFunction(
+        runtime, name, 0,
+        [this](facebook::jsi::Runtime& rt,
+               const facebook::jsi::Value&,
+               const facebook::jsi::Value*,
+               size_t) -> facebook::jsi::Value {
+          if (!_alive->load()) return facebook::jsi::Value::undefined();
+          _pipeline->flushCanvas();
+          return facebook::jsi::Value::undefined();
+        });
     }
 
     if (propName == "dispose") {
       return facebook::jsi::Function::createFromHostFunction(
-          rt, name, 0,
-          [](facebook::jsi::Runtime &, const facebook::jsi::Value &,
-             const facebook::jsi::Value *, size_t) -> facebook::jsi::Value {
-            return facebook::jsi::Value::undefined();
-          });
+        runtime, name, 0,
+        [](facebook::jsi::Runtime&,
+           const facebook::jsi::Value&,
+           const facebook::jsi::Value*,
+           size_t) -> facebook::jsi::Value {
+          return facebook::jsi::Value::undefined();
+        });
     }
 
     return facebook::jsi::Value::undefined();
   }
 
 private:
-  dawn_pipeline::DawnComputePipeline *_pipeline;
+  dawn_pipeline::DawnComputePipeline* _pipeline;
   std::shared_ptr<std::atomic<bool>> _alive;
   std::shared_ptr<RNSkia::RNSkPlatformContext> _platformContext;
 };
 
-void dawn_pipeline_install_jsi(DawnComputePipelineRef ref, void *jsiRuntime) {
-  auto &runtime = *static_cast<facebook::jsi::Runtime *>(jsiRuntime);
-  auto *pipeline = static_cast<dawn_pipeline::DawnComputePipeline *>(ref);
+// ========== JSI Installation ==========
 
-  auto alive = pipeline->getAliveFlag();
+void dawn_pipeline_install_jsi(DawnComputePipelineRef ref, void* jsiRuntime) {
+  auto* pipeline = static_cast<dawn_pipeline::DawnComputePipeline*>(ref);
+  auto& runtime = *static_cast<facebook::jsi::Runtime*>(jsiRuntime);
 
-  // Get RNSkPlatformContext from Skia's SkiaManager singleton (New Architecture).
   std::shared_ptr<RNSkia::RNSkManager> skManager = [SkiaManager latestActiveSkManager];
   if (!skManager) {
-    printf("[DawnPipeline] WARNING: SkiaManager not available — JSI bindings not installed\n");
+    printf("[DawnPipeline] WARNING: SkiaManager not available\n");
     return;
   }
   auto platformContext = skManager->getPlatformContext();
+  auto alive = pipeline->alive();
 
-  // Install global.__webgpuCamera_nextImage() — works from JS thread (rAF path)
-  auto nextImage = facebook::jsi::Function::createFromHostFunction(
-      runtime,
-      facebook::jsi::PropNameID::forAscii(runtime, "__webgpuCamera_nextImage"),
-      0,
-      [pipeline, alive, platformContext](facebook::jsi::Runtime &rt,
-                 const facebook::jsi::Value &,
-                 const facebook::jsi::Value *,
-                 size_t) -> facebook::jsi::Value {
-        if (!alive->load()) return facebook::jsi::Value::null();
+  auto nextImageFn = facebook::jsi::Function::createFromHostFunction(
+    runtime,
+    facebook::jsi::PropNameID::forAscii(runtime, "__webgpuCamera_nextImage"),
+    0,
+    [pipeline, alive, platformContext](
+      facebook::jsi::Runtime& rt,
+      const facebook::jsi::Value&,
+      const facebook::jsi::Value*,
+      size_t) -> facebook::jsi::Value {
+      if (!alive->load()) return facebook::jsi::Value::null();
 
-        void *imgPtr = pipeline->getOutputSkImage();
-        if (!imgPtr) return facebook::jsi::Value::null();
+      auto* imgPtr = static_cast<sk_sp<SkImage>*>(pipeline->getOutputSkImage());
+      if (!imgPtr || !*imgPtr) return facebook::jsi::Value::null();
 
-        sk_sp<SkImage> image = *static_cast<sk_sp<SkImage> *>(imgPtr);
-        if (!image) return facebook::jsi::Value::null();
+      auto hostObj = std::make_shared<RNSkia::JsiSkImage>(platformContext, *imgPtr);
+      return facebook::jsi::Object::createFromHostObject(rt, hostObj);
+    });
+  runtime.global().setProperty(runtime, "__webgpuCamera_nextImage", std::move(nextImageFn));
 
-        auto hostObject = std::make_shared<RNSkia::JsiSkImage>(
-            platformContext, std::move(image));
-        return jsi::Object::createFromHostObject(rt, hostObject);
-      });
+  auto createStreamFn = facebook::jsi::Function::createFromHostFunction(
+    runtime,
+    facebook::jsi::PropNameID::forAscii(runtime, "__webgpuCamera_createStream"),
+    0,
+    [pipeline, alive, platformContext](
+      facebook::jsi::Runtime& rt,
+      const facebook::jsi::Value&,
+      const facebook::jsi::Value*,
+      size_t) -> facebook::jsi::Value {
+      auto hostObj = std::make_shared<CameraStreamHostObject>(pipeline, alive, platformContext);
+      return facebook::jsi::Object::createFromHostObject(rt, hostObj);
+    });
+  runtime.global().setProperty(runtime, "__webgpuCamera_createStream", std::move(createStreamFn));
 
-  // Install global.__webgpuCamera_createStream() — returns a host object
-  // that can be passed into worklets. Worklets call stream.nextImage() on
-  // the UI thread. Reanimated shares JSI host objects across runtimes.
-  auto createStream = facebook::jsi::Function::createFromHostFunction(
-      runtime,
-      facebook::jsi::PropNameID::forAscii(runtime, "__webgpuCamera_createStream"),
-      0,
-      [pipeline, alive, platformContext](facebook::jsi::Runtime &rt,
-                 const facebook::jsi::Value &,
-                 const facebook::jsi::Value *,
-                 size_t) -> facebook::jsi::Value {
-        auto stream = std::make_shared<CameraStreamHostObject>(
-            pipeline, alive, platformContext);
-        return jsi::Object::createFromHostObject(rt, stream);
-      });
-
-  auto global = runtime.global();
-  global.setProperty(runtime, "__webgpuCamera_nextImage", std::move(nextImage));
-  global.setProperty(runtime, "__webgpuCamera_createStream", std::move(createStream));
   printf("[DawnPipeline] JSI bindings installed (nextImage + createStream)\n");
 }
 
