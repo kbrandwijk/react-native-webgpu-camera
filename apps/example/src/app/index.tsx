@@ -10,12 +10,19 @@ import {
 import { Canvas, Fill, Group, Image as SkImage } from '@shopify/react-native-skia';
 import { useCamera, useGPUFrameProcessor } from 'react-native-webgpu-camera';
 import { SOBEL_WGSL } from '@/shaders/sobel.wgsl';
+import { SOBEL_COLOR_WGSL } from '@/shaders/sobel-color.wgsl';
 
 const CAMERA_WIDTH = 3840;
 const CAMERA_HEIGHT = 2160;
 const CAMERA_FPS = 120;
 
-function CameraPreview() {
+const SHADERS = [
+  { name: 'Sobel', wgsl: [SOBEL_WGSL] },
+  { name: 'Sobel Color', wgsl: [SOBEL_COLOR_WGSL] },
+  { name: 'Multi-pass', wgsl: [SOBEL_WGSL, SOBEL_COLOR_WGSL] },
+] as const;
+
+function CameraPreview({ shaderChain }: { shaderChain: readonly string[] }) {
   const { width: screenW, height: screenH } = useWindowDimensions();
 
   const camera = useCamera({
@@ -27,7 +34,9 @@ function CameraPreview() {
 
   const { currentFrame, error } = useGPUFrameProcessor(camera, (frame) => {
     'worklet';
-    frame.runShader(SOBEL_WGSL);
+    for (const wgsl of shaderChain) {
+      frame.runShader(wgsl);
+    }
   });
 
   return (
@@ -53,12 +62,24 @@ function CameraPreview() {
 
 export default function CameraSpikeScreen() {
   const [isRunning, setIsRunning] = useState(false);
+  const [shaderIndex, setShaderIndex] = useState(0);
+  const shader = SHADERS[shaderIndex];
 
   return (
     <View style={styles.container}>
-      {isRunning && <CameraPreview />}
+      {/* key forces re-mount because pipeline setup captures shader chain */}
+      {isRunning && <CameraPreview key={shader.name} shaderChain={shader.wgsl} />}
 
       <View style={styles.controls}>
+        {isRunning && (
+          <Pressable
+            style={styles.button}
+            onPress={() => setShaderIndex((i) => (i + 1) % SHADERS.length)}
+          >
+            <Text style={styles.buttonText}>{shader.name}</Text>
+          </Pressable>
+        )}
+
         <Pressable
           style={[styles.button, isRunning && styles.buttonActive]}
           onPress={() => setIsRunning(!isRunning)}
