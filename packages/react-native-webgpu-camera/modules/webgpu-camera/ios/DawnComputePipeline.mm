@@ -322,11 +322,9 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
     }
   }
 
-  // Wrap final output as SkImage
+  // Track which texture holds the final output (image created lazily on consumer thread)
   _impl->finalTex = writeToA ? &_impl->texB : &_impl->texA;
-  _impl->outputImage = ctx.MakeImageFromTexture(
-    *_impl->finalTex, _width, _height, wgpu::TextureFormat::RGBA8Unorm
-  );
+  _impl->outputImage.reset();
 
   // Cleanup IOSurface access
   wgpu::SharedTextureMemoryEndAccessState endState{};
@@ -376,7 +374,14 @@ void DawnComputePipeline::flushCanvas() {
 
 void* DawnComputePipeline::getOutputSkImage() {
   std::lock_guard<std::mutex> lock(_mutex);
-  if (!_impl) return nullptr;
+  if (!_impl || !_impl->finalTex) return nullptr;
+
+  // Create SkImage on the calling thread's recorder so it's usable for rendering
+  if (!_impl->outputImage) {
+    auto& ctx = RNSkia::DawnContext::getInstance();
+    _impl->outputImage = ctx.MakeImageFromTexture(
+      *_impl->finalTex, _width, _height, wgpu::TextureFormat::RGBA8Unorm);
+  }
   return &_impl->outputImage;
 }
 
