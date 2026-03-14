@@ -6,42 +6,29 @@ learned and why things are the way they are.
 
 ---
 
-## AD-1: Thread-local Graphite Recorder and cross-thread SkImage
+## AD-1: SkImage creation in processFrame (camera thread)
 
 **Date:** 2026-03-14
-**Status:** Active
+**Status:** Active (revised)
 **Context:**
 
-Skia Graphite uses a thread-local `Recorder` to track GPU operations. When
-`DawnContext::MakeImageFromTexture()` wraps a `wgpu::Texture` as an `SkImage`,
-it uses the calling thread's recorder. This means the SkImage is bound to the
-thread that created it.
+We initially believed Skia Graphite's thread-local `Recorder` would prevent
+an `SkImage` created on the camera thread from rendering on the UI thread.
+This led to a deferred-creation approach (dirty flag + lazy `MakeImageFromTexture`
+on the UI thread).
 
-Our pipeline has two threads:
-- **Camera frame queue** — runs `processFrame()`, dispatches compute shaders
-- **Reanimated UI thread** — runs `useFrameCallback`, renders via Skia `<Canvas>`
+**What actually happened:** The deferred approach produced frames but they
+rendered as nothing. Reverting to create the SkImage directly in `processFrame()`
+on the camera thread — matching the working single-pass implementation — fixed
+rendering immediately.
 
-**Problem:** When `processFrame()` created the SkImage on the camera thread,
-the Skia `<Canvas>` on the UI thread couldn't render it — the image was bound
-to a different thread's recorder. The result was a valid SkImage (correct
-dimensions, non-null) that rendered as nothing.
+**Decision:** `processFrame()` calls `MakeImageFromTexture()` at the end of
+each frame, on the camera thread. `getOutputSkImage()` simply returns the
+cached image. This matches the single-pass pattern that was proven to work.
 
-**Decision:** Defer SkImage creation to the consumer thread. `processFrame()`
-only tracks which ping-pong texture holds the final output and resets the
-cached image. `getOutputSkImage()` (called from `nextImage()` on the UI thread)
-lazily creates the SkImage using the UI thread's recorder.
-
-**Alternatives considered:**
-1. `MakeRasterImage()` — GPU readback to CPU, then re-upload. Works but
-   extremely expensive at 3840×2160 (~33MB per frame). Not viable at 120fps.
-2. Share a single recorder across threads — not possible, Graphite recorders
-   are explicitly thread-local by design.
-3. Create image on camera thread, copy to new image on UI thread — same cost
-   as MakeRasterImage, just with extra steps.
-
-**Consequence:** The `wgpu::Texture` must remain valid between `processFrame()`
-completing and `nextImage()` being called. This is guaranteed because the
-ping-pong textures are persistent (allocated once in `setup()`).
+**Lesson:** The thread-local recorder theory was incorrect (or at least not
+the root cause). The working approach is simpler and avoids the complexity of
+cross-thread lazy creation.
 
 ---
 

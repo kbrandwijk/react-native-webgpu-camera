@@ -43,8 +43,13 @@ function CameraPreview({ shaderChain }: { shaderChain: readonly string[] }) {
   return (
     <>
       <Canvas style={StyleSheet.absoluteFill}>
-        <Fill color="red" />
-        <SkImage image={currentFrame} x={0} y={0} width={screenW} height={screenH} fit="contain" />
+        <Fill color="black" />
+        <Group transform={[
+          { translateX: screenW },
+          { rotate: Math.PI / 2 },
+        ]}>
+          <SkImage image={currentFrame} x={0} y={0} width={screenH} height={screenW} fit="cover" />
+        </Group>
       </Canvas>
 
       <View style={styles.statusBar}>

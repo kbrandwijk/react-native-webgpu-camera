@@ -6,7 +6,7 @@
       "distribution": "internal",
       "ios": { "buildConfiguration": "Debug" },
       "android": { "buildType": "apk" },
-      "env": { "SK_GRAPHITE": "1" }
+      "env": { "SK_GRAPHITE": "1", "EAS_USE_CACHE": "1" }
     }
   }
 }

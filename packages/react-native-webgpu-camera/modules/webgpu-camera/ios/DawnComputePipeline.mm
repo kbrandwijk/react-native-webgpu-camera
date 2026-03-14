@@ -51,7 +51,6 @@ struct DawnComputePipeline::Impl {
   sk_sp<SkSurface> surface;
   wgpu::Texture* finalTex = nullptr;
   sk_sp<SkImage> outputImage;
-  bool imageDirty = true;  // set by processFrame, cleared by getOutputSkImage
 };
 
 DawnComputePipeline::DawnComputePipeline()
@@ -206,8 +205,7 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   auto sharedMemory = device.ImportSharedTextureMemory(&sharedDesc);
   if (!sharedMemory) return false;
 
-  // Create input texture with RGBA view format compatibility
-  wgpu::TextureFormat viewFormats[] = {wgpu::TextureFormat::RGBA8Unorm};
+  // Create input texture from camera IOSurface (BGRA on iOS)
   wgpu::TextureDescriptor inputTexDesc{};
   inputTexDesc.size = {(uint32_t)_width, (uint32_t)_height, 1};
   inputTexDesc.format = wgpu::TextureFormat::BGRA8Unorm;
@@ -216,8 +214,6 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   inputTexDesc.mipLevelCount = 1;
   inputTexDesc.sampleCount = 1;
   inputTexDesc.label = "CameraInput";
-  inputTexDesc.viewFormatCount = 1;
-  inputTexDesc.viewFormats = viewFormats;
 
   auto inputTexture = sharedMemory.CreateTexture(&inputTexDesc);
   if (!inputTexture) return false;
@@ -226,14 +222,9 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   beginDesc.initialized = true;
   sharedMemory.BeginAccess(inputTexture, &beginDesc);
 
-  // RGBA view override for pass 0
-  wgpu::TextureViewDescriptor inputViewDesc{};
-  inputViewDesc.format = wgpu::TextureFormat::RGBA8Unorm;
-  auto inputView = inputTexture.CreateView(&inputViewDesc);
-
   auto encoder = device.CreateCommandEncoder();
 
-  wgpu::TextureView readView = inputView;
+  wgpu::TextureView readView = inputTexture.CreateView();
   bool writeToA = true;
 
   for (size_t i = 0; i < _impl->passes.size(); i++) {
@@ -323,9 +314,10 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
     }
   }
 
-  // Track which texture holds the final output (image created lazily on consumer thread)
+  // Track which texture holds the final output and create SkImage immediately
   _impl->finalTex = writeToA ? &_impl->texB : &_impl->texA;
-  _impl->imageDirty = true;
+  _impl->outputImage = ctx.MakeImageFromTexture(
+    *_impl->finalTex, _width, _height, wgpu::TextureFormat::RGBA8Unorm);
 
   // Cleanup IOSurface access
   wgpu::SharedTextureMemoryEndAccessState endState{};
@@ -375,16 +367,7 @@ void DawnComputePipeline::flushCanvas() {
 
 void* DawnComputePipeline::getOutputSkImage() {
   std::lock_guard<std::mutex> lock(_mutex);
-  if (!_impl || !_impl->finalTex) return nullptr;
-
-  // Recreate SkImage only when processFrame has produced new output.
-  // Created on the calling (UI) thread's recorder so it's renderable.
-  if (_impl->imageDirty) {
-    auto& ctx = RNSkia::DawnContext::getInstance();
-    _impl->outputImage = ctx.MakeImageFromTexture(
-      *_impl->finalTex, _width, _height, wgpu::TextureFormat::RGBA8Unorm);
-    _impl->imageDirty = false;
-  }
+  if (!_impl || !_impl->outputImage) return nullptr;
   return &_impl->outputImage;
 }
 
