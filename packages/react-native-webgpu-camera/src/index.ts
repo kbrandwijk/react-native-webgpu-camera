@@ -10,8 +10,13 @@ export type {
   CameraHandle,
   CameraStream,
   ProcessorFrame,
+  RenderFrame,
   FrameProcessor,
   GPUFrameProcessorResult,
+  ProcessorConfig,
+  BufferHandle,
+  NullableBuffers,
+  TypedArrayConstructor,
 } from './types';
 
 // Native module (advanced usage)
