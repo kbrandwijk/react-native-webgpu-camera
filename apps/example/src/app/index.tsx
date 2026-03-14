@@ -11,6 +11,7 @@ import { Canvas, Fill, Group, Image as SkImage } from '@shopify/react-native-ski
 import { useCamera, useGPUFrameProcessor } from 'react-native-webgpu-camera';
 import { SOBEL_WGSL } from '@/shaders/sobel.wgsl';
 import { SOBEL_COLOR_WGSL } from '@/shaders/sobel-color.wgsl';
+import DepthEstimation from '@/components/DepthEstimation';
 
 const CAMERA_WIDTH = 3840;
 const CAMERA_HEIGHT = 2160;
@@ -42,13 +43,8 @@ function CameraPreview({ shaderChain }: { shaderChain: readonly string[] }) {
   return (
     <>
       <Canvas style={StyleSheet.absoluteFill}>
-        <Fill color="black" />
-        <Group transform={[
-          { translateX: screenW },
-          { rotate: Math.PI / 2 },
-        ]}>
-          <SkImage image={currentFrame} x={0} y={0} width={screenH} height={screenW} fit="cover" />
-        </Group>
+        <Fill color="red" />
+        <SkImage image={currentFrame} x={0} y={0} width={screenW} height={screenH} fit="contain" />
       </Canvas>
 
       <View style={styles.statusBar}>
@@ -63,7 +59,12 @@ function CameraPreview({ shaderChain }: { shaderChain: readonly string[] }) {
 export default function CameraSpikeScreen() {
   const [isRunning, setIsRunning] = useState(false);
   const [shaderIndex, setShaderIndex] = useState(0);
+  const [showDepth, setShowDepth] = useState(false);
   const shader = SHADERS[shaderIndex];
+
+  if (showDepth) {
+    return <DepthEstimation onBack={() => setShowDepth(false)} />;
+  }
 
   return (
     <View style={styles.container}>
@@ -86,6 +87,12 @@ export default function CameraSpikeScreen() {
         >
           <Text style={styles.buttonText}>{isRunning ? 'Stop' : 'Start Pipeline'}</Text>
         </Pressable>
+
+        {!isRunning && (
+          <Pressable style={styles.button} onPress={() => setShowDepth(true)}>
+            <Text style={styles.buttonText}>Depth AI</Text>
+          </Pressable>
+        )}
       </View>
     </View>
   );
