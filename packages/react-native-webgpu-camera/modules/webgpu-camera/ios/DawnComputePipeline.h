@@ -1,5 +1,7 @@
 #pragma once
 
+#ifdef __cplusplus
+
 #include <string>
 #include <vector>
 #include <mutex>
@@ -54,31 +56,40 @@ private:
 
 } // namespace dawn_pipeline
 
+#endif // __cplusplus
+
+// C interface for Swift/ObjC bridge
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef void* DawnComputePipelineRef;
 
-extern "C" {
-  DawnComputePipelineRef dawn_pipeline_create();
-  void dawn_pipeline_destroy(DawnComputePipelineRef ref);
+DawnComputePipelineRef dawn_pipeline_create(void);
+void dawn_pipeline_destroy(DawnComputePipelineRef ref);
 
-  bool dawn_pipeline_setup_multipass(
-    DawnComputePipelineRef ref,
-    const char** shaders, int shaderCount,
-    int width, int height,
-    const int* bufferSpecs, int bufferCount,
-    bool useCanvas, bool sync);
+bool dawn_pipeline_setup_multipass(
+  DawnComputePipelineRef ref,
+  const char** shaders, int shaderCount,
+  int width, int height,
+  const int* bufferSpecs, int bufferCount,
+  bool useCanvas, bool sync);
 
-  bool dawn_pipeline_process_frame(DawnComputePipelineRef ref,
-                                    CVPixelBufferRef pixelBuffer);
+bool dawn_pipeline_process_frame(DawnComputePipelineRef ref,
+                                  CVPixelBufferRef pixelBuffer);
 
-  const void* dawn_pipeline_read_buffer(DawnComputePipelineRef ref, int index);
-  int dawn_pipeline_get_buffer_byte_size(DawnComputePipelineRef ref, int index);
+const void* dawn_pipeline_read_buffer(DawnComputePipelineRef ref, int index);
+int dawn_pipeline_get_buffer_byte_size(DawnComputePipelineRef ref, int index);
 
-  void* dawn_pipeline_get_sk_surface(DawnComputePipelineRef ref);
-  void dawn_pipeline_flush_canvas(DawnComputePipelineRef ref);
+void* dawn_pipeline_get_sk_surface(DawnComputePipelineRef ref);
+void dawn_pipeline_flush_canvas(DawnComputePipelineRef ref);
 
-  void* dawn_pipeline_get_output_image(DawnComputePipelineRef ref);
+void* dawn_pipeline_get_output_image(DawnComputePipelineRef ref);
 
-  void dawn_pipeline_cleanup(DawnComputePipelineRef ref);
+void dawn_pipeline_cleanup(DawnComputePipelineRef ref);
 
-  void dawn_pipeline_install_jsi(DawnComputePipelineRef ref, void* jsiRuntime);
+void dawn_pipeline_install_jsi(DawnComputePipelineRef ref, void* jsiRuntime);
+
+#ifdef __cplusplus
 }
+#endif
