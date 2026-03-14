@@ -75,19 +75,47 @@ public class WebGPUCameraModule: Module {
 
     // --- Dawn compute pipeline ---
 
-    Function("setupComputePipeline") { (wgslCode: String, width: Int, height: Int) -> Bool in
+    Function("setupMultiPassPipeline") { (config: [String: Any]) -> Bool in
+      guard let shaders = config["shaders"] as? [String],
+            let width = config["width"] as? Int,
+            let height = config["height"] as? Int else {
+        print("[WebGPUCamera] setupMultiPassPipeline: missing required config fields")
+        return false
+      }
+
+      let bufferSpecsRaw = config["buffers"] as? [[NSNumber]] ?? []
+      let useCanvas = config["useCanvas"] as? Bool ?? false
+      let sync = config["sync"] as? Bool ?? false
+
+      let bufferSpecs = bufferSpecsRaw.map { spec in
+        spec.map { $0 }
+      }
+
+      // Clean up any existing bridge before creating a new one
+      self.dawnBridge?.cleanup()
+      self.dawnBridge = nil
+
       let bridge = DawnPipelineBridge()
-      let ok = bridge.setup(withWGSL: wgslCode, width: Int32(width), height: Int32(height))
+      let ok = bridge.setupMultiPass(
+        withShaders: shaders,
+        width: Int32(width),
+        height: Int32(height),
+        bufferSpecs: bufferSpecs,
+        useCanvas: useCanvas,
+        sync: sync
+      )
+
       if ok {
         self.dawnBridge = bridge
         self.computeSetup = true
-        // Install JSI bindings so JS can call __webgpuCamera_nextImage()
         if let runtime = try? self.appContext?.runtime {
           bridge.installJSIBindings(runtime)
+        } else {
+          print("[WebGPUCamera] WARNING: Could not access runtime for JSI bindings")
         }
-        print("[WebGPUCamera] Compute pipeline setup OK: \(width)x\(height)")
+        print("[WebGPUCamera] Multi-pass pipeline setup OK: \(shaders.count) passes, \(width)x\(height)")
       } else {
-        print("[WebGPUCamera] Compute pipeline setup FAILED")
+        print("[WebGPUCamera] Multi-pass pipeline setup FAILED")
       }
       return ok
     }
