@@ -311,15 +311,67 @@ void dawn_pipeline_cleanup(DawnComputePipelineRef ref) {
   pipeline->cleanup();
 }
 
+// JSI host object for the camera stream — passable into worklets.
+// Reanimated shares JSI host objects across runtimes, so a worklet can
+// call stream.nextImage() on the UI thread even though the object was
+// created on the JS thread.  This follows the JsiVideo pattern.
+class CameraStreamHostObject : public facebook::jsi::HostObject {
+public:
+  CameraStreamHostObject(
+      dawn_pipeline::DawnComputePipeline *pipeline,
+      std::shared_ptr<std::atomic<bool>> alive,
+      std::shared_ptr<RNSkia::RNSkPlatformContext> platformContext)
+      : _pipeline(pipeline), _alive(std::move(alive)),
+        _platformContext(std::move(platformContext)) {}
+
+  facebook::jsi::Value get(facebook::jsi::Runtime &rt,
+                           const facebook::jsi::PropNameID &name) override {
+    auto propName = name.utf8(rt);
+
+    if (propName == "nextImage") {
+      return facebook::jsi::Function::createFromHostFunction(
+          rt, name, 0,
+          [this](facebook::jsi::Runtime &rt, const facebook::jsi::Value &,
+                 const facebook::jsi::Value *, size_t) -> facebook::jsi::Value {
+            if (!_alive->load()) return facebook::jsi::Value::null();
+
+            void *imgPtr = _pipeline->getOutputSkImage();
+            if (!imgPtr) return facebook::jsi::Value::null();
+
+            sk_sp<SkImage> image = *static_cast<sk_sp<SkImage> *>(imgPtr);
+            if (!image) return facebook::jsi::Value::null();
+
+            auto hostObject = std::make_shared<RNSkia::JsiSkImage>(
+                _platformContext, std::move(image));
+            return facebook::jsi::Object::createFromHostObject(rt, hostObject);
+          });
+    }
+
+    if (propName == "dispose") {
+      return facebook::jsi::Function::createFromHostFunction(
+          rt, name, 0,
+          [](facebook::jsi::Runtime &, const facebook::jsi::Value &,
+             const facebook::jsi::Value *, size_t) -> facebook::jsi::Value {
+            return facebook::jsi::Value::undefined();
+          });
+    }
+
+    return facebook::jsi::Value::undefined();
+  }
+
+private:
+  dawn_pipeline::DawnComputePipeline *_pipeline;
+  std::shared_ptr<std::atomic<bool>> _alive;
+  std::shared_ptr<RNSkia::RNSkPlatformContext> _platformContext;
+};
+
 void dawn_pipeline_install_jsi(DawnComputePipelineRef ref, void *jsiRuntime) {
   auto &runtime = *static_cast<facebook::jsi::Runtime *>(jsiRuntime);
   auto *pipeline = static_cast<dawn_pipeline::DawnComputePipeline *>(ref);
 
-  // Capture a shared_ptr<atomic<bool>> for liveness check — survives pipeline destruction.
   auto alive = pipeline->getAliveFlag();
 
   // Get RNSkPlatformContext from Skia's SkiaManager singleton (New Architecture).
-  // This is needed to construct JsiSkImage host objects that Skia Canvas can render.
   std::shared_ptr<RNSkia::RNSkManager> skManager = [SkiaManager latestActiveSkManager];
   if (!skManager) {
     printf("[DawnPipeline] WARNING: SkiaManager not available — JSI bindings not installed\n");
@@ -327,10 +379,7 @@ void dawn_pipeline_install_jsi(DawnComputePipelineRef ref, void *jsiRuntime) {
   }
   auto platformContext = skManager->getPlatformContext();
 
-  // Install global.__webgpuCamera_nextImage()
-  // Returns a JsiSkImage host object wrapping the compute output texture.
-  // Designed to be called from useFrameCallback (UI thread worklet).
-  // Pattern follows JsiVideo::nextImage() from react-native-skia.
+  // Install global.__webgpuCamera_nextImage() — works from JS thread (rAF path)
   auto nextImage = facebook::jsi::Function::createFromHostFunction(
       runtime,
       facebook::jsi::PropNameID::forAscii(runtime, "__webgpuCamera_nextImage"),
@@ -339,32 +388,39 @@ void dawn_pipeline_install_jsi(DawnComputePipelineRef ref, void *jsiRuntime) {
                  const facebook::jsi::Value &,
                  const facebook::jsi::Value *,
                  size_t) -> facebook::jsi::Value {
-        // Check liveness — pipeline may have been destroyed
-        if (!alive->load()) {
-          return facebook::jsi::Value::null();
-        }
+        if (!alive->load()) return facebook::jsi::Value::null();
 
-        // Get the sk_sp<SkImage> from the compute pipeline (mutex-protected)
         void *imgPtr = pipeline->getOutputSkImage();
-        if (!imgPtr) {
-          return facebook::jsi::Value::null();
-        }
+        if (!imgPtr) return facebook::jsi::Value::null();
 
-        // imgPtr points to sk_sp<SkImage> inside the pipeline — copy it (bumps refcount)
         sk_sp<SkImage> image = *static_cast<sk_sp<SkImage> *>(imgPtr);
-        if (!image) {
-          return facebook::jsi::Value::null();
-        }
+        if (!image) return facebook::jsi::Value::null();
 
-        // Wrap as JsiSkImage — same pattern as JsiVideo::nextImage()
         auto hostObject = std::make_shared<RNSkia::JsiSkImage>(
             platformContext, std::move(image));
         return jsi::Object::createFromHostObject(rt, hostObject);
       });
 
+  // Install global.__webgpuCamera_createStream() — returns a host object
+  // that can be passed into worklets. Worklets call stream.nextImage() on
+  // the UI thread. Reanimated shares JSI host objects across runtimes.
+  auto createStream = facebook::jsi::Function::createFromHostFunction(
+      runtime,
+      facebook::jsi::PropNameID::forAscii(runtime, "__webgpuCamera_createStream"),
+      0,
+      [pipeline, alive, platformContext](facebook::jsi::Runtime &rt,
+                 const facebook::jsi::Value &,
+                 const facebook::jsi::Value *,
+                 size_t) -> facebook::jsi::Value {
+        auto stream = std::make_shared<CameraStreamHostObject>(
+            pipeline, alive, platformContext);
+        return jsi::Object::createFromHostObject(rt, stream);
+      });
+
   auto global = runtime.global();
   global.setProperty(runtime, "__webgpuCamera_nextImage", std::move(nextImage));
-  printf("[DawnPipeline] JSI bindings installed (nextImage → JsiSkImage)\n");
+  global.setProperty(runtime, "__webgpuCamera_createStream", std::move(createStream));
+  printf("[DawnPipeline] JSI bindings installed (nextImage + createStream)\n");
 }
 
 } // extern "C"

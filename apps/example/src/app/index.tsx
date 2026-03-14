@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect, useRef } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import {
   View,
   Text,
@@ -9,36 +9,44 @@ import {
   useWindowDimensions,
 } from 'react-native';
 import { Canvas, Fill, Group, Image as SkImage, type SkImage as SkImageType } from '@shopify/react-native-skia';
+import { useSharedValue, useFrameCallback } from 'react-native-reanimated';
 import { useSpikeMetrics, SpikeResults } from '@/hooks/useSpikeMetrics';
 import { startRecording, stopRecording, RecorderState } from '@/utils/recorderBridge';
 import WebGPUCameraModule from 'react-native-webgpu-camera/modules/webgpu-camera/src/WebGPUCameraModule';
 import { SOBEL_WGSL } from '@/shaders/sobel.wgsl';
 
+interface CameraStream {
+  nextImage(): SkImageType | null;
+  dispose(): void;
+}
+
 declare global {
-  // Returns a JsiSkImage (SkImage host object) directly — no MakeImageFromTexture needed
+  // Returns a JsiSkImage (SkImage host object) directly — rAF fallback path
   function __webgpuCamera_nextImage(): SkImageType | null;
+  // Returns a CameraStreamHostObject for worklet path
+  function __webgpuCamera_createStream(): CameraStream;
 }
 
 const CAMERA_WIDTH = 3840;
 const CAMERA_HEIGHT = 2160;
-const CAMERA_FPS = 60;
+const CAMERA_FPS = 120;
 
-function PreviewCanvas({ previewImage }: { previewImage: SkImageType | null }) {
+function PreviewCanvas({ currentFrame }: { currentFrame: SharedValue<SkImageType | null> }) {
   const { width: screenW, height: screenH } = useWindowDimensions();
   return (
     <Canvas style={StyleSheet.absoluteFill}>
       <Fill color="black" />
-      {previewImage && (
-        <Group transform={[
-          { translateX: screenW },
-          { rotate: Math.PI / 2 },
-        ]}>
-          <SkImage image={previewImage} x={0} y={0} width={screenH} height={screenW} fit="cover" />
-        </Group>
-      )}
+      <Group transform={[
+        { translateX: screenW },
+        { rotate: Math.PI / 2 },
+      ]}>
+        <SkImage image={currentFrame} x={0} y={0} width={screenH} height={screenW} fit="cover" />
+      </Group>
     </Canvas>
   );
 }
+
+type SharedValue<T> = ReturnType<typeof useSharedValue<T>>;
 
 export default function CameraSpikeScreen() {
   const [isRunning, setIsRunning] = useState(false);
@@ -47,59 +55,27 @@ export default function CameraSpikeScreen() {
   const [results, setResults] = useState<SpikeResults | null>(null);
   const metrics = useSpikeMetrics();
 
-  const isRunningRef = useRef(false);
   const recorderPathRef = useRef('pending');
-  const lastFrameCounter = useRef(0);
-  const startTimeRef = useRef(0);
-  const rafRef = useRef<number | null>(null);
-  const [previewImage, setPreviewImage] = useState<SkImageType | null>(null);
-  const prevImageRef = useRef<SkImageType | null>(null);
 
-  const startRenderLoop = useCallback(() => {
-    startTimeRef.current = performance.now();
-    lastFrameCounter.current = 0;
+  // Shared values: accessible from both JS and UI (worklet) runtimes
+  const stream = useSharedValue<CameraStream | null>(null);
+  const currentFrame = useSharedValue<SkImageType | null>(null);
 
-    const tick = () => {
-      if (!isRunningRef.current) return;
-
-      const frameCounter = WebGPUCameraModule.getFrameCounter();
-      if (frameCounter > lastFrameCounter.current) {
-        lastFrameCounter.current = frameCounter;
-
-        const t0 = performance.now();
-
-        // Get the compute output as JsiSkImage directly (no MakeImageFromTexture needed)
-        const img = globalThis.__webgpuCamera_nextImage?.();
-        const tNextImage = performance.now();
-
-        if (img) {
-          prevImageRef.current?.dispose();
-          prevImageRef.current = img;
-          setPreviewImage(img);
-
-          metrics.recordFrame({
-            importMs: tNextImage - t0,
-            computeMs: 0, // compute runs on native thread, not measured here
-            skiaMs: 0, // SkImage created natively, no JS-side Skia work
-            totalMs: tNextImage - t0,
-          });
-        }
-
-        if (frameCounter % 30 === 0) {
-          metrics.recordThermalChange(WebGPUCameraModule.getThermalState());
-        }
-      }
-      rafRef.current = requestAnimationFrame(tick);
-    };
-
-    // Small delay to let camera start producing frames
-    setTimeout(() => {
-      rafRef.current = requestAnimationFrame(tick);
-    }, 500);
-  }, [metrics]);
+  // useFrameCallback runs on UI thread every display frame.
+  // The stream host object is shared across runtimes by Reanimated.
+  // Skia Canvas watches currentFrame and redraws automatically — no setState.
+  useFrameCallback(() => {
+    'worklet';
+    const s = stream.value;
+    if (!s) return;
+    const img = s.nextImage();
+    if (img) {
+      currentFrame.value?.dispose();
+      currentFrame.value = img;
+    }
+  });
 
   const startPipeline = useCallback(() => {
-    isRunningRef.current = true;
     setIsRunning(true);
     setResults(null);
     metrics.reset();
@@ -113,18 +89,17 @@ export default function CameraSpikeScreen() {
     }
     setStatus('compute ready');
 
-    // 2. Start camera with fps — each frame runs compute on native thread
+    // 2. Create stream host object (JSI) — passable into worklets
+    stream.value = globalThis.__webgpuCamera_createStream();
+
+    // 3. Start camera with fps — each frame runs compute on native thread
     WebGPUCameraModule.startCameraPreview('back', CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS);
     console.log('[CameraSpikeScreen] Native pipeline started');
-
-    // 3. Start JS render loop
-    startRenderLoop();
-  }, [metrics.reset, startRenderLoop]);
+  }, [metrics.reset]);
 
   const stopPipeline = useCallback(() => {
-    isRunningRef.current = false;
     setIsRunning(false);
-    if (rafRef.current != null) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
+    stream.value = null;
 
     WebGPUCameraModule.stopCameraPreview();
     WebGPUCameraModule.cleanupComputePipeline();
@@ -169,16 +144,14 @@ export default function CameraSpikeScreen() {
 
   useEffect(() => {
     return () => {
-      isRunningRef.current = false;
-      if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
-      prevImageRef.current?.dispose();
+      stream.value = null;
       WebGPUCameraModule.cleanupComputePipeline();
     };
   }, []);
 
   return (
     <View style={styles.container}>
-      <PreviewCanvas previewImage={previewImage} />
+      <PreviewCanvas currentFrame={currentFrame} />
 
       <View style={styles.statusBar}>
         <Text style={styles.statusText}>
