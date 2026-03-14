@@ -3,16 +3,17 @@
 #import <Foundation/Foundation.h>
 #import <CoreVideo/CVPixelBuffer.h>
 
-/// Obj-C bridge to the C++ DawnComputePipeline.
-/// Swift can call these methods; they forward to the C interface internally.
 @interface DawnPipelineBridge : NSObject
 
-- (BOOL)setupWithWGSL:(nonnull NSString *)wgslCode width:(int)width height:(int)height;
-- (BOOL)processFrame:(CVPixelBufferRef _Nonnull)pixelBuffer;
-- (void)cleanup;
+- (BOOL)setupMultiPassWithShaders:(nonnull NSArray<NSString *> *)shaders
+                            width:(int)width
+                           height:(int)height
+                      bufferSpecs:(nonnull NSArray<NSArray<NSNumber *> *> *)bufferSpecs
+                        useCanvas:(BOOL)useCanvas
+                             sync:(BOOL)sync;
 
-/// Install JSI bindings using the given Expo runtime.
-/// Must be called on the JS thread after setup.
+- (BOOL)processFrame:(nonnull CVPixelBufferRef)pixelBuffer;
+- (void)cleanup;
 - (void)installJSIBindings:(nonnull id)expoRuntime;
 
 @end
