@@ -1,84 +1,84 @@
 #pragma once
 
-#ifdef __cplusplus
-
 #include <string>
+#include <vector>
 #include <mutex>
 #include <memory>
 #include <atomic>
 #include <CoreVideo/CVPixelBuffer.h>
 
-// Forward declare to avoid pulling all Dawn headers into Swift bridging
 namespace dawn_pipeline {
 
-/// Opaque handle to the native compute pipeline.
-/// All GPU work happens on the shared Dawn device from Skia Graphite.
 class DawnComputePipeline {
 public:
   DawnComputePipeline();
   ~DawnComputePipeline();
 
-  /// Compile WGSL shader and create compute pipeline + output texture.
-  /// Call once at setup time. Returns true on success.
-  bool setup(const std::string &wgslCode, int width, int height);
+  struct BufferSpec {
+    int passIndex;
+    int elementSize;
+    int count;
+  };
 
-  /// Import a camera CVPixelBuffer as a Dawn texture via IOSurface (zero-copy).
-  /// Then dispatch the compute shader.
-  /// Call from the camera frame callback (native thread).
+  bool setup(const std::vector<std::string>& wgslShaders,
+             int width, int height,
+             const std::vector<BufferSpec>& bufferSpecs,
+             bool useCanvas, bool sync);
+
   bool processFrame(CVPixelBufferRef pixelBuffer);
 
-  /// Get the compute output as an opaque pointer to sk_sp<SkImage>.
-  /// The returned pointer is only valid until the next processFrame call.
-  /// Returns nullptr if no frame has been processed yet.
-  void *getOutputSkImage();
+  const void* readBuffer(int bufferIndex) const;
+  int getBufferByteSize(int bufferIndex) const;
 
-  /// Get the raw output wgpu::Texture pointer (for wrapping as GPUTexture JSI object).
-  /// Returns nullptr if pipeline not set up.
-  void *getOutputTexturePtr();
+  void* getSkSurface();
+  void flushCanvas();
 
-  /// Tear down GPU resources.
+  void* getOutputSkImage();
+
   void cleanup();
 
-  int getWidth() const { return _width; }
-  int getHeight() const { return _height; }
-
-  /// Shared liveness flag — checked by JSI lambda to avoid use-after-free.
-  std::shared_ptr<std::atomic<bool>> getAliveFlag() const { return _alive; }
+  int width() const { return _width; }
+  int height() const { return _height; }
+  std::shared_ptr<std::atomic<bool>> alive() const { return _alive; }
 
 private:
-  void cleanupLocked(); // called with _mutex already held
+  void cleanupLocked();
 
   struct Impl;
-  Impl *_impl = nullptr;
+  Impl* _impl = nullptr;
+  std::mutex _mutex;
   int _width = 0;
   int _height = 0;
-  std::mutex _mutex;
   std::shared_ptr<std::atomic<bool>> _alive;
 };
 
 } // namespace dawn_pipeline
 
-#endif // __cplusplus
+typedef void* DawnComputePipelineRef;
 
-// C interface for Swift interop
-#ifdef __cplusplus
 extern "C" {
-#endif
+  DawnComputePipelineRef dawn_pipeline_create();
+  void dawn_pipeline_destroy(DawnComputePipelineRef ref);
 
-typedef void *DawnComputePipelineRef;
+  bool dawn_pipeline_setup_multipass(
+    DawnComputePipelineRef ref,
+    const char** shaders, int shaderCount,
+    int width, int height,
+    const int* bufferSpecs, int bufferCount,
+    bool useCanvas, bool sync);
 
-DawnComputePipelineRef dawn_pipeline_create(void);
-void dawn_pipeline_destroy(DawnComputePipelineRef ref);
-bool dawn_pipeline_setup(DawnComputePipelineRef ref, const char *wgslCode, int width, int height);
-bool dawn_pipeline_process_frame(DawnComputePipelineRef ref, CVPixelBufferRef pixelBuffer);
-void *dawn_pipeline_get_output_image(DawnComputePipelineRef ref);
-void *dawn_pipeline_get_output_texture(DawnComputePipelineRef ref);
-void dawn_pipeline_cleanup(DawnComputePipelineRef ref);
+  bool dawn_pipeline_process_frame(DawnComputePipelineRef ref,
+                                    CVPixelBufferRef pixelBuffer);
 
-/// Install JSI bindings for the compute pipeline on the given JS runtime.
-/// Call once after the pipeline is created. Installs global.__webgpuCamera_getOutputTexture().
-void dawn_pipeline_install_jsi(DawnComputePipelineRef ref, void *jsiRuntime);
+  const void* dawn_pipeline_read_buffer(DawnComputePipelineRef ref, int index);
+  int dawn_pipeline_get_buffer_byte_size(DawnComputePipelineRef ref, int index);
 
-#ifdef __cplusplus
+  void* dawn_pipeline_get_sk_surface(DawnComputePipelineRef ref);
+  void dawn_pipeline_flush_canvas(DawnComputePipelineRef ref);
+
+  void* dawn_pipeline_get_output_image(DawnComputePipelineRef ref);
+
+  void dawn_pipeline_cleanup(DawnComputePipelineRef ref);
+
+  void dawn_pipeline_install_jsi(DawnComputePipelineRef ref, void* jsiRuntime);
 }
-#endif
