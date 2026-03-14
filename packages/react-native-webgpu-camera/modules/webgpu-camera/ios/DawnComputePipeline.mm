@@ -29,7 +29,7 @@ struct StagingBuffer {
   int elementSize = 0;
   int count = 0;
   int passIndex = 0;
-  std::atomic<bool> mapped[2] = {false, false};
+  bool mapped[2] = {false, false};  // guarded by pipeline mutex
   const void* mappedData[2] = {nullptr, nullptr};
 };
 
@@ -167,14 +167,18 @@ bool DawnComputePipeline::setup(
   // Determine final output texture
   _impl->finalTex = (wgslShaders.size() % 2 != 0) ? &_impl->texA : &_impl->texB;
 
-  // Create persistent SkSurface for canvas if needed
+  // Create SkSurface wrapping the final compute output texture for canvas drawing.
+  // Skia Graphite draws directly onto this GPU texture — no extra composition needed.
   if (useCanvas) {
-    skgpu::graphite::BackendTexture backendTex =
-      skgpu::graphite::BackendTextures::MakeDawn(_impl->finalTex->Get());
+    // Get a Recorder* via a temporary offscreen surface (getRecorder() is private)
+    auto tempSurface = ctx.MakeOffscreen(1, 1);
+    auto* recorder = tempSurface->recorder();
+
+    auto backendTex = skgpu::graphite::BackendTextures::MakeDawn(
+      _impl->finalTex->Get());
     _impl->surface = SkSurfaces::WrapBackendTexture(
-      ctx.getRecorder(), backendTex,
-      kRGBA_8888_SkColorType, nullptr, nullptr
-    );
+      recorder, backendTex,
+      kRGBA_8888_SkColorType, nullptr, nullptr);
   }
 
   printf("[DawnPipeline] Multi-pass setup complete: %zu passes, %dx%d\n",
@@ -278,9 +282,9 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   for (auto& sb : _impl->buffers) {
     int stagingIdx = sb.frameIndex % 2;
 
-    if (sb.mapped[stagingIdx].load()) {
+    if (sb.mapped[stagingIdx]) {
       sb.staging[stagingIdx].Unmap();
-      sb.mapped[stagingIdx].store(false);
+      sb.mapped[stagingIdx] = false;
       sb.mappedData[stagingIdx] = nullptr;
     }
 
@@ -300,7 +304,7 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
       [&sb, stagingIdx](wgpu::MapAsyncStatus status, wgpu::StringView) {
         if (status == wgpu::MapAsyncStatus::Success) {
           sb.mappedData[stagingIdx] = sb.staging[stagingIdx].GetConstMappedRange(0, sb.byteSize);
-          sb.mapped[stagingIdx].store(true);
+          sb.mapped[stagingIdx] = true;
         }
       }
     );
@@ -312,7 +316,7 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   if (_impl->syncMode) {
     for (auto& sb : _impl->buffers) {
       int stagingIdx = (sb.frameIndex - 1) % 2;
-      while (!sb.mapped[stagingIdx].load()) {
+      while (!sb.mapped[stagingIdx]) {
         device.Tick();
       }
     }
@@ -337,7 +341,7 @@ const void* DawnComputePipeline::readBuffer(int bufferIndex) const {
 
   auto& sb = _impl->buffers[bufferIndex];
   int readIdx = sb.frameIndex % 2;
-  if (!sb.mapped[readIdx].load()) return nullptr;
+  if (!sb.mapped[readIdx]) return nullptr;
   return sb.mappedData[readIdx];
 }
 
@@ -358,12 +362,9 @@ void DawnComputePipeline::flushCanvas() {
   if (!_impl || !_impl->surface) return;
 
   auto& ctx = RNSkia::DawnContext::getInstance();
-  auto recording = ctx.getRecorder()->snap();
+  auto recording = _impl->surface->recorder()->snap();
   if (recording) {
-    skgpu::graphite::InsertRecordingInfo insertInfo{};
-    insertInfo.fRecording = recording.get();
-    ctx.fGraphiteContext->insertRecording(insertInfo);
-    ctx.fGraphiteContext->submit(skgpu::graphite::SyncToCpu::kNo);
+    ctx.submitRecording(recording.get());
   }
 
   if (_impl->finalTex) {
@@ -389,9 +390,9 @@ void DawnComputePipeline::cleanupLocked() {
 
   for (auto& sb : _impl->buffers) {
     for (int j = 0; j < 2; j++) {
-      if (sb.mapped[j].load()) {
+      if (sb.mapped[j]) {
         sb.staging[j].Unmap();
-        sb.mapped[j].store(false);
+        sb.mapped[j] = false;
         sb.mappedData[j] = nullptr;
       }
     }
