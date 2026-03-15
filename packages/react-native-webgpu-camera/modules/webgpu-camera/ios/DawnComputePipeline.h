@@ -34,13 +34,46 @@ public:
 
   void* getSkSurface();
   void flushCanvas();
+  void* flushCanvasAndGetImage();
 
   void* getOutputSkImage();
+
+  /** Single-lock frame begin: returns image, buffers, canvas, fps, generation, metrics */
+  struct FrameData {
+    void* image = nullptr;         // sk_sp<SkImage>*
+    void* surface = nullptr;       // sk_sp<SkSurface>*
+    const void* bufferData[8] = {};
+    int bufferByteSizes[8] = {};
+    int bufferCount = 0;
+    int pipelineFps = 0;
+    int generation = 0;
+    double metricLockWait = 0;
+    double metricImport = 0;
+    double metricBindGroup = 0;
+    double metricCompute = 0;
+    double metricBuffers = 0;
+    double metricMakeImage = 0;
+    double metricTotal = 0;
+    double metricWall = 0;
+  };
+  FrameData beginFrame();
 
   void cleanup();
 
   int width() const { return _width; }
   int height() const { return _height; }
+  int pipelineFps() const;
+  int generation() const;
+
+  // Per-step timing (ms) from last processFrame
+  double metricLockWait() const;
+  double metricImport() const;
+  double metricBindGroup() const;
+  double metricCompute() const;
+  double metricBuffers() const;
+  double metricMakeImage() const;
+  double metricTotal() const;
+  double metricWall() const;
   std::shared_ptr<std::atomic<bool>> alive() const { return _alive; }
 
 private:

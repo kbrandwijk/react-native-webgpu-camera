@@ -23,8 +23,8 @@ Pod::Spec.new do |s|
   s.dependency 'ExpoModulesCore'
   s.dependency 'react-native-skia'
 
-  s.source_files = "**/*.{h,m,mm,swift,hpp,cpp}"
-  s.vendored_libraries = 'rust/libwebgpu_camera.a'
+  s.source_files = "*.{h,m,mm,swift,hpp,cpp}"
+  s.exclude_files = "rust/**"
 
   s.frameworks = ['CoreVideo', 'IOSurface', 'MetalKit']
 
@@ -32,7 +32,6 @@ Pod::Spec.new do |s|
     'DEFINES_MODULE' => 'YES',
     'CLANG_CXX_LANGUAGE_STANDARD' => 'c++17',
     'GCC_PREPROCESSOR_DEFINITIONS' => '$(inherited) SK_GRAPHITE=1 RCT_NEW_ARCH_ENABLED=1',
-    'SWIFT_INCLUDE_PATHS' => '$(PODS_TARGET_SRCROOT)/rust',
     'HEADER_SEARCH_PATHS' => [
       '"$(PODS_TARGET_SRCROOT)"',
       "\"#{skia_pkg_root}/cpp/\"/**",

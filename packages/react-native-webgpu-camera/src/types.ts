@@ -21,12 +21,39 @@ export interface CameraHandle {
 
 // useGPUFrameProcessor
 
+/** Per-step timing from last processFrame (milliseconds) */
+export interface PipelineMetrics {
+  lockWait: number;
+  import: number;
+  bindGroup: number;
+  compute: number;
+  buffers: number;
+  makeImage: number;
+  total: number;
+  wall: number;
+}
+
+/** Result from beginFrame() — everything in one mutex lock */
+export interface FrameSnapshot {
+  image?: SkImage;
+  canvas?: SkCanvas;
+  buffers: (ArrayBuffer | null)[];
+  pipelineFps: number;
+  generation: number;
+  metrics: PipelineMetrics;
+}
+
 /** JSI host object shared across Reanimated runtimes */
 export interface CameraStream {
   nextImage(): SkImage | null;
   readBuffer(index: number): ArrayBuffer | null;
   getCanvas(): SkCanvas | null;
   flushCanvas(): void;
+  flushCanvasAndGetImage(): SkImage | null;
+  beginFrame(): FrameSnapshot | null;
+  pipelineFps(): number;
+  generation(): number;
+  metrics(): PipelineMetrics | null;
   dispose(): void;
 }
 
@@ -100,6 +127,15 @@ export interface GPUFrameProcessorResult {
   /** Latest processed frame as SkImage — drive a Skia Canvas with this.
    *  The hook owns disposal — do NOT call dispose() on this value. */
   currentFrame: SharedValue<SkImage | null>;
+  /** Latest buffer readback data — keyed by the names returned from pipeline().
+   *  Values are null until the first readback completes. Updated every display frame. */
+  buffers: SharedValue<Record<string, ArrayBufferView | null>>;
+  /** Pipeline FPS — how many frames the native compute pipeline processes per second. */
+  fps: SharedValue<number>;
+  /** Display FPS — how many truly new frames reach the display per second. */
+  displayFps: SharedValue<number>;
+  /** Per-step timing from last processFrame (ms). Updated once per second. */
+  metrics: SharedValue<PipelineMetrics | null>;
   /** Non-null if shader compilation or pipeline setup failed. */
   error: string | null;
 }

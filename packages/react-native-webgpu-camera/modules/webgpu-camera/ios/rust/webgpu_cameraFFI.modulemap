@@ -1,7 +1,0 @@
-module webgpu_cameraFFI {
-    header "webgpu_cameraFFI.h"
-    export *
-    use "Darwin"
-    use "_Builtin_stdbool"
-    use "_Builtin_stdint"
-}

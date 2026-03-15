@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react';
-import { useSharedValue, useFrameCallback } from 'react-native-reanimated';
-import type { SkImage } from '@shopify/react-native-skia';
-import WebGPUCameraModule from '../modules/webgpu-camera/src/WebGPUCameraModule';
+import { useEffect, useState } from "react";
+import { useSharedValue, useFrameCallback } from "react-native-reanimated";
+import type { SkImage } from "@shopify/react-native-skia";
+import WebGPUCameraModule from "../modules/webgpu-camera/src/WebGPUCameraModule";
 import type {
   CameraHandle,
   CameraStream,
@@ -9,8 +9,9 @@ import type {
   ProcessorConfig,
   FrameProcessor,
   GPUFrameProcessorResult,
+  PipelineMetrics,
   TypedArrayConstructor,
-} from './types';
+} from "./types";
 
 /** Internal: collected shader/buffer info from the capture proxy */
 interface CapturedPass {
@@ -41,18 +42,24 @@ function capturePipeline<B extends Record<string, any>>(
   let hasCanvas = false;
 
   const captureFrame: ProcessorFrame = {
-    runShader(wgsl: string, options?: { output: TypedArrayConstructor; count: number }) {
+    runShader(
+      wgsl: string,
+      options?: { output: TypedArrayConstructor; count: number },
+    ) {
       const pass: CapturedPass = { wgsl };
       if (options) {
         pass.buffer = { output: options.output, count: options.count };
-        bufferMetas.push({ name: `__buf_${bufferMetas.length}`, ctor: options.output });
+        bufferMetas.push({
+          name: `__buf_${bufferMetas.length}`,
+          ctor: options.output,
+        });
       }
       passes.push(pass);
       return {} as any;
     },
     canvas: new Proxy({} as any, {
       get(_, prop) {
-        if (typeof prop === 'string' && prop.startsWith('draw')) {
+        if (typeof prop === "string" && prop.startsWith("draw")) {
           hasCanvas = true;
         }
         return () => {};
@@ -104,16 +111,53 @@ function buildNativeConfig(
 }
 
 /**
- * Typed array constructor lookup — available as globals in the worklet runtime.
+ * Typed array constructor index → constructor.
+ * We can't pass constructors directly into worklets, so we use an index.
+ * 0=Float32, 1=Float64, 2=Int8, 3=Int16, 4=Int32, 5=Uint8, 6=Uint16, 7=Uint32, 8=Uint8Clamped
  */
-function wrapBuffer(arrayBuffer: ArrayBuffer, bytesPerElement: number): ArrayBufferView {
-  'worklet';
-  switch (bytesPerElement) {
-    case 8: return new Float64Array(arrayBuffer);
-    case 4: return new Float32Array(arrayBuffer);
-    case 2: return new Uint16Array(arrayBuffer);
-    case 1: return new Uint8Array(arrayBuffer);
-    default: return new Float32Array(arrayBuffer);
+const CTOR_INDEX: TypedArrayConstructor[] = [
+  Float32Array,
+  Float64Array,
+  Int8Array,
+  Int16Array,
+  Int32Array,
+  Uint8Array,
+  Uint16Array,
+  Uint32Array,
+  Uint8ClampedArray,
+];
+
+function ctorToIndex(ctor: TypedArrayConstructor): number {
+  const idx = CTOR_INDEX.indexOf(ctor);
+  return idx >= 0 ? idx : 0;
+}
+
+function wrapBuffer(
+  arrayBuffer: ArrayBuffer,
+  ctorIndex: number,
+): ArrayBufferView {
+  "worklet";
+  switch (ctorIndex) {
+    case 0:
+      return new Float32Array(arrayBuffer);
+    case 1:
+      return new Float64Array(arrayBuffer);
+    case 2:
+      return new Int8Array(arrayBuffer);
+    case 3:
+      return new Int16Array(arrayBuffer);
+    case 4:
+      return new Int32Array(arrayBuffer);
+    case 5:
+      return new Uint8Array(arrayBuffer);
+    case 6:
+      return new Uint16Array(arrayBuffer);
+    case 7:
+      return new Uint32Array(arrayBuffer);
+    case 8:
+      return new Uint8ClampedArray(arrayBuffer);
+    default:
+      return new Float32Array(arrayBuffer);
   }
 }
 
@@ -124,14 +168,22 @@ export function useGPUFrameProcessor(
   const [error, setError] = useState<string | null>(null);
   const stream = useSharedValue<CameraStream | null>(null);
   const currentFrame = useSharedValue<SkImage | null>(null);
+  const buffers = useSharedValue<Record<string, ArrayBufferView | null>>({});
+  const fps = useSharedValue(0);
+  const displayFps = useSharedValue(0);
+  const metrics = useSharedValue<PipelineMetrics | null>(null);
+  const lastGen = useSharedValue(0);
+  const displayFrameCount = useSharedValue(0);
+  const displayFpsTime = useSharedValue(0);
 
   // Determine form at module scope (not in worklet)
-  const isObjectForm = typeof processorOrConfig !== 'function' && 'pipeline' in processorOrConfig;
+  const isObjectForm =
+    typeof processorOrConfig !== "function" && "pipeline" in processorOrConfig;
   const onFrameFn = isObjectForm
     ? (processorOrConfig as ProcessorConfig<any>).onFrame
     : undefined;
   const sync = isObjectForm
-    ? (processorOrConfig as ProcessorConfig<any>).sync ?? false
+    ? ((processorOrConfig as ProcessorConfig<any>).sync ?? false)
     : false;
   const pipelineFn = isObjectForm
     ? (processorOrConfig as ProcessorConfig<any>).pipeline
@@ -140,7 +192,7 @@ export function useGPUFrameProcessor(
   // Buffer metadata shared with the worklet via shared values
   const bufferCount = useSharedValue(0);
   const bufferNames = useSharedValue<string[]>([]);
-  const bufferBytesPerElement = useSharedValue<number[]>([]);
+  const bufferCtorIndices = useSharedValue<number[]>([]);
   const hasOnFrame = useSharedValue(false);
 
   // Setup compute pipeline when camera is ready
@@ -154,15 +206,12 @@ export function useGPUFrameProcessor(
       camera.height,
     );
 
-    if (passes.length === 0) {
-      setError('No shader provided — call frame.runShader(wgslCode) in your processor');
-      return;
-    }
+    // Zero passes is valid — camera frames pass through without compute
 
     // Store buffer metadata in shared values for worklet access
     bufferCount.value = bufferMetas.length;
     bufferNames.value = bufferMetas.map((m) => m.name);
-    bufferBytesPerElement.value = bufferMetas.map((m) => m.ctor.BYTES_PER_ELEMENT ?? 4);
+    bufferCtorIndices.value = bufferMetas.map((m) => ctorToIndex(m.ctor));
     hasOnFrame.value = !!onFrameFn;
 
     // Determine if canvas is used (between passes OR in onFrame)
@@ -170,12 +219,16 @@ export function useGPUFrameProcessor(
 
     // Build and send native config
     const nativeConfig = buildNativeConfig(
-      passes, camera.width, camera.height, useCanvas, sync,
+      passes,
+      camera.width,
+      camera.height,
+      useCanvas,
+      sync,
     );
 
     const ok = WebGPUCameraModule.setupMultiPassPipeline(nativeConfig);
     if (!ok) {
-      setError('Multi-pass pipeline setup failed');
+      setError("Multi-pass pipeline setup failed");
       return;
     }
     setError(null);
@@ -193,56 +246,69 @@ export function useGPUFrameProcessor(
 
   // Frame callback — runs on Reanimated UI thread every display frame
   useFrameCallback(() => {
-    'worklet';
+    "worklet";
     const s = stream.value;
     if (!s) return;
 
-    const img = s.nextImage();
-    if (!img) return;
+    // Single native call: image + buffers + canvas + fps + generation + metrics
+    const frame = s.beginFrame();
+    if (!frame) return;
 
-    if (hasOnFrame.value && onFrameFn) {
-      // --- Object form with onFrame ---
-      const count = bufferCount.value;
+    // All from the same snapshot — no extra JSI calls
+    fps.value = frame.pipelineFps;
+
+    // Track display FPS — count frames where generation changed (truly new frame)
+    if (frame.generation !== lastGen.value) {
+      lastGen.value = frame.generation;
+      displayFrameCount.value++;
+      const now = performance.now();
+      if (displayFpsTime.value === 0) {
+        displayFpsTime.value = now;
+      } else if (now - displayFpsTime.value >= 1000) {
+        displayFps.value = Math.round(displayFrameCount.value * 1000 / (now - displayFpsTime.value));
+        displayFrameCount.value = 0;
+        displayFpsTime.value = now;
+        metrics.value = frame.metrics;
+      }
+    }
+
+    // Resolve buffers from the frame snapshot
+    const count = bufferCount.value;
+    if (count > 0) {
       const names = bufferNames.value;
-      const bpe = bufferBytesPerElement.value;
-      const buffers: Record<string, any> = {};
-
+      const bpe = bufferCtorIndices.value;
+      const readBuffers: Record<string, any> = {};
       for (let i = 0; i < count; i++) {
-        const buf = s.readBuffer(i);
-        buffers[names[i]] = buf !== null ? wrapBuffer(buf, bpe[i]) : null;
+        const buf = frame.buffers[i];
+        readBuffers[names[i]] = buf != null ? wrapBuffer(buf, bpe[i]) : null;
       }
+      buffers.value = readBuffers;
+    }
 
-      const canvas = s.getCanvas();
-
+    // onFrame canvas path — always flush to produce the composited image
+    if (hasOnFrame.value && onFrameFn && frame.canvas) {
       const renderFrame = {
-        canvas: canvas!,
-        width: img.width(),
-        height: img.height(),
+        canvas: frame.canvas,
+        width: camera.width,
+        height: camera.height,
       };
+      onFrameFn(renderFrame, (buffers.value ?? {}) as any);
 
-      onFrameFn(renderFrame, buffers as any);
-
-      if (canvas) {
-        s.flushCanvas();
-        const composited = s.nextImage();
-        if (composited) {
-          currentFrame.value?.dispose();
-          currentFrame.value = composited;
-          img.dispose();
-        } else {
-          currentFrame.value?.dispose();
-          currentFrame.value = img;
-        }
-      } else {
+      const composited = s.flushCanvasAndGetImage();
+      if (composited) {
         currentFrame.value?.dispose();
-        currentFrame.value = img;
+        currentFrame.value = composited;
+        frame.image?.dispose();
+        return;
       }
-    } else {
-      // --- Shorthand form (no onFrame) ---
+    }
+
+    // Non-canvas path or fallback
+    if (frame.image) {
       currentFrame.value?.dispose();
-      currentFrame.value = img;
+      currentFrame.value = frame.image;
     }
   });
 
-  return { currentFrame, error };
+  return { currentFrame, buffers, fps, displayFps, metrics, error };
 }

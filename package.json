@@ -8,8 +8,6 @@
   ],
   "scripts": {
     "build": "bun run --filter 'react-native-webgpu-camera' build",
-    "build:rust": "./scripts/build-rust.sh",
-    "build:bindings": "./scripts/generate-bindings.sh",
     "build:skia": "cd packages/react-native-skia/packages/skia && SK_GRAPHITE=1 bunx tsx ./scripts/build-skia.ts",
     "install:skia-graphite": "cd packages/react-native-skia/packages/skia && bunx tsx ./scripts/install-skia-graphite.ts",
     "lint": "bun run --filter '*' lint",

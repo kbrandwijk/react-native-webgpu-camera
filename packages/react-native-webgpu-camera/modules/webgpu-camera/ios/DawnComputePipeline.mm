@@ -36,6 +36,7 @@ struct StagingBuffer {
 struct PassState {
   wgpu::ComputePipeline pipeline;
   wgpu::BindGroupLayout bindGroupLayout;
+  wgpu::BindGroup cachedBindGroup;  // cached for passes 1+ (static ping-pong textures)
   bool hasOutputBuffer = false;
   int bufferIndex = -1;
 };
@@ -48,9 +49,29 @@ struct DawnComputePipeline::Impl {
   std::vector<StagingBuffer> buffers;
   bool syncMode = false;
   bool useCanvas = false;
+  bool rawCamera = false;  // true when 0 shaders, no canvas, no buffers
   sk_sp<SkSurface> surface;
   wgpu::Texture* finalTex = nullptr;
   sk_sp<SkImage> outputImage;
+  sk_sp<SkImage> compositedImage;  // set by flushCanvas, consumed by next nextImage call
+
+  // FPS tracking — counts processFrame completions per second
+  int frameCount = 0;
+  double lastFpsTime = 0;
+  int currentFps = 0;
+
+  // Generation counter — increments each processFrame completion
+  int generation = 0;
+
+  // Per-step timing (ms) — updated every frame, logged every second
+  double t_lockWait = 0;
+  double t_import = 0;
+  double t_bindGroup = 0;
+  double t_compute = 0;
+  double t_buffers = 0;
+  double t_makeImage = 0;
+  double t_total = 0;
+  double t_wall = 0;  // wall time including lock wait
 };
 
 DawnComputePipeline::DawnComputePipeline()
@@ -79,6 +100,10 @@ bool DawnComputePipeline::setup(
   _impl->syncMode = sync;
   _impl->useCanvas = useCanvas;
 
+  // TODO: Raw camera path (0 shaders, no canvas, no buffers) needs texture
+  // lifetime management — IOSurface texture is freed when processFrame returns.
+  // For now, always use the compute path with auto-inserted passthrough shader.
+
   // Create ping-pong textures
   wgpu::TextureDescriptor texDesc{};
   texDesc.size = {(uint32_t)width, (uint32_t)height, 1};
@@ -101,12 +126,31 @@ bool DawnComputePipeline::setup(
     return false;
   }
 
+  // Auto-insert passthrough shader when no user shaders but canvas/buffers needed.
+  // Handles BGRA→RGBA conversion and gives onFrame a canvas to draw on.
+  static const std::string kPassthroughWGSL = R"(
+@group(0) @binding(0) var inputTex: texture_2d<f32>;
+@group(0) @binding(1) var outputTex: texture_storage_2d<rgba8unorm, write>;
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  let dims = textureDimensions(inputTex);
+  if (id.x >= dims.x || id.y >= dims.y) { return; }
+  textureStore(outputTex, vec2i(id.xy), textureLoad(inputTex, vec2i(id.xy), 0));
+}
+)";
+
+  auto effectiveShaders = wgslShaders;
+  if (effectiveShaders.empty()) {
+    effectiveShaders.push_back(kPassthroughWGSL);
+  }
+
   // Compile shader passes
-  for (size_t i = 0; i < wgslShaders.size(); i++) {
+  for (size_t i = 0; i < effectiveShaders.size(); i++) {
     PassState pass;
 
     wgpu::ShaderModuleWGSLDescriptor wgslDesc{};
-    wgslDesc.code = wgslShaders[i].c_str();
+    wgslDesc.code = effectiveShaders[i].c_str();
 
     wgpu::ShaderModuleDescriptor smDesc{};
     smDesc.nextInChain = &wgslDesc;
@@ -165,7 +209,44 @@ bool DawnComputePipeline::setup(
   }
 
   // Determine final output texture
-  _impl->finalTex = (wgslShaders.size() % 2 != 0) ? &_impl->texA : &_impl->texB;
+  _impl->finalTex = (effectiveShaders.size() % 2 != 0) ? &_impl->texA : &_impl->texB;
+
+  // Cache bind groups for passes 1+ (static ping-pong textures).
+  // Pass 0 reads from the camera input which changes every frame — can't cache.
+  for (size_t i = 1; i < _impl->passes.size(); i++) {
+    auto& pass = _impl->passes[i];
+    // Pass i reads from the output of pass i-1, writes to the next ping-pong texture.
+    // Odd passes read texA write texB, even passes read texB write texA.
+    bool readFromA = (i % 2 != 0);
+    wgpu::Texture& readTex = readFromA ? _impl->texA : _impl->texB;
+    wgpu::Texture& writeTex = readFromA ? _impl->texB : _impl->texA;
+
+    std::vector<wgpu::BindGroupEntry> entries;
+    wgpu::BindGroupEntry entry0{};
+    entry0.binding = 0;
+    entry0.textureView = readTex.CreateView();
+    entries.push_back(entry0);
+
+    wgpu::BindGroupEntry entry1{};
+    entry1.binding = 1;
+    entry1.textureView = writeTex.CreateView();
+    entries.push_back(entry1);
+
+    if (pass.hasOutputBuffer && pass.bufferIndex >= 0) {
+      auto& sb = _impl->buffers[pass.bufferIndex];
+      wgpu::BindGroupEntry entry2{};
+      entry2.binding = 2;
+      entry2.buffer = sb.gpuBuffer;
+      entry2.size = sb.byteSize;
+      entries.push_back(entry2);
+    }
+
+    wgpu::BindGroupDescriptor bgDesc{};
+    bgDesc.layout = pass.bindGroupLayout;
+    bgDesc.entryCount = entries.size();
+    bgDesc.entries = entries.data();
+    pass.cachedBindGroup = _impl->device.CreateBindGroup(&bgDesc);
+  }
 
   // Create SkSurface wrapping the final compute output texture for canvas drawing.
   // Skia Graphite draws directly onto this GPU texture — no extra composition needed.
@@ -181,17 +262,22 @@ bool DawnComputePipeline::setup(
       kRGBA_8888_SkColorType, nullptr, nullptr);
   }
 
-  printf("[DawnPipeline] Multi-pass setup complete: %zu passes, %dx%d\n",
-         wgslShaders.size(), width, height);
+  printf("[DawnPipeline] Setup complete: %zu passes, %zu buffers, %dx%d%s\n",
+         effectiveShaders.size(), bufferSpecs.size(), width, height,
+         useCanvas ? " +canvas" : "");
   return true;
 }
 
 bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
+  double tWallStart = CACurrentMediaTime();
   std::lock_guard<std::mutex> lock(_mutex);
+  double tAfterLock = CACurrentMediaTime();
   if (!_impl || !pixelBuffer) return false;
 
   auto& ctx = RNSkia::DawnContext::getInstance();
   auto& device = _impl->device;
+
+  double tStart = tAfterLock;
 
   IOSurfaceRef ioSurface = CVPixelBufferGetIOSurface(pixelBuffer);
   if (!ioSurface) return false;
@@ -222,106 +308,185 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   beginDesc.initialized = true;
   sharedMemory.BeginAccess(inputTexture, &beginDesc);
 
-  auto encoder = device.CreateCommandEncoder();
+  double tAfterImport = CACurrentMediaTime();
 
-  wgpu::TextureView readView = inputTexture.CreateView();
-  bool writeToA = true;
+  // ── Raw camera path: no compute, just wrap the BGRA texture as SkImage ──
+  if (_impl->rawCamera) {
+    _impl->outputImage = ctx.MakeImageFromTexture(
+      inputTexture, _width, _height, wgpu::TextureFormat::BGRA8Unorm);
+
+    wgpu::SharedTextureMemoryEndAccessState endState{};
+    sharedMemory.EndAccess(inputTexture, &endState);
+
+    _impl->frameCount++;
+    _impl->generation++;
+    auto now = CACurrentMediaTime();
+    if (_impl->lastFpsTime == 0) {
+      _impl->lastFpsTime = now;
+    } else if (now - _impl->lastFpsTime >= 1.0) {
+      _impl->currentFps = (int)(_impl->frameCount / (now - _impl->lastFpsTime));
+      _impl->frameCount = 0;
+      _impl->lastFpsTime = now;
+    }
+    return true;
+  }
+
+  // ── Compute path ──
+
+  // Process pending async callbacks from previous frame (e.g. MapAsync).
+  // AllowProcessEvents callbacks fire during ProcessEvents(), not Tick().
+  if (!_impl->syncMode && !_impl->buffers.empty()) {
+    ctx.getWGPUInstance().ProcessEvents();
+  }
+
+  double tAfterBindGroup = tAfterImport; // updated after loop
+
+  auto encoder = device.CreateCommandEncoder();
 
   for (size_t i = 0; i < _impl->passes.size(); i++) {
     auto& pass = _impl->passes[i];
 
-    wgpu::Texture& writeTex = writeToA ? _impl->texA : _impl->texB;
-    auto writeView = writeTex.CreateView();
+    wgpu::BindGroup bindGroup;
+    if (i == 0) {
+      // Pass 0: camera input changes every frame — build bind group per frame
+      bool writeToA = true;
+      wgpu::Texture& writeTex = writeToA ? _impl->texA : _impl->texB;
 
-    std::vector<wgpu::BindGroupEntry> entries;
+      std::vector<wgpu::BindGroupEntry> entries;
+      wgpu::BindGroupEntry entry0{};
+      entry0.binding = 0;
+      entry0.textureView = inputTexture.CreateView();
+      entries.push_back(entry0);
 
-    wgpu::BindGroupEntry entry0{};
-    entry0.binding = 0;
-    entry0.textureView = readView;
-    entries.push_back(entry0);
+      wgpu::BindGroupEntry entry1{};
+      entry1.binding = 1;
+      entry1.textureView = writeTex.CreateView();
+      entries.push_back(entry1);
 
-    wgpu::BindGroupEntry entry1{};
-    entry1.binding = 1;
-    entry1.textureView = writeView;
-    entries.push_back(entry1);
+      if (pass.hasOutputBuffer && pass.bufferIndex >= 0) {
+        auto& sb = _impl->buffers[pass.bufferIndex];
+        wgpu::BindGroupEntry entry2{};
+        entry2.binding = 2;
+        entry2.buffer = sb.gpuBuffer;
+        entry2.size = sb.byteSize;
+        entries.push_back(entry2);
+      }
 
-    if (pass.hasOutputBuffer && pass.bufferIndex >= 0) {
-      auto& sb = _impl->buffers[pass.bufferIndex];
-      wgpu::BindGroupEntry entry2{};
-      entry2.binding = 2;
-      entry2.buffer = sb.gpuBuffer;
-      entry2.size = sb.byteSize;
-      entries.push_back(entry2);
+      wgpu::BindGroupDescriptor bgDesc{};
+      bgDesc.layout = pass.bindGroupLayout;
+      bgDesc.entryCount = entries.size();
+      bgDesc.entries = entries.data();
+      bindGroup = device.CreateBindGroup(&bgDesc);
+    } else {
+      // Passes 1+: cached bind group (static ping-pong textures)
+      bindGroup = pass.cachedBindGroup;
     }
-
-    wgpu::BindGroupDescriptor bgDesc{};
-    bgDesc.layout = pass.bindGroupLayout;
-    bgDesc.entryCount = entries.size();
-    bgDesc.entries = entries.data();
-    auto bindGroup = device.CreateBindGroup(&bgDesc);
 
     auto computePass = encoder.BeginComputePass();
     computePass.SetPipeline(pass.pipeline);
     computePass.SetBindGroup(0, bindGroup);
     computePass.DispatchWorkgroups((_width + 15) / 16, (_height + 15) / 16);
     computePass.End();
-
-    readView = writeView;
-    writeToA = !writeToA;
   }
 
-  // Copy output buffers to staging
-  for (auto& sb : _impl->buffers) {
-    int stagingIdx = sb.frameIndex % 2;
+  tAfterBindGroup = CACurrentMediaTime();
 
-    if (sb.mapped[stagingIdx]) {
-      sb.staging[stagingIdx].Unmap();
-      sb.mapped[stagingIdx] = false;
-      sb.mappedData[stagingIdx] = nullptr;
-    }
-
-    encoder.CopyBufferToBuffer(sb.gpuBuffer, 0, sb.staging[stagingIdx], 0, sb.byteSize);
-  }
-
+  // Submit compute work
   auto commands = encoder.Finish();
   device.GetQueue().Submit(1, &commands);
 
-  // Async map staging buffers
-  for (auto& sb : _impl->buffers) {
-    int stagingIdx = sb.frameIndex % 2;
+  double tAfterCompute = CACurrentMediaTime();
 
-    sb.staging[stagingIdx].MapAsync(
-      wgpu::MapMode::Read, 0, sb.byteSize,
-      wgpu::CallbackMode::AllowProcessEvents,
-      [&sb, stagingIdx](wgpu::MapAsyncStatus status, wgpu::StringView) {
-        if (status == wgpu::MapAsyncStatus::Success) {
-          sb.mappedData[stagingIdx] = sb.staging[stagingIdx].GetConstMappedRange(0, sb.byteSize);
-          sb.mapped[stagingIdx] = true;
-        }
-      }
-    );
+  // Copy output buffers to staging in a separate submission
+  if (!_impl->buffers.empty()) {
+    auto copyEncoder = device.CreateCommandEncoder();
 
-    sb.frameIndex++;
-  }
-
-  // Sync mode: tick until all maps complete
-  if (_impl->syncMode) {
     for (auto& sb : _impl->buffers) {
-      int stagingIdx = (sb.frameIndex - 1) % 2;
-      while (!sb.mapped[stagingIdx]) {
-        device.Tick();
+      int stagingIdx = sb.frameIndex % 2;
+
+      if (sb.mapped[stagingIdx]) {
+        sb.staging[stagingIdx].Unmap();
+        sb.mapped[stagingIdx] = false;
+        sb.mappedData[stagingIdx] = nullptr;
       }
+
+      copyEncoder.CopyBufferToBuffer(sb.gpuBuffer, 0, sb.staging[stagingIdx], 0, sb.byteSize);
+    }
+
+    auto copyCommands = copyEncoder.Finish();
+    device.GetQueue().Submit(1, &copyCommands);
+
+    // Map staging buffers for readback
+    for (auto& sb : _impl->buffers) {
+      int stagingIdx = sb.frameIndex % 2;
+
+      if (_impl->syncMode) {
+        auto instance = ctx.getWGPUInstance();
+        auto future = sb.staging[stagingIdx].MapAsync(
+          wgpu::MapMode::Read, 0, sb.byteSize,
+          wgpu::CallbackMode::WaitAnyOnly,
+          [&sb, stagingIdx](wgpu::MapAsyncStatus status, wgpu::StringView) {
+            if (status == wgpu::MapAsyncStatus::Success) {
+              sb.mappedData[stagingIdx] = sb.staging[stagingIdx].GetConstMappedRange(0, sb.byteSize);
+              sb.mapped[stagingIdx] = true;
+            }
+          }
+        );
+        instance.WaitAny(future, UINT64_MAX);
+      } else {
+        // Async readback: AllowProcessEvents callback fires on next ProcessEvents() call.
+        // Data arrives one frame behind — imperceptible for overlays.
+        sb.staging[stagingIdx].MapAsync(
+          wgpu::MapMode::Read, 0, sb.byteSize,
+          wgpu::CallbackMode::AllowProcessEvents,
+          [&sb, stagingIdx](wgpu::MapAsyncStatus status, wgpu::StringView) {
+            if (status == wgpu::MapAsyncStatus::Success) {
+              sb.mappedData[stagingIdx] = sb.staging[stagingIdx].GetConstMappedRange(0, sb.byteSize);
+              sb.mapped[stagingIdx] = true;
+            }
+          }
+        );
+      }
+
+      sb.frameIndex++;
     }
   }
 
-  // Track which texture holds the final output and create SkImage immediately
-  _impl->finalTex = writeToA ? &_impl->texB : &_impl->texA;
+  double tAfterBuffers = CACurrentMediaTime();
+
+  // Determine final output texture and create SkImage
+  bool finalIsA = (_impl->passes.size() % 2 != 0);
+  _impl->finalTex = finalIsA ? &_impl->texA : &_impl->texB;
   _impl->outputImage = ctx.MakeImageFromTexture(
     *_impl->finalTex, _width, _height, wgpu::TextureFormat::RGBA8Unorm);
+
+  double tAfterMakeImage = CACurrentMediaTime();
 
   // Cleanup IOSurface access
   wgpu::SharedTextureMemoryEndAccessState endState{};
   sharedMemory.EndAccess(inputTexture, &endState);
+
+  // Per-step timing (ms)
+  _impl->t_lockWait = (tAfterLock - tWallStart) * 1000.0;
+  _impl->t_import = (tAfterImport - tStart) * 1000.0;
+  _impl->t_bindGroup = (tAfterBindGroup - tAfterImport) * 1000.0;
+  _impl->t_compute = (tAfterCompute - tAfterBindGroup) * 1000.0;
+  _impl->t_buffers = (tAfterBuffers - tAfterCompute) * 1000.0;
+  _impl->t_makeImage = (tAfterMakeImage - tAfterBuffers) * 1000.0;
+  _impl->t_total = (tAfterMakeImage - tStart) * 1000.0;
+  _impl->t_wall = (tAfterMakeImage - tWallStart) * 1000.0;
+
+  // FPS tracking + generation counter
+  _impl->frameCount++;
+  _impl->generation++;
+  auto now = CACurrentMediaTime();
+  if (_impl->lastFpsTime == 0) {
+    _impl->lastFpsTime = now;
+  } else if (now - _impl->lastFpsTime >= 1.0) {
+    _impl->currentFps = (int)(_impl->frameCount / (now - _impl->lastFpsTime));
+    _impl->frameCount = 0;
+    _impl->lastFpsTime = now;
+  }
 
   return true;
 }
@@ -331,9 +496,14 @@ const void* DawnComputePipeline::readBuffer(int bufferIndex) const {
     return nullptr;
 
   auto& sb = _impl->buffers[bufferIndex];
-  int readIdx = sb.frameIndex % 2;
-  if (!sb.mapped[readIdx]) return nullptr;
-  return sb.mappedData[readIdx];
+  // Double-buffer read: frameIndex points past the last write.
+  // The Tick at the start of frame N+1 completes the map from frame N.
+  // After Tick + unmap/write/map cycle, the *other* staging buffer holds completed data.
+  // Try both — return whichever is mapped.
+  for (int i = 0; i < 2; i++) {
+    if (sb.mapped[i] && sb.mappedData[i]) return sb.mappedData[i];
+  }
+  return nullptr;
 }
 
 int DawnComputePipeline::getBufferByteSize(int bufferIndex) const {
@@ -341,6 +511,25 @@ int DawnComputePipeline::getBufferByteSize(int bufferIndex) const {
     return 0;
   return _impl->buffers[bufferIndex].byteSize;
 }
+
+int DawnComputePipeline::pipelineFps() const {
+  if (!_impl) return 0;
+  return _impl->currentFps;
+}
+
+int DawnComputePipeline::generation() const {
+  if (!_impl) return 0;
+  return _impl->generation;
+}
+
+double DawnComputePipeline::metricLockWait() const { return _impl ? _impl->t_lockWait : 0; }
+double DawnComputePipeline::metricImport() const { return _impl ? _impl->t_import : 0; }
+double DawnComputePipeline::metricBindGroup() const { return _impl ? _impl->t_bindGroup : 0; }
+double DawnComputePipeline::metricCompute() const { return _impl ? _impl->t_compute : 0; }
+double DawnComputePipeline::metricBuffers() const { return _impl ? _impl->t_buffers : 0; }
+double DawnComputePipeline::metricMakeImage() const { return _impl ? _impl->t_makeImage : 0; }
+double DawnComputePipeline::metricTotal() const { return _impl ? _impl->t_total : 0; }
+double DawnComputePipeline::metricWall() const { return _impl ? _impl->t_wall : 0; }
 
 void* DawnComputePipeline::getSkSurface() {
   std::lock_guard<std::mutex> lock(_mutex);
@@ -355,19 +544,105 @@ void DawnComputePipeline::flushCanvas() {
   auto& ctx = RNSkia::DawnContext::getInstance();
   auto recording = _impl->surface->recorder()->snap();
   if (recording) {
-    ctx.submitRecording(recording.get());
+    ctx.submitRecording(recording.get(), skgpu::graphite::SyncToCpu::kNo);
   }
 
   if (_impl->finalTex) {
-    _impl->outputImage = ctx.MakeImageFromTexture(
+    // Store as compositedImage so the next nextImage() call returns this
+    // instead of outputImage (which processFrame may overwrite on the camera thread).
+    _impl->compositedImage = ctx.MakeImageFromTexture(
       *_impl->finalTex, _width, _height, wgpu::TextureFormat::RGBA8Unorm
     );
   }
 }
 
+DawnComputePipeline::FrameData DawnComputePipeline::beginFrame() {
+  FrameData fd;
+  std::lock_guard<std::mutex> lock(_mutex);
+  if (!_impl) return fd;
+
+  // Process pending async buffer maps
+  if (!_impl->syncMode && !_impl->buffers.empty()) {
+    auto& ctx = RNSkia::DawnContext::getInstance();
+    ctx.getWGPUInstance().ProcessEvents();
+  }
+
+  // Image
+  if (_impl->compositedImage) {
+    _impl->outputImage = std::move(_impl->compositedImage);
+    _impl->compositedImage = nullptr;
+  }
+  if (_impl->outputImage) {
+    fd.image = &_impl->outputImage;
+  }
+
+  // Buffers
+  fd.bufferCount = std::min((int)_impl->buffers.size(), 8);
+  for (int bi = 0; bi < fd.bufferCount; bi++) {
+    auto& sb = _impl->buffers[bi];
+    fd.bufferByteSizes[bi] = sb.byteSize;
+    fd.bufferData[bi] = nullptr;
+    for (int si = 0; si < 2; si++) {
+      if (sb.mapped[si] && sb.mappedData[si]) {
+        fd.bufferData[bi] = sb.mappedData[si];
+        break;
+      }
+    }
+  }
+
+  // Canvas surface
+  if (_impl->surface) {
+    fd.surface = &_impl->surface;
+  }
+
+  // FPS + generation + metrics — all in the same lock
+  fd.pipelineFps = _impl->currentFps;
+  fd.generation = _impl->generation;
+  fd.metricLockWait = _impl->t_lockWait;
+  fd.metricImport = _impl->t_import;
+  fd.metricBindGroup = _impl->t_bindGroup;
+  fd.metricCompute = _impl->t_compute;
+  fd.metricBuffers = _impl->t_buffers;
+  fd.metricMakeImage = _impl->t_makeImage;
+  fd.metricTotal = _impl->t_total;
+  fd.metricWall = _impl->t_wall;
+
+  return fd;
+}
+
+void* DawnComputePipeline::flushCanvasAndGetImage() {
+  std::lock_guard<std::mutex> lock(_mutex);
+  if (!_impl) return nullptr;
+
+  // Flush canvas and get composited image in one lock
+  if (_impl->surface) {
+    auto& ctx = RNSkia::DawnContext::getInstance();
+    auto recording = _impl->surface->recorder()->snap();
+    if (recording) {
+      ctx.submitRecording(recording.get(), skgpu::graphite::SyncToCpu::kNo);
+    }
+    if (_impl->finalTex) {
+      _impl->outputImage = ctx.MakeImageFromTexture(
+        *_impl->finalTex, _width, _height, wgpu::TextureFormat::RGBA8Unorm
+      );
+    }
+  }
+
+  if (!_impl->outputImage) return nullptr;
+  return &_impl->outputImage;
+}
+
 void* DawnComputePipeline::getOutputSkImage() {
   std::lock_guard<std::mutex> lock(_mutex);
-  if (!_impl || !_impl->outputImage) return nullptr;
+  if (!_impl) return nullptr;
+
+  // Prefer composited image (from flushCanvas) — consume it so it's one-shot
+  if (_impl->compositedImage) {
+    _impl->outputImage = std::move(_impl->compositedImage);
+    _impl->compositedImage = nullptr;
+  }
+
+  if (!_impl->outputImage) return nullptr;
   return &_impl->outputImage;
 }
 
@@ -567,6 +842,144 @@ public:
           if (!_alive->load()) return facebook::jsi::Value::undefined();
           _pipeline->flushCanvas();
           return facebook::jsi::Value::undefined();
+        });
+    }
+
+    if (propName == "flushCanvasAndGetImage") {
+      return facebook::jsi::Function::createFromHostFunction(
+        runtime, name, 0,
+        [this](facebook::jsi::Runtime& rt,
+               const facebook::jsi::Value&,
+               const facebook::jsi::Value*,
+               size_t) -> facebook::jsi::Value {
+          if (!_alive->load()) return facebook::jsi::Value::null();
+
+          auto* imgPtr = static_cast<sk_sp<SkImage>*>(
+            _pipeline->flushCanvasAndGetImage());
+          if (!imgPtr || !*imgPtr) return facebook::jsi::Value::null();
+
+          auto hostObj = std::make_shared<RNSkia::JsiSkImage>(
+            _platformContext, *imgPtr);
+          return facebook::jsi::Object::createFromHostObject(rt, hostObj);
+        });
+    }
+
+    if (propName == "beginFrame") {
+      return facebook::jsi::Function::createFromHostFunction(
+        runtime, name, 0,
+        [this](facebook::jsi::Runtime& rt,
+               const facebook::jsi::Value&,
+               const facebook::jsi::Value*,
+               size_t) -> facebook::jsi::Value {
+          if (!_alive->load()) return facebook::jsi::Value::null();
+
+          auto fd = _pipeline->beginFrame();
+
+          auto result = facebook::jsi::Object(rt);
+
+          // image
+          if (fd.image) {
+            auto* imgPtr = static_cast<sk_sp<SkImage>*>(fd.image);
+            if (imgPtr && *imgPtr) {
+              auto hostObj = std::make_shared<RNSkia::JsiSkImage>(
+                _platformContext, *imgPtr);
+              result.setProperty(rt, "image",
+                facebook::jsi::Object::createFromHostObject(rt, hostObj));
+            }
+          }
+
+          // canvas
+          if (fd.surface) {
+            auto* surfPtr = static_cast<sk_sp<SkSurface>*>(fd.surface);
+            if (surfPtr && *surfPtr) {
+              SkCanvas* canvas = (*surfPtr)->getCanvas();
+              if (canvas) {
+                auto hostObj = std::make_shared<RNSkia::JsiSkCanvas>(
+                  _platformContext, canvas);
+                result.setProperty(rt, "canvas",
+                  facebook::jsi::Object::createFromHostObject(rt, hostObj));
+              }
+            }
+          }
+
+          // buffers as array
+          auto bufsArr = facebook::jsi::Array(rt, fd.bufferCount);
+          for (int i = 0; i < fd.bufferCount; i++) {
+            if (fd.bufferData[i] && fd.bufferByteSizes[i] > 0) {
+              auto arrayBuffer = rt.global()
+                .getPropertyAsFunction(rt, "ArrayBuffer")
+                .callAsConstructor(rt, fd.bufferByteSizes[i])
+                .asObject(rt)
+                .getArrayBuffer(rt);
+              memcpy(arrayBuffer.data(rt), fd.bufferData[i], fd.bufferByteSizes[i]);
+              bufsArr.setValueAtIndex(rt, i, std::move(arrayBuffer));
+            } else {
+              bufsArr.setValueAtIndex(rt, i, facebook::jsi::Value::null());
+            }
+          }
+          result.setProperty(rt, "buffers", std::move(bufsArr));
+
+          // FPS + generation + metrics
+          result.setProperty(rt, "pipelineFps", fd.pipelineFps);
+          result.setProperty(rt, "generation", fd.generation);
+
+          auto m = facebook::jsi::Object(rt);
+          m.setProperty(rt, "lockWait", fd.metricLockWait);
+          m.setProperty(rt, "import", fd.metricImport);
+          m.setProperty(rt, "bindGroup", fd.metricBindGroup);
+          m.setProperty(rt, "compute", fd.metricCompute);
+          m.setProperty(rt, "buffers", fd.metricBuffers);
+          m.setProperty(rt, "makeImage", fd.metricMakeImage);
+          m.setProperty(rt, "total", fd.metricTotal);
+          m.setProperty(rt, "wall", fd.metricWall);
+          result.setProperty(rt, "metrics", std::move(m));
+
+          return result;
+        });
+    }
+
+    if (propName == "pipelineFps") {
+      return facebook::jsi::Function::createFromHostFunction(
+        runtime, name, 0,
+        [this](facebook::jsi::Runtime&,
+               const facebook::jsi::Value&,
+               const facebook::jsi::Value*,
+               size_t) -> facebook::jsi::Value {
+          if (!_alive->load()) return facebook::jsi::Value(0);
+          return facebook::jsi::Value(_pipeline->pipelineFps());
+        });
+    }
+
+    if (propName == "generation") {
+      return facebook::jsi::Function::createFromHostFunction(
+        runtime, name, 0,
+        [this](facebook::jsi::Runtime&,
+               const facebook::jsi::Value&,
+               const facebook::jsi::Value*,
+               size_t) -> facebook::jsi::Value {
+          if (!_alive->load()) return facebook::jsi::Value(0);
+          return facebook::jsi::Value(_pipeline->generation());
+        });
+    }
+
+    if (propName == "metrics") {
+      return facebook::jsi::Function::createFromHostFunction(
+        runtime, name, 0,
+        [this](facebook::jsi::Runtime& rt,
+               const facebook::jsi::Value&,
+               const facebook::jsi::Value*,
+               size_t) -> facebook::jsi::Value {
+          if (!_alive->load()) return facebook::jsi::Value::null();
+          auto obj = facebook::jsi::Object(rt);
+          obj.setProperty(rt, "lockWait", _pipeline->metricLockWait());
+          obj.setProperty(rt, "import", _pipeline->metricImport());
+          obj.setProperty(rt, "bindGroup", _pipeline->metricBindGroup());
+          obj.setProperty(rt, "compute", _pipeline->metricCompute());
+          obj.setProperty(rt, "buffers", _pipeline->metricBuffers());
+          obj.setProperty(rt, "makeImage", _pipeline->metricMakeImage());
+          obj.setProperty(rt, "total", _pipeline->metricTotal());
+          obj.setProperty(rt, "wall", _pipeline->metricWall());
+          return obj;
         });
     }
 
