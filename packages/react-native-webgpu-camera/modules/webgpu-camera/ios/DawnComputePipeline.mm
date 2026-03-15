@@ -963,9 +963,18 @@ bool dawn_pipeline_setup_multipass(
   const dawn_pipeline::PassInputSpec* passInputs =
     static_cast<const dawn_pipeline::PassInputSpec*>(passInputsPtr);
 
-  std::vector<dawn_pipeline::ResourceSpec> resourceVec(resources, resources + resourceCount);
-  std::vector<dawn_pipeline::PassInputSpec> passInputVec(passInputs, passInputs + passInputCount);
-  std::vector<int> texOutVec(textureOutputPassesPtr, textureOutputPassesPtr + textureOutputPassCount);
+  std::vector<dawn_pipeline::ResourceSpec> resourceVec;
+  if (resourceCount > 0 && resources) {
+    resourceVec.assign(resources, resources + resourceCount);
+  }
+  std::vector<dawn_pipeline::PassInputSpec> passInputVec;
+  if (passInputCount > 0 && passInputs) {
+    passInputVec.assign(passInputs, passInputs + passInputCount);
+  }
+  std::vector<int> texOutVec;
+  if (textureOutputPassCount > 0 && textureOutputPassesPtr) {
+    texOutVec.assign(textureOutputPassesPtr, textureOutputPassesPtr + textureOutputPassCount);
+  }
 
   return pipeline->setup(wgslShaders, width, height, specs, useCanvas, sync,
                          resourceVec, passInputVec, texOutVec);
