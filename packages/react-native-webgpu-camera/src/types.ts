@@ -1,13 +1,15 @@
 import type { SharedValue } from 'react-native-reanimated';
 import type { SkImage, SkCanvas } from '@shopify/react-native-skia';
+import type { ResourceHandle } from './GPUResource';
 
 // useCamera
 
 export interface CameraConfig {
   device: 'back' | 'front';
-  width: number;
-  height: number;
-  fps: number;
+  /** Selected format from useCameraFormats(). Default: best 1080p/30fps match. */
+  format?: CameraFormat;
+  /** Color space to activate. Default: 'sRGB'. Must be in format.supportedColorSpaces. */
+  colorSpace?: ColorSpace;
 }
 
 export interface CameraHandle {
@@ -17,6 +19,27 @@ export interface CameraHandle {
   width: number;
   height: number;
   fps: number;
+}
+
+// Format enumeration
+
+export type ColorSpace = 'sRGB' | 'p3D65' | 'hlgBT2020' | 'appleLog';
+export type StabilizationMode = 'off' | 'standard' | 'cinematic' | 'cinematicExtended';
+
+export interface CameraFormat {
+  width: number;
+  height: number;
+  minFps: number;
+  maxFps: number;
+  pixelFormat: 'yuv420' | 'yuv422' | 'yuv444' | 'bgra';
+  supportedColorSpaces: ColorSpace[];
+  isHDR: boolean;
+  stabilizationModes: StabilizationMode[];
+  fieldOfView: number;
+  isBinned: boolean;
+  isMultiCamSupported: boolean;
+  /** Opaque index into native format array — pass back to useCamera */
+  nativeHandle: number;
 }
 
 // useGPUFrameProcessor
@@ -71,19 +94,20 @@ export type BufferHandle<T> = T & { readonly [__bufferBrand]: never };
 /** Setup-time frame interface — used inside pipeline callback */
 export interface ProcessorFrame {
   /** Run a compute shader — output feeds into next pass or becomes final frame */
-  runShader(wgsl: string): void;
+  runShader(wgsl: string, options?: { inputs?: Record<string, any> }): void;
   /** Run a compute shader with buffer output — returns a handle resolved per-frame */
   runShader<T extends TypedArrayConstructor>(
     wgsl: string,
-    options: { output: T; count: number },
+    options: { output: T; count: number; inputs?: Record<string, any> },
   ): BufferHandle<InstanceType<T>>;
+  /** Run a compute shader with texture output — returns a handle for use as input */
+  runShader(
+    wgsl: string,
+    options: { output: { readonly __outputType: 'texture2d' }; inputs?: Record<string, any> },
+  ): ResourceHandle<'texture2d'>;
 
-  /** Skia canvas targeting the current pass's output texture.
-   *  Only valid inside `pipeline` for between-pass draws.
-   *  Draws are recorded once at setup time and replayed every frame (static).
-   *  For per-frame dynamic draws, use `onFrame`'s `RenderFrame.canvas`. */
+  /** Skia canvas targeting the current pass's output texture */
   canvas: SkCanvas;
-
   /** Current frame dimensions */
   width: number;
   height: number;
@@ -104,14 +128,21 @@ export type NullableBuffers<B> = {
 };
 
 /** Configuration for the object form of useGPUFrameProcessor */
-export interface ProcessorConfig<B extends Record<string, any>> {
+export interface ProcessorConfig<
+  B extends Record<string, any>,
+  R extends Record<string, any> = {},
+> {
   /** When true, onFrame blocks until current frame's compute + readback completes.
    *  Default false: onFrame receives most recent available data (may be 1 frame behind). */
   sync?: boolean;
 
+  /** Static GPU resources uploaded once at setup time.
+   *  Handles are passed as the second argument to pipeline. */
+  resources?: R;
+
   /** Runs once at setup. Declares shader chain and buffer outputs.
    *  Return value maps buffer names to handles for use in onFrame. */
-  pipeline: (frame: ProcessorFrame) => B;
+  pipeline: (frame: ProcessorFrame, resources: R) => B;
 
   /** Runs every display frame on UI thread.
    *  Receives resolved buffer data and a canvas for Skia draws. */
@@ -141,6 +172,7 @@ export interface GPUFrameProcessorResult {
 }
 
 export type { SharedValue };
+export type { ResourceHandle } from './GPUResource';
 
 // Global JSI bindings installed by the native pipeline
 declare global {
