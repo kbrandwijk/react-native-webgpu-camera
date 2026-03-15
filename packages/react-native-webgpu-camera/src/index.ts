@@ -2,12 +2,16 @@
 
 // Hooks
 export { useCamera } from './useCamera';
+export { useCameraFormats } from './useCameraFormats';
 export { useGPUFrameProcessor } from './useGPUFrameProcessor';
 
 // Types
 export type {
   CameraConfig,
   CameraHandle,
+  CameraFormat,
+  ColorSpace,
+  StabilizationMode,
   CameraStream,
   ProcessorFrame,
   RenderFrame,
@@ -18,6 +22,10 @@ export type {
   NullableBuffers,
   TypedArrayConstructor,
 } from './types';
+
+// GPU Resources
+export { GPUResource } from './GPUResource';
+export type { ResourceHandle } from './GPUResource';
 
 // Native module (advanced usage)
 export { default as WebGPUCameraModule } from '../modules/webgpu-camera/src/WebGPUCameraModule';
