@@ -50,6 +50,7 @@ struct DawnComputePipeline::Impl {
   bool syncMode = false;
   bool useCanvas = false;
   bool rawCamera = false;  // true when 0 shaders, no canvas, no buffers
+  wgpu::Texture canvasTex;  // separate texture for Skia draws — not touched by compute
   sk_sp<SkSurface> surface;
   wgpu::Texture* finalTex = nullptr;
   sk_sp<SkImage> outputImage;
@@ -248,15 +249,24 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     pass.cachedBindGroup = _impl->device.CreateBindGroup(&bgDesc);
   }
 
-  // Create SkSurface wrapping the final compute output texture for canvas drawing.
-  // Skia Graphite draws directly onto this GPU texture — no extra composition needed.
+  // Create a separate texture for Skia canvas draws, isolated from compute output.
+  // processFrame writes to finalTex; Skia draws go on canvasTex to avoid races.
   if (useCanvas) {
-    // Get a Recorder* via a temporary offscreen surface (getRecorder() is private)
+    wgpu::TextureDescriptor canvasTexDesc{};
+    canvasTexDesc.size = {(uint32_t)width, (uint32_t)height, 1};
+    canvasTexDesc.format = wgpu::TextureFormat::RGBA8Unorm;
+    canvasTexDesc.usage = wgpu::TextureUsage::TextureBinding |
+                          wgpu::TextureUsage::CopySrc |
+                          wgpu::TextureUsage::CopyDst |
+                          wgpu::TextureUsage::RenderAttachment;
+    canvasTexDesc.label = "CanvasTex";
+    _impl->canvasTex = _impl->device.CreateTexture(&canvasTexDesc);
+
     auto tempSurface = ctx.MakeOffscreen(1, 1);
     auto* recorder = tempSurface->recorder();
 
     auto backendTex = skgpu::graphite::BackendTextures::MakeDawn(
-      _impl->finalTex->Get());
+      _impl->canvasTex.Get());
     _impl->surface = SkSurfaces::WrapBackendTexture(
       recorder, backendTex,
       kRGBA_8888_SkColorType, nullptr, nullptr);
@@ -270,14 +280,22 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
 bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   double tWallStart = CACurrentMediaTime();
-  std::lock_guard<std::mutex> lock(_mutex);
+
+  // Brief lock just to check _impl and grab stable references
+  Impl* impl;
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (!_impl || !pixelBuffer) return false;
+    impl = _impl;
+  }
   double tAfterLock = CACurrentMediaTime();
-  if (!_impl || !pixelBuffer) return false;
 
   auto& ctx = RNSkia::DawnContext::getInstance();
-  auto& device = _impl->device;
+  auto& device = impl->device;
 
   double tStart = tAfterLock;
+
+  // ── All GPU work below — no mutex needed ──
 
   IOSurfaceRef ioSurface = CVPixelBufferGetIOSurface(pixelBuffer);
   if (!ioSurface) return false;
@@ -311,22 +329,25 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   double tAfterImport = CACurrentMediaTime();
 
   // ── Raw camera path: no compute, just wrap the BGRA texture as SkImage ──
-  if (_impl->rawCamera) {
-    _impl->outputImage = ctx.MakeImageFromTexture(
+  if (impl->rawCamera) {
+    auto outputImage = ctx.MakeImageFromTexture(
       inputTexture, _width, _height, wgpu::TextureFormat::BGRA8Unorm);
 
     wgpu::SharedTextureMemoryEndAccessState endState{};
     sharedMemory.EndAccess(inputTexture, &endState);
 
-    _impl->frameCount++;
-    _impl->generation++;
+    // Brief lock to publish results
+    std::lock_guard<std::mutex> lock(_mutex);
+    impl->outputImage = std::move(outputImage);
+    impl->frameCount++;
+    impl->generation++;
     auto now = CACurrentMediaTime();
-    if (_impl->lastFpsTime == 0) {
-      _impl->lastFpsTime = now;
-    } else if (now - _impl->lastFpsTime >= 1.0) {
-      _impl->currentFps = (int)(_impl->frameCount / (now - _impl->lastFpsTime));
-      _impl->frameCount = 0;
-      _impl->lastFpsTime = now;
+    if (impl->lastFpsTime == 0) {
+      impl->lastFpsTime = now;
+    } else if (now - impl->lastFpsTime >= 1.0) {
+      impl->currentFps = (int)(impl->frameCount / (now - impl->lastFpsTime));
+      impl->frameCount = 0;
+      impl->lastFpsTime = now;
     }
     return true;
   }
@@ -335,7 +356,7 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
 
   // Process pending async callbacks from previous frame (e.g. MapAsync).
   // AllowProcessEvents callbacks fire during ProcessEvents(), not Tick().
-  if (!_impl->syncMode && !_impl->buffers.empty()) {
+  if (!impl->syncMode && !impl->buffers.empty()) {
     ctx.getWGPUInstance().ProcessEvents();
   }
 
@@ -343,14 +364,14 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
 
   auto encoder = device.CreateCommandEncoder();
 
-  for (size_t i = 0; i < _impl->passes.size(); i++) {
-    auto& pass = _impl->passes[i];
+  for (size_t i = 0; i < impl->passes.size(); i++) {
+    auto& pass = impl->passes[i];
 
     wgpu::BindGroup bindGroup;
     if (i == 0) {
       // Pass 0: camera input changes every frame — build bind group per frame
       bool writeToA = true;
-      wgpu::Texture& writeTex = writeToA ? _impl->texA : _impl->texB;
+      wgpu::Texture& writeTex = writeToA ? impl->texA : impl->texB;
 
       std::vector<wgpu::BindGroupEntry> entries;
       wgpu::BindGroupEntry entry0{};
@@ -364,7 +385,7 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
       entries.push_back(entry1);
 
       if (pass.hasOutputBuffer && pass.bufferIndex >= 0) {
-        auto& sb = _impl->buffers[pass.bufferIndex];
+        auto& sb = impl->buffers[pass.bufferIndex];
         wgpu::BindGroupEntry entry2{};
         entry2.binding = 2;
         entry2.buffer = sb.gpuBuffer;
@@ -398,10 +419,10 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   double tAfterCompute = CACurrentMediaTime();
 
   // Copy output buffers to staging in a separate submission
-  if (!_impl->buffers.empty()) {
+  if (!impl->buffers.empty()) {
     auto copyEncoder = device.CreateCommandEncoder();
 
-    for (auto& sb : _impl->buffers) {
+    for (auto& sb : impl->buffers) {
       int stagingIdx = sb.frameIndex % 2;
 
       if (sb.mapped[stagingIdx]) {
@@ -417,10 +438,10 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
     device.GetQueue().Submit(1, &copyCommands);
 
     // Map staging buffers for readback
-    for (auto& sb : _impl->buffers) {
+    for (auto& sb : impl->buffers) {
       int stagingIdx = sb.frameIndex % 2;
 
-      if (_impl->syncMode) {
+      if (impl->syncMode) {
         auto instance = ctx.getWGPUInstance();
         auto future = sb.staging[stagingIdx].MapAsync(
           wgpu::MapMode::Read, 0, sb.byteSize,
@@ -455,10 +476,9 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   double tAfterBuffers = CACurrentMediaTime();
 
   // Determine final output texture and create SkImage
-  bool finalIsA = (_impl->passes.size() % 2 != 0);
-  _impl->finalTex = finalIsA ? &_impl->texA : &_impl->texB;
-  _impl->outputImage = ctx.MakeImageFromTexture(
-    *_impl->finalTex, _width, _height, wgpu::TextureFormat::RGBA8Unorm);
+  bool finalIsA = (impl->passes.size() % 2 != 0);
+  auto outputImage = ctx.MakeImageFromTexture(
+    *(finalIsA ? &impl->texA : &impl->texB), _width, _height, wgpu::TextureFormat::RGBA8Unorm);
 
   double tAfterMakeImage = CACurrentMediaTime();
 
@@ -466,26 +486,33 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   wgpu::SharedTextureMemoryEndAccessState endState{};
   sharedMemory.EndAccess(inputTexture, &endState);
 
-  // Per-step timing (ms)
-  _impl->t_lockWait = (tAfterLock - tWallStart) * 1000.0;
-  _impl->t_import = (tAfterImport - tStart) * 1000.0;
-  _impl->t_bindGroup = (tAfterBindGroup - tAfterImport) * 1000.0;
-  _impl->t_compute = (tAfterCompute - tAfterBindGroup) * 1000.0;
-  _impl->t_buffers = (tAfterBuffers - tAfterCompute) * 1000.0;
-  _impl->t_makeImage = (tAfterMakeImage - tAfterBuffers) * 1000.0;
-  _impl->t_total = (tAfterMakeImage - tStart) * 1000.0;
-  _impl->t_wall = (tAfterMakeImage - tWallStart) * 1000.0;
+  // ── Brief lock to publish results ──
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    impl->finalTex = finalIsA ? &impl->texA : &impl->texB;
+    impl->outputImage = std::move(outputImage);
 
-  // FPS tracking + generation counter
-  _impl->frameCount++;
-  _impl->generation++;
-  auto now = CACurrentMediaTime();
-  if (_impl->lastFpsTime == 0) {
-    _impl->lastFpsTime = now;
-  } else if (now - _impl->lastFpsTime >= 1.0) {
-    _impl->currentFps = (int)(_impl->frameCount / (now - _impl->lastFpsTime));
-    _impl->frameCount = 0;
-    _impl->lastFpsTime = now;
+    // Per-step timing (ms)
+    impl->t_lockWait = (tAfterLock - tWallStart) * 1000.0;
+    impl->t_import = (tAfterImport - tStart) * 1000.0;
+    impl->t_bindGroup = (tAfterBindGroup - tAfterImport) * 1000.0;
+    impl->t_compute = (tAfterCompute - tAfterBindGroup) * 1000.0;
+    impl->t_buffers = (tAfterBuffers - tAfterCompute) * 1000.0;
+    impl->t_makeImage = (tAfterMakeImage - tAfterBuffers) * 1000.0;
+    impl->t_total = (tAfterMakeImage - tStart) * 1000.0;
+    impl->t_wall = (tAfterMakeImage - tWallStart) * 1000.0;
+
+    // FPS tracking + generation counter
+    impl->frameCount++;
+    impl->generation++;
+    auto now = CACurrentMediaTime();
+    if (impl->lastFpsTime == 0) {
+      impl->lastFpsTime = now;
+    } else if (now - impl->lastFpsTime >= 1.0) {
+      impl->currentFps = (int)(impl->frameCount / (now - impl->lastFpsTime));
+      impl->frameCount = 0;
+      impl->lastFpsTime = now;
+    }
   }
 
   return true;
@@ -614,18 +641,31 @@ void* DawnComputePipeline::flushCanvasAndGetImage() {
   std::lock_guard<std::mutex> lock(_mutex);
   if (!_impl) return nullptr;
 
-  // Flush canvas and get composited image in one lock
-  if (_impl->surface) {
+  if (_impl->surface && _impl->finalTex && _impl->canvasTex) {
     auto& ctx = RNSkia::DawnContext::getInstance();
+
+    // Copy compute output → canvasTex so Skia draws composite on a stable snapshot.
+    // This prevents the race where processFrame overwrites finalTex mid-draw.
+    auto encoder = _impl->device.CreateCommandEncoder();
+    wgpu::TexelCopyTextureInfo src{};
+    src.texture = *_impl->finalTex;
+    wgpu::TexelCopyTextureInfo dst{};
+    dst.texture = _impl->canvasTex;
+    wgpu::Extent3D extent = {(uint32_t)_width, (uint32_t)_height, 1};
+    encoder.CopyTextureToTexture(&src, &dst, &extent);
+    auto commands = encoder.Finish();
+    _impl->device.GetQueue().Submit(1, &commands);
+
+    // Flush Skia draws (recorded by onFrame) onto canvasTex
     auto recording = _impl->surface->recorder()->snap();
     if (recording) {
       ctx.submitRecording(recording.get(), skgpu::graphite::SyncToCpu::kNo);
     }
-    if (_impl->finalTex) {
-      _impl->outputImage = ctx.MakeImageFromTexture(
-        *_impl->finalTex, _width, _height, wgpu::TextureFormat::RGBA8Unorm
-      );
-    }
+
+    // Wrap canvasTex (compute + Skia draws) as the output image
+    _impl->outputImage = ctx.MakeImageFromTexture(
+      _impl->canvasTex, _width, _height, wgpu::TextureFormat::RGBA8Unorm
+    );
   }
 
   if (!_impl->outputImage) return nullptr;
