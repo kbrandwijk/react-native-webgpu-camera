@@ -10,7 +10,10 @@
                            height:(int)height
                       bufferSpecs:(nonnull NSArray<NSArray<NSNumber *> *> *)bufferSpecs
                         useCanvas:(BOOL)useCanvas
-                             sync:(BOOL)sync;
+                             sync:(BOOL)sync
+                        resources:(nonnull NSArray<NSDictionary *> *)resources
+                       passInputs:(nonnull NSArray<NSDictionary *> *)passInputs
+               textureOutputPasses:(nonnull NSArray<NSNumber *> *)textureOutputPasses;
 
 - (BOOL)processFrame:(nonnull CVPixelBufferRef)pixelBuffer;
 - (void)cleanup;

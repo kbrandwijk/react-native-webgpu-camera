@@ -39,6 +39,7 @@ struct PassState {
   wgpu::BindGroup cachedBindGroup;  // cached for passes 1+ (static ping-pong textures)
   bool hasOutputBuffer = false;
   int bufferIndex = -1;
+  bool hasTextureOutput = false;
 };
 
 struct DawnComputePipeline::Impl {
@@ -73,7 +74,77 @@ struct DawnComputePipeline::Impl {
   double t_makeImage = 0;
   double t_total = 0;
   double t_wall = 0;  // wall time including lock wait
+
+  // Custom resources
+  struct UploadedResource {
+    ResourceType type;
+    wgpu::Texture texture;
+    wgpu::TextureView textureView;
+    wgpu::Sampler sampler;
+    wgpu::Buffer buffer;
+  };
+  std::vector<UploadedResource> uploadedResources;
+
+  // Default linear sampler for texture outputs (always created if any custom inputs exist)
+  wgpu::Sampler defaultSampler;
+
+  // Per-pass custom input bindings (indexed by pass index)
+  std::vector<std::vector<InputBinding>> passInputBindings;
+
+  // Texture outputs from passes (indexed by pass index)
+  std::vector<wgpu::Texture> passTextureOutputs;
 };
+
+// Helper: append custom input binding entries for the given pass into the bind group entry vector.
+// Handles resource textures, samplers, storage buffers, and cross-pass texture outputs.
+static void appendCustomInputEntries(
+    int passIndex,
+    std::vector<wgpu::BindGroupEntry>& entries,
+    const DawnComputePipeline::Impl& impl) {
+  if ((size_t)passIndex >= impl.passInputBindings.size()) return;
+  for (const auto& ib : impl.passInputBindings[passIndex]) {
+    wgpu::BindGroupEntry entry{};
+    entry.binding = ib.bindingIndex;
+
+    switch (ib.type) {
+      case InputBindingType::Texture3D:
+      case InputBindingType::Texture2D:
+        if (ib.resourceHandle >= 0 && (size_t)ib.resourceHandle < impl.uploadedResources.size()) {
+          entry.textureView = impl.uploadedResources[ib.resourceHandle].textureView;
+          entries.push_back(entry);
+        } else if (ib.sourcePass >= 0 && (size_t)ib.sourcePass < impl.passTextureOutputs.size()
+                   && impl.passTextureOutputs[ib.sourcePass]) {
+          entry.textureView = impl.passTextureOutputs[ib.sourcePass].CreateView();
+          entries.push_back(entry);
+        }
+        break;
+
+      case InputBindingType::Sampler:
+        if (ib.resourceHandle >= 0 && (size_t)ib.resourceHandle < impl.uploadedResources.size()
+            && impl.uploadedResources[ib.resourceHandle].sampler) {
+          entry.sampler = impl.uploadedResources[ib.resourceHandle].sampler;
+        } else {
+          // Fall back to default sampler (for pass texture output samplers)
+          entry.sampler = impl.defaultSampler;
+        }
+        entries.push_back(entry);
+        break;
+
+      case InputBindingType::StorageBufferRead:
+        if (ib.resourceHandle >= 0 && (size_t)ib.resourceHandle < impl.uploadedResources.size()
+            && impl.uploadedResources[ib.resourceHandle].buffer) {
+          entry.buffer = impl.uploadedResources[ib.resourceHandle].buffer;
+          entry.size = impl.uploadedResources[ib.resourceHandle].buffer.GetSize();
+          entries.push_back(entry);
+        } else if (ib.sourceBuffer >= 0 && (size_t)ib.sourceBuffer < impl.buffers.size()) {
+          entry.buffer = impl.buffers[ib.sourceBuffer].gpuBuffer;
+          entry.size = impl.buffers[ib.sourceBuffer].byteSize;
+          entries.push_back(entry);
+        }
+        break;
+    }
+  }
+}
 
 DawnComputePipeline::DawnComputePipeline()
   : _alive(std::make_shared<std::atomic<bool>>(true)) {}
@@ -88,7 +159,10 @@ bool DawnComputePipeline::setup(
     const std::vector<std::string>& wgslShaders,
     int width, int height,
     const std::vector<BufferSpec>& bufferSpecs,
-    bool useCanvas, bool sync) {
+    bool useCanvas, bool sync,
+    const std::vector<ResourceSpec>& resources,
+    const std::vector<PassInputSpec>& passInputs,
+    const std::vector<int>& textureOutputPasses) {
   std::lock_guard<std::mutex> lock(_mutex);
   cleanupLocked();
 
@@ -212,6 +286,115 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   // Determine final output texture
   _impl->finalTex = (effectiveShaders.size() % 2 != 0) ? &_impl->texA : &_impl->texB;
 
+  // ── Upload custom resources ──
+  if (!passInputs.empty()) {
+    // Create default linear sampler (used for pass texture outputs)
+    wgpu::SamplerDescriptor samplerDesc{};
+    samplerDesc.magFilter = wgpu::FilterMode::Linear;
+    samplerDesc.minFilter = wgpu::FilterMode::Linear;
+    samplerDesc.mipmapFilter = wgpu::MipmapFilterMode::Linear;
+    samplerDesc.addressModeU = wgpu::AddressMode::ClampToEdge;
+    samplerDesc.addressModeV = wgpu::AddressMode::ClampToEdge;
+    samplerDesc.addressModeW = wgpu::AddressMode::ClampToEdge;
+    _impl->defaultSampler = _impl->device.CreateSampler(&samplerDesc);
+  }
+
+  _impl->uploadedResources.resize(resources.size());
+  for (size_t ri = 0; ri < resources.size(); ri++) {
+    const auto& spec = resources[ri];
+    auto& ur = _impl->uploadedResources[ri];
+    ur.type = spec.type;
+
+    if (spec.type == ResourceType::Texture3D || spec.type == ResourceType::Texture2D) {
+      wgpu::TextureDescriptor texDesc{};
+      texDesc.format = wgpu::TextureFormat::RGBA8Unorm;
+      texDesc.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst;
+      texDesc.mipLevelCount = 1;
+      texDesc.sampleCount = 1;
+
+      if (spec.type == ResourceType::Texture3D) {
+        texDesc.dimension = wgpu::TextureDimension::e3D;
+        texDesc.size = {(uint32_t)spec.width, (uint32_t)spec.height, (uint32_t)spec.depth};
+        texDesc.label = "CustomTexture3D";
+      } else {
+        texDesc.dimension = wgpu::TextureDimension::e2D;
+        texDesc.size = {(uint32_t)spec.width, (uint32_t)spec.height, 1};
+        texDesc.label = "CustomTexture2D";
+      }
+
+      ur.texture = _impl->device.CreateTexture(&texDesc);
+      ur.textureView = ur.texture.CreateView();
+
+      // Upload data via WriteTexture
+      if (!spec.data.empty()) {
+        wgpu::TexelCopyTextureInfo dst{};
+        dst.texture = ur.texture;
+        dst.mipLevel = 0;
+        dst.origin = {0, 0, 0};
+        dst.aspect = wgpu::TextureAspect::All;
+
+        uint32_t bytesPerRow = (uint32_t)spec.width * 4;
+        uint32_t rowsPerLayer = (uint32_t)spec.height;
+
+        wgpu::TexelCopyBufferLayout layout{};
+        layout.offset = 0;
+        layout.bytesPerRow = bytesPerRow;
+        layout.rowsPerImage = rowsPerLayer;
+
+        wgpu::Extent3D extent = texDesc.size;
+        _impl->device.GetQueue().WriteTexture(&dst, spec.data.data(), spec.data.size(), &layout, &extent);
+      }
+
+      // Create sampler for this texture resource
+      wgpu::SamplerDescriptor sampDesc{};
+      sampDesc.magFilter = wgpu::FilterMode::Linear;
+      sampDesc.minFilter = wgpu::FilterMode::Linear;
+      sampDesc.mipmapFilter = wgpu::MipmapFilterMode::Linear;
+      sampDesc.addressModeU = wgpu::AddressMode::ClampToEdge;
+      sampDesc.addressModeV = wgpu::AddressMode::ClampToEdge;
+      sampDesc.addressModeW = wgpu::AddressMode::ClampToEdge;
+      ur.sampler = _impl->device.CreateSampler(&sampDesc);
+
+    } else {
+      // StorageBuffer
+      wgpu::BufferDescriptor bufDesc{};
+      bufDesc.size = spec.data.size();
+      bufDesc.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
+      bufDesc.label = "CustomStorageBuffer";
+      ur.buffer = _impl->device.CreateBuffer(&bufDesc);
+
+      if (!spec.data.empty()) {
+        _impl->device.GetQueue().WriteBuffer(ur.buffer, 0, spec.data.data(), spec.data.size());
+      }
+    }
+  }
+
+  // Store per-pass custom input bindings
+  _impl->passInputBindings.resize(_impl->passes.size());
+  for (const auto& piSpec : passInputs) {
+    if (piSpec.passIndex >= 0 && piSpec.passIndex < (int)_impl->passes.size()) {
+      _impl->passInputBindings[piSpec.passIndex] = piSpec.bindings;
+    }
+  }
+
+  // Create texture outputs for designated passes
+  _impl->passTextureOutputs.resize(_impl->passes.size());
+  for (int passIdx : textureOutputPasses) {
+    if (passIdx >= 0 && passIdx < (int)_impl->passes.size()) {
+      _impl->passes[passIdx].hasTextureOutput = true;
+
+      wgpu::TextureDescriptor texOutDesc{};
+      texOutDesc.size = {(uint32_t)width, (uint32_t)height, 1};
+      texOutDesc.format = wgpu::TextureFormat::RGBA8Unorm;
+      texOutDesc.usage = wgpu::TextureUsage::StorageBinding | wgpu::TextureUsage::TextureBinding;
+      texOutDesc.dimension = wgpu::TextureDimension::e2D;
+      texOutDesc.mipLevelCount = 1;
+      texOutDesc.sampleCount = 1;
+      texOutDesc.label = "PassTextureOutput";
+      _impl->passTextureOutputs[passIdx] = _impl->device.CreateTexture(&texOutDesc);
+    }
+  }
+
   // Cache bind groups for passes 1+ (static ping-pong textures).
   // Pass 0 reads from the camera input which changes every frame — can't cache.
   for (size_t i = 1; i < _impl->passes.size(); i++) {
@@ -240,7 +423,15 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
       entry2.buffer = sb.gpuBuffer;
       entry2.size = sb.byteSize;
       entries.push_back(entry2);
+    } else if (pass.hasTextureOutput && _impl->passTextureOutputs[i]) {
+      wgpu::BindGroupEntry entry2{};
+      entry2.binding = 2;
+      entry2.textureView = _impl->passTextureOutputs[i].CreateView();
+      entries.push_back(entry2);
     }
+
+    // Append custom input bindings for this pass
+    appendCustomInputEntries((int)i, entries, *_impl);
 
     wgpu::BindGroupDescriptor bgDesc{};
     bgDesc.layout = pass.bindGroupLayout;
@@ -391,7 +582,15 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
         entry2.buffer = sb.gpuBuffer;
         entry2.size = sb.byteSize;
         entries.push_back(entry2);
+      } else if (pass.hasTextureOutput && impl->passTextureOutputs[0]) {
+        wgpu::BindGroupEntry entry2{};
+        entry2.binding = 2;
+        entry2.textureView = impl->passTextureOutputs[0].CreateView();
+        entries.push_back(entry2);
       }
+
+      // Append custom input bindings for pass 0
+      appendCustomInputEntries(0, entries, *impl);
 
       wgpu::BindGroupDescriptor bgDesc{};
       bgDesc.layout = pass.bindGroupLayout;
@@ -710,6 +909,10 @@ void DawnComputePipeline::cleanupLocked() {
   _impl->texB = nullptr;
   _impl->passes.clear();
   _impl->buffers.clear();
+  _impl->uploadedResources.clear();
+  _impl->passTextureOutputs.clear();
+  _impl->passInputBindings.clear();
+  _impl->defaultSampler = nullptr;
 
   delete _impl;
   _impl = nullptr;
@@ -734,7 +937,10 @@ bool dawn_pipeline_setup_multipass(
     const char** shaders, int shaderCount,
     int width, int height,
     const int* bufferSpecsFlat, int bufferCount,
-    bool useCanvas, bool sync) {
+    bool useCanvas, bool sync,
+    const void* resourcesPtr, int resourceCount,
+    const void* passInputsPtr, int passInputCount,
+    const int* textureOutputPassesPtr, int textureOutputPassCount) {
   auto* pipeline = static_cast<dawn_pipeline::DawnComputePipeline*>(ref);
 
   std::vector<std::string> wgslShaders;
@@ -751,7 +957,18 @@ bool dawn_pipeline_setup_multipass(
     specs.push_back(s);
   }
 
-  return pipeline->setup(wgslShaders, width, height, specs, useCanvas, sync);
+  // Cast void* back to typed C++ vectors
+  const dawn_pipeline::ResourceSpec* resources =
+    static_cast<const dawn_pipeline::ResourceSpec*>(resourcesPtr);
+  const dawn_pipeline::PassInputSpec* passInputs =
+    static_cast<const dawn_pipeline::PassInputSpec*>(passInputsPtr);
+
+  std::vector<dawn_pipeline::ResourceSpec> resourceVec(resources, resources + resourceCount);
+  std::vector<dawn_pipeline::PassInputSpec> passInputVec(passInputs, passInputs + passInputCount);
+  std::vector<int> texOutVec(textureOutputPassesPtr, textureOutputPassesPtr + textureOutputPassCount);
+
+  return pipeline->setup(wgslShaders, width, height, specs, useCanvas, sync,
+                         resourceVec, passInputVec, texOutVec);
 }
 
 bool dawn_pipeline_process_frame(DawnComputePipelineRef ref, CVPixelBufferRef pixelBuffer) {

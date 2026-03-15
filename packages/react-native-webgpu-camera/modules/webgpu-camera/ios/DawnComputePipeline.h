@@ -11,6 +11,31 @@
 
 namespace dawn_pipeline {
 
+enum class ResourceType { Texture3D, Texture2D, StorageBuffer };
+
+struct ResourceSpec {
+  ResourceType type;
+  std::vector<uint8_t> data;  // owns a copy of the upload data
+  int width = 0;
+  int height = 0;
+  int depth = 0;
+};
+
+enum class InputBindingType { Texture3D, Texture2D, Sampler, StorageBufferRead };
+
+struct InputBinding {
+  int bindingIndex = 0;
+  InputBindingType type;
+  int resourceHandle = -1;  // index into resources array
+  int sourcePass = -1;      // pass that produced this buffer/texture
+  int sourceBuffer = -1;    // global buffer index
+};
+
+struct PassInputSpec {
+  int passIndex = 0;
+  std::vector<InputBinding> bindings;
+};
+
 class DawnComputePipeline {
 public:
   DawnComputePipeline();
@@ -25,7 +50,10 @@ public:
   bool setup(const std::vector<std::string>& wgslShaders,
              int width, int height,
              const std::vector<BufferSpec>& bufferSpecs,
-             bool useCanvas, bool sync);
+             bool useCanvas, bool sync,
+             const std::vector<ResourceSpec>& resources = {},
+             const std::vector<PassInputSpec>& passInputs = {},
+             const std::vector<int>& textureOutputPasses = {});
 
   bool processFrame(CVPixelBufferRef pixelBuffer);
 
@@ -106,7 +134,10 @@ bool dawn_pipeline_setup_multipass(
   const char** shaders, int shaderCount,
   int width, int height,
   const int* bufferSpecs, int bufferCount,
-  bool useCanvas, bool sync);
+  bool useCanvas, bool sync,
+  const void* resources, int resourceCount,
+  const void* passInputs, int passInputCount,
+  const int* textureOutputPasses, int textureOutputPassCount);
 
 bool dawn_pipeline_process_frame(DawnComputePipelineRef ref,
                                   CVPixelBufferRef pixelBuffer);

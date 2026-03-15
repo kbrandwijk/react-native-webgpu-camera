@@ -26,7 +26,10 @@
                            height:(int)height
                       bufferSpecs:(NSArray<NSArray<NSNumber *> *> *)bufferSpecs
                         useCanvas:(BOOL)useCanvas
-                             sync:(BOOL)sync {
+                             sync:(BOOL)sync
+                        resources:(NSArray<NSDictionary *> *)resources
+                       passInputs:(NSArray<NSDictionary *> *)passInputs
+               textureOutputPasses:(NSArray<NSNumber *> *)textureOutputPasses {
   if (!_pipeline) return NO;
 
   // Convert NSArray<NSString*> to C string array
@@ -48,12 +51,72 @@
     flatSpecs[i * 3 + 2] = [spec[2] intValue]; // count
   }
 
+  // Convert resources to C++ structs
+  std::vector<dawn_pipeline::ResourceSpec> resourceSpecs;
+  for (NSDictionary *res in resources) {
+    dawn_pipeline::ResourceSpec rs;
+    NSString *type = res[@"type"];
+    if ([type isEqualToString:@"texture3d"]) {
+      rs.type = dawn_pipeline::ResourceType::Texture3D;
+    } else if ([type isEqualToString:@"texture2d"]) {
+      rs.type = dawn_pipeline::ResourceType::Texture2D;
+    } else {
+      rs.type = dawn_pipeline::ResourceType::StorageBuffer;
+    }
+    rs.width = [res[@"width"] intValue];
+    rs.height = [res[@"height"] intValue];
+    rs.depth = [res[@"depth"] intValue];
+    // Copy data to owned buffer (NSData may be released after this scope)
+    NSData *data = res[@"data"];
+    if (data) {
+      const uint8_t *bytes = (const uint8_t *)data.bytes;
+      rs.data.assign(bytes, bytes + data.length);
+    }
+    resourceSpecs.push_back(rs);
+  }
+
+  // Convert passInputs to C++ structs
+  std::vector<dawn_pipeline::PassInputSpec> passInputSpecs;
+  for (NSDictionary *pi in passInputs) {
+    dawn_pipeline::PassInputSpec pis;
+    pis.passIndex = [pi[@"passIndex"] intValue];
+    NSArray<NSDictionary *> *bindings = pi[@"bindings"];
+    for (NSDictionary *b in bindings) {
+      dawn_pipeline::InputBinding ib;
+      ib.bindingIndex = [b[@"index"] intValue];
+      NSString *btype = b[@"type"];
+      if ([btype isEqualToString:@"texture3d"]) {
+        ib.type = dawn_pipeline::InputBindingType::Texture3D;
+      } else if ([btype isEqualToString:@"texture2d"]) {
+        ib.type = dawn_pipeline::InputBindingType::Texture2D;
+      } else if ([btype isEqualToString:@"sampler"]) {
+        ib.type = dawn_pipeline::InputBindingType::Sampler;
+      } else {
+        ib.type = dawn_pipeline::InputBindingType::StorageBufferRead;
+      }
+      ib.resourceHandle = b[@"resourceHandle"] ? [b[@"resourceHandle"] intValue] : -1;
+      ib.sourcePass = b[@"sourcePass"] ? [b[@"sourcePass"] intValue] : -1;
+      ib.sourceBuffer = b[@"sourceBuffer"] ? [b[@"sourceBuffer"] intValue] : -1;
+      pis.bindings.push_back(ib);
+    }
+    passInputSpecs.push_back(pis);
+  }
+
+  // Convert textureOutputPasses
+  std::vector<int> texOutPasses;
+  for (NSNumber *n in textureOutputPasses) {
+    texOutPasses.push_back([n intValue]);
+  }
+
   return dawn_pipeline_setup_multipass(
     _pipeline,
     cShaders.data(), shaderCount,
     width, height,
     flatSpecs.data(), bufferCount,
-    useCanvas, sync
+    useCanvas, sync,
+    resourceSpecs.data(), (int)resourceSpecs.size(),
+    passInputSpecs.data(), (int)passInputSpecs.size(),
+    texOutPasses.data(), (int)texOutPasses.size()
   );
 }
 
