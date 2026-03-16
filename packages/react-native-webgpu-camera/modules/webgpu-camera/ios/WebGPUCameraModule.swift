@@ -301,14 +301,34 @@ public class WebGPUCameraModule: Module {
       let height = Int(dims.height)
 
       let output = AVCaptureVideoDataOutput()
+      let available = output.availableVideoPixelFormatTypes  // [OSType]
+      let availableHex = available.map { String(format: "0x%08x", $0) }
+      NSLog("[WebGPUCamera] startCapture: step 8a — availableVideoPixelFormatTypes: \(availableHex)")
       if self.isHDR {
         // Both appleLog and hlgBT2020 deliver 10-bit YUV bi-planar
-        NSLog("[WebGPUCamera] startCapture: step 8a — requesting 10-bit YUV pixel format")
+        // Check which 10-bit format is actually available
+        let videoRange = OSType(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
+        let fullRange = OSType(kCVPixelFormatType_420YpCbCr10BiPlanarFullRange)
+
+        let chosen: OSType
+        if available.contains(videoRange) {
+          chosen = videoRange
+          NSLog("[WebGPUCamera] startCapture: step 8b — using 10-bit YUV VideoRange")
+        } else if available.contains(fullRange) {
+          chosen = fullRange
+          NSLog("[WebGPUCamera] startCapture: step 8b — using 10-bit YUV FullRange")
+        } else {
+          // Fallback: log and use BGRA
+          NSLog("[WebGPUCamera] startCapture: step 8b — NO 10-bit YUV format available, falling back to BGRA")
+          chosen = OSType(kCVPixelFormatType_32BGRA)
+          self.isHDR = false
+          self.isAppleLog = false
+        }
         output.videoSettings = [
-          kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+          kCVPixelBufferPixelFormatTypeKey as String: chosen
         ]
       } else {
-        NSLog("[WebGPUCamera] startCapture: step 8a — requesting BGRA pixel format")
+        NSLog("[WebGPUCamera] startCapture: step 8b — requesting BGRA pixel format")
         output.videoSettings = [
           kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
         ]
