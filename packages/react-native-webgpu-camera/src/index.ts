@@ -27,6 +27,9 @@ export type {
 export { GPUResource } from './GPUResource';
 export type { ResourceHandle } from './GPUResource';
 
+// Utilities
+export { parseCubeFile } from './parseCubeFile';
+
 // Native module (advanced usage)
 export { default as WebGPUCameraModule } from '../modules/webgpu-camera/src/WebGPUCameraModule';
 export type { FrameDimensions } from '../modules/webgpu-camera/src/WebGPUCameraModule';
