@@ -12,6 +12,7 @@ public class WebGPUCameraModule: Module {
   // --- Dawn compute pipeline ---
   var dawnBridge: DawnPipelineBridge?
   private var computeSetup = false
+  var isAppleLog = false
 
   /// Stored AVCaptureDevice.Format arrays, keyed by device position.
   /// Rebuilt on each getFormats() call. nativeHandle indexes into these.
@@ -150,6 +151,8 @@ public class WebGPUCameraModule: Module {
         spec.map { $0 }
       }
 
+      self.isAppleLog = appleLog
+
       // Clean up any existing bridge before creating a new one
       self.dawnBridge?.cleanup()
       self.dawnBridge = nil
@@ -270,9 +273,15 @@ public class WebGPUCameraModule: Module {
       let height = Int(dims.height)
 
       let output = AVCaptureVideoDataOutput()
-      output.videoSettings = [
-        kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
-      ]
+      if self.isAppleLog {
+        output.videoSettings = [
+          kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+        ]
+      } else {
+        output.videoSettings = [
+          kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+        ]
+      }
       output.alwaysDiscardsLateVideoFrames = true
 
       let delegate = FrameDelegate(width: UInt32(width), height: UInt32(height), module: self)
