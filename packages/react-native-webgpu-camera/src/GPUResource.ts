@@ -3,6 +3,7 @@ export interface ResourceHandle<T extends string> {
   readonly __resourceType: T;
   readonly __handle: number;
   readonly __data?: ArrayBuffer;
+  readonly __fileUri?: string;
   readonly __dims?: { width: number; height: number; depth?: number; format?: string };
 }
 
@@ -12,13 +13,21 @@ export interface OutputTypeToken<T extends string> {
 }
 
 function texture3D(
-  data: ArrayBuffer,
+  dataOrFileUri: ArrayBuffer | string,
   dims: { width: number; height: number; depth: number; format?: 'rgba8unorm' | 'rgba32float' },
 ): ResourceHandle<'texture3d'> {
+  if (typeof dataOrFileUri === 'string') {
+    return {
+      __resourceType: 'texture3d',
+      __handle: -1,
+      __fileUri: dataOrFileUri,
+      __dims: dims,
+    };
+  }
   return {
     __resourceType: 'texture3d',
-    __handle: -1, // assigned by capture proxy
-    __data: data,
+    __handle: -1,
+    __data: dataOrFileUri,
     __dims: dims,
   };
 }

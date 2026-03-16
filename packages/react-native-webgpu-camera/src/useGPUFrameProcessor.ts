@@ -39,7 +39,8 @@ interface CapturedInput {
 /** A resource spec to send to native for GPU upload */
 interface CapturedResource {
   type: 'texture3d' | 'texture2d' | 'storageBuffer';
-  data: ArrayBuffer;
+  data?: ArrayBuffer;
+  fileUri?: string;
   width?: number;
   height?: number;
   depth?: number;
@@ -85,7 +86,8 @@ function capturePipeline<B extends Record<string, any>, R extends Record<string,
         // Store resource spec for native upload
         capturedResources.push({
           type: rh.__resourceType as CapturedResource['type'],
-          data: rh.__data!,
+          data: rh.__data,
+          fileUri: rh.__fileUri,
           width: rh.__dims?.width,
           height: rh.__dims?.height,
           depth: rh.__dims?.depth,
@@ -251,22 +253,26 @@ function buildNativeConfig(
   const shaders = passes.map((p) => p.wgsl);
   const buffers: [number, number, number][] = [];
 
+  // When appleLog is true, the native side prepends a YUV→RGB shader as pass 0,
+  // shifting all user shader indices by +1. Offset all pass indices accordingly.
+  const passOffset = appleLog ? 1 : 0;
+
   passes.forEach((pass, passIndex) => {
     if (pass.buffer) {
       const elementSize = pass.buffer.output.BYTES_PER_ELEMENT ?? 4;
-      buffers.push([passIndex, elementSize, pass.buffer.count]);
+      buffers.push([passIndex + passOffset, elementSize, pass.buffer.count]);
     }
   });
 
   // Collect pass indices that produce texture outputs
   const textureOutputPasses = passes
-    .map((p, i) => p.textureOutput ? i : -1)
+    .map((p, i) => p.textureOutput ? i + passOffset : -1)
     .filter((i) => i >= 0);
 
   // Build resources array for native
   const resources = capturedResources.map((r) => ({
     type: r.type,
-    data: r.data,
+    ...(r.fileUri ? { fileUri: r.fileUri } : r.data ? { data: r.data } : {}),
     width: r.width ?? 0,
     height: r.height ?? 0,
     depth: r.depth ?? 0,
@@ -288,12 +294,12 @@ function buildNativeConfig(
   passes.forEach((pass, passIndex) => {
     if (pass.inputs && pass.inputs.length > 0) {
       passInputs.push({
-        passIndex,
+        passIndex: passIndex + passOffset,
         bindings: pass.inputs.map((inp) => ({
           index: inp.bindingIndex,
           type: inp.type,
           resourceHandle: inp.resourceHandle,
-          sourcePass: inp.sourcePass,
+          sourcePass: inp.sourcePass !== undefined ? inp.sourcePass + passOffset : undefined,
           sourceBuffer: inp.sourceBuffer,
         })),
       });
@@ -312,7 +318,7 @@ function buildNativeConfig(
             : `${inp.name}→${inp.bindingIndex}(${inp.type})`;
         })
         .join(', ');
-      console.log(`[WebGPUCamera] Pass ${i} bindings: ${desc}`);
+      console.log(`[WebGPUCamera] Pass ${i + passOffset} bindings: ${desc}`);
     }
   });
 
@@ -432,7 +438,8 @@ export function useGPUFrameProcessor(
     const useCanvas = hasCanvas || (isObjectForm && !!onFrameFn);
 
     // Build and send native config
-    const appleLog = camera.colorSpace === 'appleLog';
+    // Both appleLog and hlgBT2020 deliver 10-bit YUV — need YUV→RGB conversion shader
+    const appleLog = camera.colorSpace === 'appleLog' || camera.colorSpace === 'hlgBT2020';
     const nativeConfig = buildNativeConfig(
       passes,
       camera.width,
@@ -443,7 +450,23 @@ export function useGPUFrameProcessor(
       appleLog,
     );
 
-    const ok = WebGPUCameraModule.setupMultiPassPipeline(nativeConfig);
+    console.log(`[WebGPUCamera] setupMultiPassPipeline: appleLog=${appleLog}, ${nativeConfig.shaders.length} shaders, ${nativeConfig.resources.length} resources, ${nativeConfig.passInputs.length} passInputs`);
+    for (const r of nativeConfig.resources) {
+      const rAny = r as any;
+      console.log(`[WebGPUCamera] resource: type=${r.type} format=${r.format} ${r.width}x${r.height}x${r.depth} dataBytes=${rAny.data?.byteLength ?? 'null'} fileUri=${rAny.fileUri ?? 'null'}`);
+    }
+    if (nativeConfig.passInputs.length > 0) {
+      console.log(`[WebGPUCamera] passInputs:`, JSON.stringify(nativeConfig.passInputs.map(pi => ({ passIndex: pi.passIndex, bindings: pi.bindings.length }))));
+    }
+
+    let ok: boolean;
+    try {
+      ok = WebGPUCameraModule.setupMultiPassPipeline(nativeConfig);
+    } catch (e) {
+      console.error(`[WebGPUCamera] setupMultiPassPipeline THREW:`, e);
+      setError(`Pipeline setup exception: ${e}`);
+      return;
+    }
     if (!ok) {
       setError("Multi-pass pipeline setup failed");
       return;

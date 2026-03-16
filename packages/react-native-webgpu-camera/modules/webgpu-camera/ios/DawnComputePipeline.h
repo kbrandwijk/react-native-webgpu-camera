@@ -18,6 +18,7 @@ struct ResourceSpec {
   ResourceType type;
   ResourceFormat format = ResourceFormat::RGBA8Unorm;
   std::vector<uint8_t> data;  // owns a copy of the upload data
+  std::string fileUri;        // alternative: load from file (e.g. .cube LUT)
   int width = 0;
   int height = 0;
   int depth = 0;

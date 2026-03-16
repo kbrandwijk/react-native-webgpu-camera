@@ -19,7 +19,8 @@ interface WebGPUCameraModuleInterface extends NativeModule {
     appleLog: boolean;
     resources: {
       type: string;
-      data: ArrayBuffer;
+      data?: ArrayBuffer;
+      fileUri?: string;
       width: number;
       height: number;
       depth: number;

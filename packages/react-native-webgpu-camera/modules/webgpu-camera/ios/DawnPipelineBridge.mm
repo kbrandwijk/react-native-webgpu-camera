@@ -73,6 +73,16 @@
     } else {
       rs.format = dawn_pipeline::ResourceFormat::RGBA8Unorm;
     }
+    // File URI path (native side will load and parse)
+    NSString *fileUri = res[@"fileUri"];
+    if (fileUri) {
+      // Strip file:// prefix if present
+      NSString *path = fileUri;
+      if ([path hasPrefix:@"file://"]) {
+        path = [path substringFromIndex:7];
+      }
+      rs.fileUri = [path UTF8String];
+    }
     // Copy data to owned buffer (NSData may be released after this scope)
     NSData *data = res[@"data"];
     if (data) {

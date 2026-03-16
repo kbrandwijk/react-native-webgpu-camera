@@ -13,6 +13,7 @@ export function useCamera(config: CameraConfig): CameraHandle {
   const colorSpace = config.colorSpace ?? 'sRGB';
 
   useEffect(() => {
+    console.log(`[useCamera] startCameraPreview device=${device} nativeHandle=${nativeHandle} colorSpace=${colorSpace} format=${config.format?.width}x${config.format?.height}`);
     WebGPUCameraModule.startCameraPreview(device, nativeHandle, colorSpace);
 
     // Camera needs time to produce first frame

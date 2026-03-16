@@ -13,6 +13,7 @@ public class WebGPUCameraModule: Module {
   var dawnBridge: DawnPipelineBridge?
   private var computeSetup = false
   var isAppleLog = false
+  var isHDR = false  // true for appleLog OR hlgBT2020 — both deliver 10-bit YUV
 
   /// Stored AVCaptureDevice.Format arrays, keyed by device position.
   /// Rebuilt on each getFormats() call. nativeHandle indexes into these.
@@ -27,6 +28,8 @@ public class WebGPUCameraModule: Module {
     Name("WebGPUCamera")
 
     Function("startCameraPreview") { (deviceId: String, nativeHandle: Int, colorSpace: String) in
+      // isAppleLog and isHDR are set inside startCapture after validating
+      // that the format actually supports the requested color space
       self.startCapture(deviceId: deviceId, nativeHandle: nativeHandle, colorSpace: colorSpace)
     }
 
@@ -199,12 +202,18 @@ public class WebGPUCameraModule: Module {
   }
 
   private func startCapture(deviceId: String, nativeHandle: Int, colorSpace: String) {
+    NSLog("[WebGPUCamera] startCapture ENTER: device=\(deviceId) nativeHandle=\(nativeHandle) colorSpace=\(colorSpace)")
     sessionQueue.async { [weak self] in
-      guard let self = self else { return }
+      guard let self = self else {
+        NSLog("[WebGPUCamera] startCapture: self is nil, aborting")
+        return
+      }
+      NSLog("[WebGPUCamera] startCapture: step 1 — creating session")
       let session = AVCaptureSession()
       session.sessionPreset = .inputPriority
 
       let position: AVCaptureDevice.Position = deviceId == "front" ? .front : .back
+      NSLog("[WebGPUCamera] startCapture: step 2 — getting camera device (position=\(position.rawValue))")
 
       guard let camera = AVCaptureDevice.default(
         .builtInWideAngleCamera,
@@ -214,24 +223,30 @@ public class WebGPUCameraModule: Module {
         NSLog("[WebGPUCamera] No camera found for position: \(deviceId)")
         return
       }
+      NSLog("[WebGPUCamera] startCapture: step 3 — creating input")
 
       guard let input = try? AVCaptureDeviceInput(device: camera) else {
         NSLog("[WebGPUCamera] Could not create camera input")
         return
       }
+      NSLog("[WebGPUCamera] startCapture: step 4 — adding input to session")
       if session.canAddInput(input) {
         session.addInput(input)
       }
 
       // Format selection
+      NSLog("[WebGPUCamera] startCapture: step 5 — locking camera for configuration")
       do {
         try camera.lockForConfiguration()
+        NSLog("[WebGPUCamera] startCapture: step 5a — camera locked OK")
 
         if nativeHandle >= 0 {
           // User selected a specific format
           let storedFormats = position == .back ? self.storedBackFormats : self.storedFrontFormats
+          NSLog("[WebGPUCamera] startCapture: step 5b — storedFormats count=\(storedFormats.count), nativeHandle=\(nativeHandle)")
           if nativeHandle < storedFormats.count {
             let selectedFormat = storedFormats[nativeHandle]
+            NSLog("[WebGPUCamera] startCapture: step 5c — setting activeFormat")
             camera.activeFormat = selectedFormat
 
             // Set FPS to format's max
@@ -239,6 +254,7 @@ public class WebGPUCameraModule: Module {
             for range in selectedFormat.videoSupportedFrameRateRanges {
               bestMaxFps = max(bestMaxFps, range.maxFrameRate)
             }
+            NSLog("[WebGPUCamera] startCapture: step 5d — setting FPS to \(bestMaxFps)")
             camera.activeVideoMinFrameDuration = CMTime(value: 1, timescale: CMTimeScale(bestMaxFps))
             camera.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: CMTimeScale(bestMaxFps))
             self.activeFps = Int(bestMaxFps)
@@ -254,40 +270,57 @@ public class WebGPUCameraModule: Module {
         }
 
         // Color space — validate against format, then set explicitly (some formats default to P3)
+        NSLog("[WebGPUCamera] startCapture: step 6 — setting color space '\(colorSpace)'")
         let targetColorSpace = self.mapColorSpace(colorSpace)
+        let supportedSpaces = camera.activeFormat.supportedColorSpaces.map { "\($0.rawValue)" }.joined(separator: ",")
+        NSLog("[WebGPUCamera] startCapture: step 6a — supported color spaces: [\(supportedSpaces)], target=\(targetColorSpace.rawValue)")
         if camera.activeFormat.supportedColorSpaces.contains(targetColorSpace) {
+          NSLog("[WebGPUCamera] startCapture: step 6b — setting activeColorSpace")
           camera.activeColorSpace = targetColorSpace
+          // Only set HDR flags if the format actually supports the requested color space
+          self.isAppleLog = (colorSpace == "appleLog")
+          self.isHDR = (colorSpace == "appleLog" || colorSpace == "hlgBT2020")
+          NSLog("[WebGPUCamera] startCapture: step 6c — isAppleLog=\(self.isAppleLog) isHDR=\(self.isHDR)")
         } else {
           NSLog("[WebGPUCamera] Color space '\(colorSpace)' not supported by active format, falling back to sRGB")
           camera.activeColorSpace = .sRGB
+          self.isAppleLog = false
+          self.isHDR = false
         }
 
+        NSLog("[WebGPUCamera] startCapture: step 7 — unlocking camera")
         camera.unlockForConfiguration()
       } catch {
         NSLog("[WebGPUCamera] Failed to lock camera for configuration: \(error)")
       }
 
       // Frame output setup
+      NSLog("[WebGPUCamera] startCapture: step 8 — creating video output (isHDR=\(self.isHDR))")
       let dims = CMVideoFormatDescriptionGetDimensions(camera.activeFormat.formatDescription)
       let width = Int(dims.width)
       let height = Int(dims.height)
 
       let output = AVCaptureVideoDataOutput()
-      if self.isAppleLog {
+      if self.isHDR {
+        // Both appleLog and hlgBT2020 deliver 10-bit YUV bi-planar
+        NSLog("[WebGPUCamera] startCapture: step 8a — requesting 10-bit YUV pixel format")
         output.videoSettings = [
           kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
         ]
       } else {
+        NSLog("[WebGPUCamera] startCapture: step 8a — requesting BGRA pixel format")
         output.videoSettings = [
           kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
         ]
       }
       output.alwaysDiscardsLateVideoFrames = true
 
+      NSLog("[WebGPUCamera] startCapture: step 9 — setting up frame delegate")
       let delegate = FrameDelegate(width: UInt32(width), height: UInt32(height), module: self)
       self.frameDelegate = delegate
       output.setSampleBufferDelegate(delegate, queue: self.frameQueue)
 
+      NSLog("[WebGPUCamera] startCapture: step 10 — adding output to session")
       if session.canAddOutput(output) {
         session.addOutput(output)
       }
@@ -295,7 +328,9 @@ public class WebGPUCameraModule: Module {
       self.activeWidth = width
       self.activeHeight = height
 
+      NSLog("[WebGPUCamera] startCapture: step 11 — calling session.startRunning()")
       session.startRunning()
+      NSLog("[WebGPUCamera] startCapture: step 12 — session started OK")
 
       self.captureSession = session
       self.dataOutput = output

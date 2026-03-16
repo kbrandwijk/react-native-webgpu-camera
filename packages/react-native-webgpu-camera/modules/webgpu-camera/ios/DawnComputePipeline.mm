@@ -16,7 +16,10 @@
 #include <CoreVideo/CoreVideo.h>
 #include <CoreVideo/CVPixelBufferIOSurface.h>
 #include <vector>
+#include <fstream>
+#include <sstream>
 
+#import <Foundation/Foundation.h>
 #import "SkiaManager.h"
 
 namespace dawn_pipeline {
@@ -255,6 +258,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 }
 )";
 
+  NSLog(@"[DawnPipeline] setup() appleLog=%d, %zu user shaders, %dx%d\n",
+         appleLog, wgslShaders.size(), width, height);
+
   auto effectiveShaders = wgslShaders;
   if (appleLog) {
     // Auto-insert YUV→RGB as pass 0 before user shaders
@@ -264,9 +270,21 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     effectiveShaders.push_back(kPassthroughWGSL);
   }
 
+  NSLog(@"[DawnPipeline] %zu effective shaders after prepend\n", effectiveShaders.size());
+
+  // Check Dawn feature support
+  if (appleLog) {
+    bool hasMultiPlanar = _impl->device.HasFeature(wgpu::FeatureName::DawnMultiPlanarFormats);
+    bool hasExtUsages = _impl->device.HasFeature(wgpu::FeatureName::MultiPlanarFormatExtendedUsages);
+    NSLog(@"[DawnPipeline] Dawn features: DawnMultiPlanarFormats=%d, MultiPlanarFormatExtendedUsages=%d\n",
+           hasMultiPlanar, hasExtUsages);
+  }
+
   // Compile shader passes
   for (size_t i = 0; i < effectiveShaders.size(); i++) {
     PassState pass;
+
+    NSLog(@"[DawnPipeline] Compiling shader pass %zu (%zu chars)\n", i, effectiveShaders[i].size());
 
     wgpu::ShaderModuleWGSLDescriptor wgslDesc{};
     wgslDesc.code = effectiveShaders[i].c_str();
@@ -276,7 +294,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
     auto shaderModule = _impl->device.CreateShaderModule(&smDesc);
     if (!shaderModule) {
-      printf("[DawnPipeline] Failed to create shader module for pass %zu\n", i);
+      NSLog(@"[DawnPipeline] FAILED to create shader module for pass %zu\n", i);
       cleanupLocked();
       return false;
     }
@@ -287,13 +305,14 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
     pass.pipeline = _impl->device.CreateComputePipeline(&cpDesc);
     if (!pass.pipeline) {
-      printf("[DawnPipeline] Failed to create compute pipeline for pass %zu\n", i);
+      NSLog(@"[DawnPipeline] FAILED to create compute pipeline for pass %zu\n", i);
       cleanupLocked();
       return false;
     }
 
     pass.bindGroupLayout = pass.pipeline.GetBindGroupLayout(0);
     _impl->passes.push_back(std::move(pass));
+    NSLog(@"[DawnPipeline] Pass %zu compiled OK\n", i);
   }
 
   // Create staging buffers for readback
@@ -345,9 +364,73 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
   _impl->uploadedResources.resize(resources.size());
   for (size_t ri = 0; ri < resources.size(); ri++) {
-    const auto& spec = resources[ri];
+    auto spec = resources[ri];  // mutable copy — fileUri may populate data/dims
     auto& ur = _impl->uploadedResources[ri];
     ur.type = spec.type;
+
+    // Load .cube LUT file if fileUri is set
+    if (!spec.fileUri.empty() && spec.data.empty()) {
+      NSLog(@"[DawnPipeline] Loading .cube file: %s\n", spec.fileUri.c_str());
+      std::ifstream file(spec.fileUri);
+      if (!file.is_open()) {
+        NSLog(@"[DawnPipeline] FAILED to open file: %s\n", spec.fileUri.c_str());
+        cleanupLocked();
+        return false;
+      }
+
+      int lutSize = 0;
+      std::vector<float> values;
+      std::string line;
+      while (std::getline(file, line)) {
+        // Trim
+        size_t start = line.find_first_not_of(" \t\r\n");
+        if (start == std::string::npos) continue;
+        line = line.substr(start);
+
+        if (line.empty() || line[0] == '#') continue;
+
+        if (line.rfind("LUT_3D_SIZE", 0) == 0) {
+          lutSize = std::stoi(line.substr(11));
+          continue;
+        }
+
+        // Skip metadata lines (TITLE, DOMAIN_MIN, etc.)
+        if (line[0] >= 'A' && line[0] <= 'Z') continue;
+
+        // Parse R G B triplet
+        std::istringstream iss(line);
+        float r, g, b;
+        if (iss >> r >> g >> b) {
+          values.push_back(r);
+          values.push_back(g);
+          values.push_back(b);
+          values.push_back(1.0f);  // alpha
+        }
+      }
+
+      if (lutSize == 0) {
+        NSLog(@"[DawnPipeline] .cube file missing LUT_3D_SIZE\n");
+        cleanupLocked();
+        return false;
+      }
+
+      int expected = lutSize * lutSize * lutSize * 4;
+      if ((int)values.size() != expected) {
+        NSLog(@"[DawnPipeline] .cube: expected %d floats, got %zu\n", expected, values.size());
+        cleanupLocked();
+        return false;
+      }
+
+      // Copy float data into spec
+      spec.width = lutSize;
+      spec.height = lutSize;
+      spec.depth = lutSize;
+      spec.format = ResourceFormat::RGBA32Float;
+      spec.data.resize(values.size() * sizeof(float));
+      memcpy(spec.data.data(), values.data(), spec.data.size());
+
+      NSLog(@"[DawnPipeline] Parsed .cube LUT: size=%d (%zu bytes)\n", lutSize, spec.data.size());
+    }
 
     if (spec.type == ResourceType::Texture3D || spec.type == ResourceType::Texture2D) {
       wgpu::TextureFormat texFmt;
@@ -424,10 +507,17 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   }
 
   // Store per-pass custom input bindings
+  NSLog(@"[DawnPipeline] Storing %zu passInput specs across %zu passes\n",
+         passInputs.size(), _impl->passes.size());
   _impl->passInputBindings.resize(_impl->passes.size());
   for (const auto& piSpec : passInputs) {
+    NSLog(@"[DawnPipeline] passInput: passIndex=%d, %zu bindings\n",
+           piSpec.passIndex, piSpec.bindings.size());
     if (piSpec.passIndex >= 0 && piSpec.passIndex < (int)_impl->passes.size()) {
       _impl->passInputBindings[piSpec.passIndex] = piSpec.bindings;
+    } else {
+      NSLog(@"[DawnPipeline] WARNING: passInput passIndex %d out of range (0..%zu)\n",
+             piSpec.passIndex, _impl->passes.size() - 1);
     }
   }
 
@@ -451,6 +541,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
   // Cache bind groups for passes 1+ (static ping-pong textures).
   // Pass 0 reads from the camera input which changes every frame — can't cache.
+  NSLog(@"[DawnPipeline] Caching bind groups for passes 1..%zu\n", _impl->passes.size() - 1);
   for (size_t i = 1; i < _impl->passes.size(); i++) {
     auto& pass = _impl->passes[i];
     // Pass i reads from the output of pass i-1, writes to the next ping-pong texture.
@@ -485,13 +576,25 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     }
 
     // Append custom input bindings for this pass
+    size_t beforeCustom = entries.size();
     _impl->appendCustomInputEntries((int)i, entries);
+    NSLog(@"[DawnPipeline] Pass %zu cached bind group: %zu base entries + %zu custom = %zu total\n",
+           i, beforeCustom, entries.size() - beforeCustom, entries.size());
+    for (size_t e = 0; e < entries.size(); e++) {
+      NSLog(@"[DawnPipeline]   entry[%zu]: binding=%u\n", e, entries[e].binding);
+    }
 
     wgpu::BindGroupDescriptor bgDesc{};
     bgDesc.layout = pass.bindGroupLayout;
     bgDesc.entryCount = entries.size();
     bgDesc.entries = entries.data();
     pass.cachedBindGroup = _impl->device.CreateBindGroup(&bgDesc);
+    if (!pass.cachedBindGroup) {
+      NSLog(@"[DawnPipeline] FAILED to create cached bind group for pass %zu\n", i);
+      cleanupLocked();
+      return false;
+    }
+    NSLog(@"[DawnPipeline] Pass %zu cached bind group OK\n", i);
   }
 
   // Create a separate texture for Skia canvas draws, isolated from compute output.
@@ -517,7 +620,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
       kRGBA_F16_SkColorType, nullptr, nullptr);
   }
 
-  printf("[DawnPipeline] Setup complete: %zu passes, %zu buffers, %dx%d%s\n",
+  NSLog(@"[DawnPipeline] Setup complete: %zu passes, %zu buffers, %dx%d%s\n",
          effectiveShaders.size(), bufferSpecs.size(), width, height,
          useCanvas ? " +canvas" : "");
   return true;
@@ -552,13 +655,22 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   sharedDesc.nextInChain = &ioDesc;
 
   auto sharedMemory = device.ImportSharedTextureMemory(&sharedDesc);
-  if (!sharedMemory) return false;
+  if (!sharedMemory) {
+    static bool logged = false;
+    if (!logged) { NSLog(@"[DawnPipeline] processFrame: ImportSharedTextureMemory FAILED\n"); logged = true; }
+    return false;
+  }
 
   wgpu::Texture inputTexture;
   wgpu::TextureView yPlaneView;   // only used in appleLog mode
   wgpu::TextureView uvPlaneView;  // only used in appleLog mode
 
   if (impl->appleLog) {
+    static bool loggedFirst = false;
+    if (!loggedFirst) {
+      NSLog(@"[DawnPipeline] processFrame: Apple Log path, importing %dx%d YUV IOSurface\n", _width, _height);
+    }
+
     // Import as multi-planar 10-bit YUV
     wgpu::TextureDescriptor inputTexDesc{};
     inputTexDesc.size = {(uint32_t)_width, (uint32_t)_height, 1};
@@ -570,18 +682,34 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
     inputTexDesc.label = "CameraInputYUV";
 
     inputTexture = sharedMemory.CreateTexture(&inputTexDesc);
-    if (!inputTexture) return false;
+    if (!inputTexture) {
+      if (!loggedFirst) { NSLog(@"[DawnPipeline] processFrame: CreateTexture (YUV) FAILED\n"); loggedFirst = true; }
+      return false;
+    }
+    if (!loggedFirst) NSLog(@"[DawnPipeline] processFrame: YUV texture created OK\n");
 
     // Create per-plane views
     wgpu::TextureViewDescriptor yViewDesc{};
     yViewDesc.aspect = wgpu::TextureAspect::Plane0Only;
     yViewDesc.format = wgpu::TextureFormat::R16Unorm;
     yPlaneView = inputTexture.CreateView(&yViewDesc);
+    if (!yPlaneView) {
+      if (!loggedFirst) { NSLog(@"[DawnPipeline] processFrame: Y plane view FAILED\n"); loggedFirst = true; }
+      return false;
+    }
 
     wgpu::TextureViewDescriptor uvViewDesc{};
     uvViewDesc.aspect = wgpu::TextureAspect::Plane1Only;
     uvViewDesc.format = wgpu::TextureFormat::RG16Unorm;
     uvPlaneView = inputTexture.CreateView(&uvViewDesc);
+    if (!uvPlaneView) {
+      if (!loggedFirst) { NSLog(@"[DawnPipeline] processFrame: UV plane view FAILED\n"); loggedFirst = true; }
+      return false;
+    }
+    if (!loggedFirst) {
+      NSLog(@"[DawnPipeline] processFrame: Y + UV plane views created OK\n");
+      loggedFirst = true;
+    }
   } else {
     // Existing BGRA path
     wgpu::TextureDescriptor inputTexDesc{};
@@ -694,13 +822,28 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
       }
 
       // Append custom input bindings for pass 0
+      size_t beforeCustom = entries.size();
       impl->appendCustomInputEntries(0, entries);
+
+      static bool loggedPass0 = false;
+      if (!loggedPass0) {
+        NSLog(@"[DawnPipeline] processFrame pass 0: %zu base + %zu custom = %zu entries, appleLog=%d\n",
+               beforeCustom, entries.size() - beforeCustom, entries.size(), impl->appleLog);
+        for (size_t e = 0; e < entries.size(); e++) {
+          NSLog(@"[DawnPipeline]   entry[%zu]: binding=%u\n", e, entries[e].binding);
+        }
+        loggedPass0 = true;
+      }
 
       wgpu::BindGroupDescriptor bgDesc{};
       bgDesc.layout = pass.bindGroupLayout;
       bgDesc.entryCount = entries.size();
       bgDesc.entries = entries.data();
       bindGroup = device.CreateBindGroup(&bgDesc);
+      if (!bindGroup) {
+        NSLog(@"[DawnPipeline] FAILED to create bind group for pass 0\n");
+        return false;
+      }
     } else {
       // Passes 1+: cached bind group (static ping-pong textures)
       bindGroup = pass.cachedBindGroup;
@@ -1381,7 +1524,7 @@ void dawn_pipeline_install_jsi(DawnComputePipelineRef ref, void* jsiRuntime) {
 
   std::shared_ptr<RNSkia::RNSkManager> skManager = [SkiaManager latestActiveSkManager];
   if (!skManager) {
-    printf("[DawnPipeline] WARNING: SkiaManager not available\n");
+    NSLog(@"[DawnPipeline] WARNING: SkiaManager not available\n");
     return;
   }
   auto platformContext = skManager->getPlatformContext();
@@ -1420,7 +1563,7 @@ void dawn_pipeline_install_jsi(DawnComputePipelineRef ref, void* jsiRuntime) {
     });
   runtime.global().setProperty(runtime, "__webgpuCamera_createStream", std::move(createStreamFn));
 
-  printf("[DawnPipeline] JSI bindings installed (nextImage + createStream)\n");
+  NSLog(@"[DawnPipeline] JSI bindings installed (nextImage + createStream)\n");
 }
 
 } // extern "C"

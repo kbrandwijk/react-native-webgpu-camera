@@ -12,9 +12,8 @@ import {
 import { Canvas, Fill, Group, Image as SkImage, Skia, Picture, createPicture } from '@shopify/react-native-skia';
 import { useDerivedValue } from 'react-native-reanimated';
 import { Asset } from 'expo-asset';
-import { File as ExpoFile } from 'expo-file-system';
-import { useCamera, useGPUFrameProcessor, useCameraFormats, GPUResource, parseCubeFile } from 'react-native-webgpu-camera';
-import type { CameraFormat } from 'react-native-webgpu-camera';
+import { useCamera, useGPUFrameProcessor, useCameraFormats, GPUResource } from 'react-native-webgpu-camera';
+import type { CameraFormat, ColorSpace } from 'react-native-webgpu-camera';
 import { PASSTHROUGH_WGSL } from '@/shaders/passthrough.wgsl';
 import { SOBEL_WGSL } from '@/shaders/sobel.wgsl';
 import { SOBEL_COLOR_WGSL } from '@/shaders/sobel-color.wgsl';
@@ -36,15 +35,16 @@ const SHADERS: ShaderMode[] = [
   { name: 'Multi-pass', wgsl: [SOBEL_WGSL, SOBEL_COLOR_WGSL], type: 'simple' },
   { name: 'Histogram', type: 'histogram' },
   { name: 'Hist (burn)', type: 'histogram-onframe' },
-  { name: 'Apple Log', type: 'applelog' },
+  { name: 'LUT', type: 'applelog' },
 ];
 
-function CameraPreview({ shaderChain, format }: { shaderChain: readonly string[]; format?: CameraFormat }) {
+function CameraPreview({ shaderChain, format, colorSpace }: { shaderChain: readonly string[]; format?: CameraFormat; colorSpace?: ColorSpace }) {
   const { width: screenW, height: screenH } = useWindowDimensions();
 
   const camera = useCamera({
     device: 'back',
     format,
+    colorSpace,
   });
 
   const { currentFrame, fps, displayFps, metrics, error } = useGPUFrameProcessor(camera, (frame) => {
@@ -82,12 +82,13 @@ function CameraPreview({ shaderChain, format }: { shaderChain: readonly string[]
   );
 }
 
-function HistogramPreview({ format }: { format?: CameraFormat }) {
+function HistogramPreview({ format, colorSpace }: { format?: CameraFormat; colorSpace?: ColorSpace }) {
   const { width: screenW, height: screenH } = useWindowDimensions();
 
   const camera = useCamera({
     device: 'back',
     format,
+    colorSpace,
   });
 
   // Histogram with buffer readback (sync required until async readback is implemented)
@@ -174,12 +175,13 @@ function HistogramPreview({ format }: { format?: CameraFormat }) {
   );
 }
 
-function HistogramOnFramePreview({ format }: { format?: CameraFormat }) {
+function HistogramOnFramePreview({ format, colorSpace }: { format?: CameraFormat; colorSpace?: ColorSpace }) {
   const { width: screenW, height: screenH } = useWindowDimensions();
 
   const camera = useCamera({
     device: 'back',
     format,
+    colorSpace,
   });
 
   const { currentFrame, fps, displayFps, metrics, error } = useGPUFrameProcessor(camera, {
@@ -263,24 +265,28 @@ function HistogramOnFramePreview({ format }: { format?: CameraFormat }) {
   );
 }
 
-function AppleLogPreview({ format, lutResource }: { format?: CameraFormat; lutResource: ReturnType<typeof GPUResource.texture3D> | null }) {
+function AppleLogPreview({ format, colorSpace, lutResource }: { format?: CameraFormat; colorSpace?: ColorSpace; lutResource: ReturnType<typeof GPUResource.texture3D> | null }) {
+  console.log('[AppleLogPreview] MOUNT, lutResource:', !!lutResource, 'format:', format?.width, 'x', format?.height, 'colorSpace:', colorSpace);
   const { width: screenW, height: screenH } = useWindowDimensions();
 
   const camera = useCamera({
     device: 'back',
     format,
-    colorSpace: 'appleLog',
+    colorSpace,
   });
 
-  const resources = lutResource ? { lut: lutResource } : undefined;
+  // TODO: Enable after native rebuild with .cube parser support
+  // const resources = lutResource ? { lut: lutResource } : undefined;
+  const resources = undefined;
 
   const { currentFrame, fps, displayFps, metrics, error } = useGPUFrameProcessor(camera, {
     resources,
     pipeline: (frame, res: any) => {
       'worklet';
-      if (res?.lut) {
-        frame.runShader(LUT_WGSL, { inputs: { lut: res.lut } });
-      }
+      // TODO: Enable after native rebuild with .cube parser support
+      // if (res?.lut) {
+      //   frame.runShader(LUT_WGSL, { inputs: { lut: res.lut } });
+      // }
     },
   });
 
@@ -319,34 +325,40 @@ export default function CameraSpikeScreen() {
   const [lutResource, setLutResource] = useState<ReturnType<typeof GPUResource.texture3D> | null>(null);
   const shader = SHADERS[shaderIndex];
 
-  // Load bundled .cube LUT on mount
+  // Load bundled .cube LUT on mount — pass file URI, native side parses .cube
   useEffect(() => {
     (async () => {
       const [asset] = await Asset.loadAsync(require('../../assets/AppleLogToRec709-v1.0.cube'));
       if (!asset.localUri) return;
-      const file = new ExpoFile(asset.localUri);
-      const text = await file.text();
-      const parsed = parseCubeFile(text);
-      setLutResource(GPUResource.texture3D(parsed.data.buffer as ArrayBuffer, {
-        width: parsed.size, height: parsed.size, depth: parsed.size,
+      console.log('[LUT] asset localUri:', asset.localUri);
+      setLutResource(GPUResource.texture3D(asset.localUri, {
+        width: 0, height: 0, depth: 0,
         format: 'rgba32float',
       }));
     })();
   }, []);
 
-  // Format enumeration
+  // Format enumeration — expand into one entry per (format, colorSpace) permutation
   const formats = useCameraFormats('back');
-  const [selectedFormat, setSelectedFormat] = useState<CameraFormat | undefined>();
+  type FormatEntry = { format: CameraFormat; colorSpace: ColorSpace };
+  const formatEntries = formats.flatMap((f) =>
+    (f.supportedColorSpaces ?? ['sRGB']).map((cs) => ({ format: f, colorSpace: cs as ColorSpace }))
+  );
+  const [selected, setSelected] = useState<FormatEntry | undefined>();
 
-  // Auto-select best format: 4K 120fps if available, otherwise highest res
+  // Auto-select best sRGB format
   useEffect(() => {
-    if (formats.length === 0) return;
+    if (formatEntries.length === 0) return;
     const best =
-      formats.find(f => f.width >= 3840 && f.maxFps >= 120) ??
-      formats.find(f => f.width >= 1920 && f.maxFps >= 60) ??
-      formats[0];
-    setSelectedFormat(best);
+      formatEntries.find(e => e.colorSpace === 'sRGB' && e.format.width >= 3840 && e.format.maxFps >= 120) ??
+      formatEntries.find(e => e.colorSpace === 'sRGB' && e.format.width >= 1920 && e.format.maxFps >= 60) ??
+      formatEntries.find(e => e.colorSpace === 'sRGB') ??
+      formatEntries[0];
+    setSelected(best);
   }, [formats]);
+
+  const selectedFormat = selected?.format;
+  const selectedColorSpace = selected?.colorSpace ?? 'sRGB';
 
   if (showDepth) {
     return <DepthEstimation onBack={() => setShowDepth(false)} />;
@@ -354,17 +366,17 @@ export default function CameraSpikeScreen() {
 
   const [showFormatPicker, setShowFormatPicker] = useState(false);
 
-  const formatLabel = selectedFormat
-    ? `${selectedFormat.width}x${selectedFormat.height} @${Math.round(selectedFormat.maxFps)}`
+  const formatLabel = selected
+    ? `${selected.format.width}x${selected.format.height} @${Math.round(selected.format.maxFps)} ${selected.colorSpace}`
     : 'Auto';
 
   return (
     <View style={styles.container}>
       {/* key forces re-mount because pipeline setup captures shader chain */}
-      {isRunning && shader.type === 'histogram' && <HistogramPreview key={shader.name} format={selectedFormat} />}
-      {isRunning && shader.type === 'histogram-onframe' && <HistogramOnFramePreview key={shader.name} format={selectedFormat} />}
-      {isRunning && shader.type === 'simple' && <CameraPreview key={shader.name} shaderChain={shader.wgsl} format={selectedFormat} />}
-      {isRunning && shader.type === 'applelog' && <AppleLogPreview key={shader.name} format={selectedFormat} lutResource={lutResource} />}
+      {isRunning && shader.type === 'histogram' && <HistogramPreview key={`${shader.name}-${selectedColorSpace}`} format={selectedFormat} colorSpace={selectedColorSpace} />}
+      {isRunning && shader.type === 'histogram-onframe' && <HistogramOnFramePreview key={`${shader.name}-${selectedColorSpace}`} format={selectedFormat} colorSpace={selectedColorSpace} />}
+      {isRunning && shader.type === 'simple' && <CameraPreview key={`${shader.name}-${selectedColorSpace}`} shaderChain={shader.wgsl} format={selectedFormat} colorSpace={selectedColorSpace} />}
+      {isRunning && shader.type === 'applelog' && <AppleLogPreview key={`${shader.name}-${selectedColorSpace}`} format={selectedFormat} colorSpace={selectedColorSpace} lutResource={lutResource} />}
 
       <View style={styles.controls}>
         {isRunning && (
@@ -372,7 +384,7 @@ export default function CameraSpikeScreen() {
             style={styles.button}
             onPress={() => setShaderIndex((i) => (i + 1) % SHADERS.length)}
           >
-            <Text style={styles.buttonText}>{shader.name}</Text>
+            <Text style={styles.buttonText}>{shader.name} ({shaderIndex + 1}/{SHADERS.length})</Text>
           </Pressable>
         )}
 
@@ -387,7 +399,7 @@ export default function CameraSpikeScreen() {
 
         <Pressable
           style={[styles.button, isRunning && styles.buttonActive]}
-          onPress={() => setIsRunning(!isRunning)}
+          onPress={() => { console.log('[CameraSpikeScreen] toggle isRunning, shader:', shader.name, 'type:', shader.type); setIsRunning(!isRunning); }}
         >
           <Text style={styles.buttonText}>{isRunning ? 'Stop' : 'Start Pipeline'}</Text>
         </Pressable>
@@ -404,20 +416,20 @@ export default function CameraSpikeScreen() {
           <View style={styles.modalContent}>
             <Text style={styles.modalTitle}>Camera Format</Text>
             <FlatList
-              data={formats}
-              keyExtractor={(f) => `${f.width}x${f.height}-${f.maxFps}-${f.nativeHandle}`}
-              renderItem={({ item: f }) => {
-                const isSelected = selectedFormat?.nativeHandle === f.nativeHandle;
+              data={formatEntries}
+              keyExtractor={(e) => `${e.format.nativeHandle}-${e.colorSpace}`}
+              renderItem={({ item: e }) => {
+                const isSelected = selected?.format.nativeHandle === e.format.nativeHandle && selected?.colorSpace === e.colorSpace;
                 return (
                   <Pressable
                     style={[styles.formatRow, isSelected && styles.formatRowSelected]}
-                    onPress={() => { setSelectedFormat(f); setShowFormatPicker(false); }}
+                    onPress={() => { setSelected(e); setShowFormatPicker(false); }}
                   >
                     <Text style={[styles.formatText, isSelected && styles.formatTextSelected]}>
-                      {f.width}x{f.height}
+                      {e.format.width}x{e.format.height}
                     </Text>
                     <Text style={[styles.formatDetail, isSelected && styles.formatTextSelected]}>
-                      {Math.round(f.minFps)}-{Math.round(f.maxFps)}fps{f.isHDR ? ' HDR' : ''}{f.isBinned ? ' bin' : ''}
+                      {Math.round(e.format.minFps)}-{Math.round(e.format.maxFps)}fps {e.colorSpace}{e.format.isBinned ? ' bin' : ''}
                     </Text>
                   </Pressable>
                 );
@@ -442,11 +454,11 @@ const styles = StyleSheet.create({
   statusText: { color: '#aaa', fontSize: 11, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
   controls: {
     position: 'absolute', bottom: 60, left: 16, right: 16,
-    flexDirection: 'row', justifyContent: 'center', gap: 16,
+    flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', gap: 10,
   },
   button: {
-    backgroundColor: 'rgba(255,255,255,0.2)', borderRadius: 24,
-    paddingHorizontal: 24, paddingVertical: 14, borderWidth: 1, borderColor: 'rgba(255,255,255,0.3)',
+    backgroundColor: 'rgba(255,255,255,0.2)', borderRadius: 20,
+    paddingHorizontal: 16, paddingVertical: 10, borderWidth: 1, borderColor: 'rgba(255,255,255,0.3)',
   },
   buttonActive: { backgroundColor: 'rgba(255,80,80,0.4)', borderColor: 'rgba(255,80,80,0.6)' },
   buttonText: { color: '#fff', fontSize: 16, fontWeight: '600' },
