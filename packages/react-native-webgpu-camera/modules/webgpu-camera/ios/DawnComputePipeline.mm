@@ -227,9 +227,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 @group(0) @binding(1) var uvPlaneTex: texture_2d<f32>;
 @group(0) @binding(2) var outputTex: texture_storage_2d<rgba16float, write>;
 
-// BT.2020 video range YCbCr -> RGB
+// BT.2020 full range YCbCr -> RGB
 // Input: R16Unorm Y plane (full res), RG16Unorm UV plane (half res)
-// Video range 10-bit: Y [64..940]/1023, CbCr [64..960]/1023
+// Full range: Y/Cb/Cr already normalized [0,1] by R16Unorm
 
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) id: vec3u) {
@@ -243,10 +243,10 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   let yRaw = textureLoad(yPlaneTex, coord, 0).r;
   let uvRaw = textureLoad(uvPlaneTex, uvCoord, 0).rg;
 
-  // Video range expansion (10-bit: 64/1023 = 0.06256, 940/1023 = 0.91887, 960/1023 = 0.93842)
-  let y = (yRaw - 0.06256) / (0.91887 - 0.06256);
-  let cb = (uvRaw.r - 0.06256) / (0.93842 - 0.06256) - 0.5;
-  let cr = (uvRaw.g - 0.06256) / (0.93842 - 0.06256) - 0.5;
+  // Full range: no offset subtraction needed
+  let y = yRaw;
+  let cb = uvRaw.r - 0.5;
+  let cr = uvRaw.g - 0.5;
 
   // BT.2020 non-constant-luminance YCbCr -> RGB
   let r = y + 1.4746 * cr;

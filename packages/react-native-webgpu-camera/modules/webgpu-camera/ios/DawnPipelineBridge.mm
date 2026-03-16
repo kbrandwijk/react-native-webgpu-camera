@@ -139,6 +139,19 @@
 
 - (BOOL)processFrame:(CVPixelBufferRef)pixelBuffer {
   if (!_pipeline) return NO;
+  static bool loggedFormat = false;
+  if (!loggedFormat) {
+    OSType fmt = CVPixelBufferGetPixelFormatType(pixelBuffer);
+    size_t w = CVPixelBufferGetWidth(pixelBuffer);
+    size_t h = CVPixelBufferGetHeight(pixelBuffer);
+    size_t planes = CVPixelBufferGetPlaneCount(pixelBuffer);
+    NSLog(@"[DawnBridge] First frame pixel format: 0x%08x (%c%c%c%c), %zux%zu, %zu planes",
+          (unsigned)fmt,
+          (char)((fmt >> 24) & 0xFF), (char)((fmt >> 16) & 0xFF),
+          (char)((fmt >> 8) & 0xFF), (char)(fmt & 0xFF),
+          w, h, planes);
+    loggedFormat = true;
+  }
   return dawn_pipeline_process_frame(_pipeline, pixelBuffer);
 }
 
