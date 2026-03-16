@@ -217,7 +217,49 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 }
 )";
 
+  // Built-in YUV→RGB shader for Apple Log mode.
+  // Converts 10-bit video range YCbCr (BT.2020) to Apple Log encoded RGB.
+  static const std::string kYUVtoRGBWGSL = R"(
+@group(0) @binding(0) var yPlaneTex: texture_2d<f32>;
+@group(0) @binding(1) var uvPlaneTex: texture_2d<f32>;
+@group(0) @binding(2) var outputTex: texture_storage_2d<rgba16float, write>;
+
+// BT.2020 video range YCbCr -> RGB
+// Input: R16Unorm Y plane (full res), RG16Unorm UV plane (half res)
+// Video range 10-bit: Y [64..940]/1023, CbCr [64..960]/1023
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  let dims = textureDimensions(yPlaneTex);
+  if (id.x >= dims.x || id.y >= dims.y) { return; }
+
+  let coord = vec2i(id.xy);
+  let uvCoord = vec2i(id.xy / 2u);
+
+  // Load normalized [0,1] values from R16Unorm/RG16Unorm planes
+  let yRaw = textureLoad(yPlaneTex, coord, 0).r;
+  let uvRaw = textureLoad(uvPlaneTex, uvCoord, 0).rg;
+
+  // Video range expansion (10-bit: 64/1023 = 0.06256, 940/1023 = 0.91887, 960/1023 = 0.93842)
+  let y = (yRaw - 0.06256) / (0.91887 - 0.06256);
+  let cb = (uvRaw.r - 0.06256) / (0.93842 - 0.06256) - 0.5;
+  let cr = (uvRaw.g - 0.06256) / (0.93842 - 0.06256) - 0.5;
+
+  // BT.2020 non-constant-luminance YCbCr -> RGB
+  let r = y + 1.4746 * cr;
+  let g = y - 0.16455 * cb - 0.57135 * cr;
+  let b = y + 1.8814 * cb;
+
+  // Do NOT clamp -- Apple Log values outside [0,1] represent valid HDR data
+  textureStore(outputTex, coord, vec4f(r, g, b, 1.0));
+}
+)";
+
   auto effectiveShaders = wgslShaders;
+  if (appleLog) {
+    // Auto-insert YUV→RGB as pass 0 before user shaders
+    effectiveShaders.insert(effectiveShaders.begin(), kYUVtoRGBWGSL);
+  }
   if (effectiveShaders.empty()) {
     effectiveShaders.push_back(kPassthroughWGSL);
   }
