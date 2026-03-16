@@ -12,7 +12,7 @@ import {
 import { Canvas, Fill, Group, Image as SkImage, Skia, Picture, createPicture } from '@shopify/react-native-skia';
 import { useDerivedValue } from 'react-native-reanimated';
 import { Asset } from 'expo-asset';
-import * as FileSystem from 'expo-file-system';
+import { File as ExpoFile } from 'expo-file-system';
 import { useCamera, useGPUFrameProcessor, useCameraFormats, GPUResource, parseCubeFile } from 'react-native-webgpu-camera';
 import type { CameraFormat } from 'react-native-webgpu-camera';
 import { PASSTHROUGH_WGSL } from '@/shaders/passthrough.wgsl';
@@ -322,9 +322,10 @@ export default function CameraSpikeScreen() {
   // Load bundled .cube LUT on mount
   useEffect(() => {
     (async () => {
-      const [asset] = await Asset.loadAsync(require('../../../assets/AppleLogToRec709-v1.0.cube'));
+      const [asset] = await Asset.loadAsync(require('../../assets/AppleLogToRec709-v1.0.cube'));
       if (!asset.localUri) return;
-      const text = await FileSystem.readAsStringAsync(asset.localUri);
+      const file = new ExpoFile(asset.localUri);
+      const text = await file.text();
       const parsed = parseCubeFile(text);
       setLutResource(GPUResource.texture3D(parsed.data.buffer as ArrayBuffer, {
         width: parsed.size, height: parsed.size, depth: parsed.size,
