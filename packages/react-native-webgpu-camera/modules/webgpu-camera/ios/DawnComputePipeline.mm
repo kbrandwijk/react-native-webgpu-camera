@@ -93,58 +93,57 @@ struct DawnComputePipeline::Impl {
 
   // Texture outputs from passes (indexed by pass index)
   std::vector<wgpu::Texture> passTextureOutputs;
-};
 
-// Helper: append custom input binding entries for the given pass into the bind group entry vector.
-// Handles resource textures, samplers, storage buffers, and cross-pass texture outputs.
-static void appendCustomInputEntries(
-    int passIndex,
-    std::vector<wgpu::BindGroupEntry>& entries,
-    const DawnComputePipeline::Impl& impl) {
-  if ((size_t)passIndex >= impl.passInputBindings.size()) return;
-  for (const auto& ib : impl.passInputBindings[passIndex]) {
+  // Helper: append custom input binding entries for the given pass into the bind group entry vector.
+  // Handles resource textures, samplers, storage buffers, and cross-pass texture outputs.
+  void appendCustomInputEntries(
+      int passIndex,
+      std::vector<wgpu::BindGroupEntry>& entries) const {
+    if ((size_t)passIndex >= passInputBindings.size()) return;
+    for (const auto& ib : passInputBindings[passIndex]) {
     wgpu::BindGroupEntry entry{};
     entry.binding = ib.bindingIndex;
 
     switch (ib.type) {
       case InputBindingType::Texture3D:
       case InputBindingType::Texture2D:
-        if (ib.resourceHandle >= 0 && (size_t)ib.resourceHandle < impl.uploadedResources.size()) {
-          entry.textureView = impl.uploadedResources[ib.resourceHandle].textureView;
+        if (ib.resourceHandle >= 0 && (size_t)ib.resourceHandle < uploadedResources.size()) {
+          entry.textureView = uploadedResources[ib.resourceHandle].textureView;
           entries.push_back(entry);
-        } else if (ib.sourcePass >= 0 && (size_t)ib.sourcePass < impl.passTextureOutputs.size()
-                   && impl.passTextureOutputs[ib.sourcePass]) {
-          entry.textureView = impl.passTextureOutputs[ib.sourcePass].CreateView();
+        } else if (ib.sourcePass >= 0 && (size_t)ib.sourcePass < passTextureOutputs.size()
+                   && passTextureOutputs[ib.sourcePass]) {
+          entry.textureView = passTextureOutputs[ib.sourcePass].CreateView();
           entries.push_back(entry);
         }
         break;
 
       case InputBindingType::Sampler:
-        if (ib.resourceHandle >= 0 && (size_t)ib.resourceHandle < impl.uploadedResources.size()
-            && impl.uploadedResources[ib.resourceHandle].sampler) {
-          entry.sampler = impl.uploadedResources[ib.resourceHandle].sampler;
+        if (ib.resourceHandle >= 0 && (size_t)ib.resourceHandle < uploadedResources.size()
+            && uploadedResources[ib.resourceHandle].sampler) {
+          entry.sampler = uploadedResources[ib.resourceHandle].sampler;
         } else {
           // Fall back to default sampler (for pass texture output samplers)
-          entry.sampler = impl.defaultSampler;
+          entry.sampler = defaultSampler;
         }
         entries.push_back(entry);
         break;
 
       case InputBindingType::StorageBufferRead:
-        if (ib.resourceHandle >= 0 && (size_t)ib.resourceHandle < impl.uploadedResources.size()
-            && impl.uploadedResources[ib.resourceHandle].buffer) {
-          entry.buffer = impl.uploadedResources[ib.resourceHandle].buffer;
-          entry.size = impl.uploadedResources[ib.resourceHandle].buffer.GetSize();
+        if (ib.resourceHandle >= 0 && (size_t)ib.resourceHandle < uploadedResources.size()
+            && uploadedResources[ib.resourceHandle].buffer) {
+          entry.buffer = uploadedResources[ib.resourceHandle].buffer;
+          entry.size = uploadedResources[ib.resourceHandle].buffer.GetSize();
           entries.push_back(entry);
-        } else if (ib.sourceBuffer >= 0 && (size_t)ib.sourceBuffer < impl.buffers.size()) {
-          entry.buffer = impl.buffers[ib.sourceBuffer].gpuBuffer;
-          entry.size = impl.buffers[ib.sourceBuffer].byteSize;
+        } else if (ib.sourceBuffer >= 0 && (size_t)ib.sourceBuffer < buffers.size()) {
+          entry.buffer = buffers[ib.sourceBuffer].gpuBuffer;
+          entry.size = buffers[ib.sourceBuffer].byteSize;
           entries.push_back(entry);
         }
         break;
     }
   }
-}
+  }
+};
 
 DawnComputePipeline::DawnComputePipeline()
   : _alive(std::make_shared<std::atomic<bool>>(true)) {}
@@ -182,7 +181,7 @@ bool DawnComputePipeline::setup(
   // Create ping-pong textures
   wgpu::TextureDescriptor texDesc{};
   texDesc.size = {(uint32_t)width, (uint32_t)height, 1};
-  texDesc.format = wgpu::TextureFormat::RGBA8Unorm;
+  texDesc.format = wgpu::TextureFormat::RGBA16Float;
   texDesc.usage = wgpu::TextureUsage::StorageBinding |
                   wgpu::TextureUsage::TextureBinding |
                   wgpu::TextureUsage::CopySrc |
@@ -205,7 +204,7 @@ bool DawnComputePipeline::setup(
   // Handles BGRA→RGBA conversion and gives onFrame a canvas to draw on.
   static const std::string kPassthroughWGSL = R"(
 @group(0) @binding(0) var inputTex: texture_2d<f32>;
-@group(0) @binding(1) var outputTex: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(1) var outputTex: texture_storage_2d<rgba16float, write>;
 
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) id: vec3u) {
@@ -385,7 +384,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
       wgpu::TextureDescriptor texOutDesc{};
       texOutDesc.size = {(uint32_t)width, (uint32_t)height, 1};
-      texOutDesc.format = wgpu::TextureFormat::RGBA8Unorm;
+      texOutDesc.format = wgpu::TextureFormat::RGBA16Float;
       texOutDesc.usage = wgpu::TextureUsage::StorageBinding | wgpu::TextureUsage::TextureBinding;
       texOutDesc.dimension = wgpu::TextureDimension::e2D;
       texOutDesc.mipLevelCount = 1;
@@ -431,7 +430,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     }
 
     // Append custom input bindings for this pass
-    appendCustomInputEntries((int)i, entries, *_impl);
+    _impl->appendCustomInputEntries((int)i, entries);
 
     wgpu::BindGroupDescriptor bgDesc{};
     bgDesc.layout = pass.bindGroupLayout;
@@ -445,7 +444,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   if (useCanvas) {
     wgpu::TextureDescriptor canvasTexDesc{};
     canvasTexDesc.size = {(uint32_t)width, (uint32_t)height, 1};
-    canvasTexDesc.format = wgpu::TextureFormat::RGBA8Unorm;
+    canvasTexDesc.format = wgpu::TextureFormat::RGBA16Float;
     canvasTexDesc.usage = wgpu::TextureUsage::TextureBinding |
                           wgpu::TextureUsage::CopySrc |
                           wgpu::TextureUsage::CopyDst |
@@ -460,7 +459,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
       _impl->canvasTex.Get());
     _impl->surface = SkSurfaces::WrapBackendTexture(
       recorder, backendTex,
-      kRGBA_8888_SkColorType, nullptr, nullptr);
+      kRGBA_F16_SkColorType, nullptr, nullptr);
   }
 
   printf("[DawnPipeline] Setup complete: %zu passes, %zu buffers, %dx%d%s\n",
@@ -590,7 +589,7 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
       }
 
       // Append custom input bindings for pass 0
-      appendCustomInputEntries(0, entries, *impl);
+      impl->appendCustomInputEntries(0, entries);
 
       wgpu::BindGroupDescriptor bgDesc{};
       bgDesc.layout = pass.bindGroupLayout;
@@ -677,7 +676,7 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   // Determine final output texture and create SkImage
   bool finalIsA = (impl->passes.size() % 2 != 0);
   auto outputImage = ctx.MakeImageFromTexture(
-    *(finalIsA ? &impl->texA : &impl->texB), _width, _height, wgpu::TextureFormat::RGBA8Unorm);
+    *(finalIsA ? &impl->texA : &impl->texB), _width, _height, wgpu::TextureFormat::RGBA16Float);
 
   double tAfterMakeImage = CACurrentMediaTime();
 
@@ -777,7 +776,7 @@ void DawnComputePipeline::flushCanvas() {
     // Store as compositedImage so the next nextImage() call returns this
     // instead of outputImage (which processFrame may overwrite on the camera thread).
     _impl->compositedImage = ctx.MakeImageFromTexture(
-      *_impl->finalTex, _width, _height, wgpu::TextureFormat::RGBA8Unorm
+      *_impl->finalTex, _width, _height, wgpu::TextureFormat::RGBA16Float
     );
   }
 }
@@ -863,7 +862,7 @@ void* DawnComputePipeline::flushCanvasAndGetImage() {
 
     // Wrap canvasTex (compute + Skia draws) as the output image
     _impl->outputImage = ctx.MakeImageFromTexture(
-      _impl->canvasTex, _width, _height, wgpu::TextureFormat::RGBA8Unorm
+      _impl->canvasTex, _width, _height, wgpu::TextureFormat::RGBA16Float
     );
   }
 
