@@ -502,18 +502,48 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   auto sharedMemory = device.ImportSharedTextureMemory(&sharedDesc);
   if (!sharedMemory) return false;
 
-  // Create input texture from camera IOSurface (BGRA on iOS)
-  wgpu::TextureDescriptor inputTexDesc{};
-  inputTexDesc.size = {(uint32_t)_width, (uint32_t)_height, 1};
-  inputTexDesc.format = wgpu::TextureFormat::BGRA8Unorm;
-  inputTexDesc.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc;
-  inputTexDesc.dimension = wgpu::TextureDimension::e2D;
-  inputTexDesc.mipLevelCount = 1;
-  inputTexDesc.sampleCount = 1;
-  inputTexDesc.label = "CameraInput";
+  wgpu::Texture inputTexture;
+  wgpu::TextureView yPlaneView;   // only used in appleLog mode
+  wgpu::TextureView uvPlaneView;  // only used in appleLog mode
 
-  auto inputTexture = sharedMemory.CreateTexture(&inputTexDesc);
-  if (!inputTexture) return false;
+  if (impl->appleLog) {
+    // Import as multi-planar 10-bit YUV
+    wgpu::TextureDescriptor inputTexDesc{};
+    inputTexDesc.size = {(uint32_t)_width, (uint32_t)_height, 1};
+    inputTexDesc.format = wgpu::TextureFormat::R10X6BG10X6Biplanar420Unorm;
+    inputTexDesc.usage = wgpu::TextureUsage::TextureBinding;
+    inputTexDesc.dimension = wgpu::TextureDimension::e2D;
+    inputTexDesc.mipLevelCount = 1;
+    inputTexDesc.sampleCount = 1;
+    inputTexDesc.label = "CameraInputYUV";
+
+    inputTexture = sharedMemory.CreateTexture(&inputTexDesc);
+    if (!inputTexture) return false;
+
+    // Create per-plane views
+    wgpu::TextureViewDescriptor yViewDesc{};
+    yViewDesc.aspect = wgpu::TextureAspect::Plane0Only;
+    yViewDesc.format = wgpu::TextureFormat::R16Unorm;
+    yPlaneView = inputTexture.CreateView(&yViewDesc);
+
+    wgpu::TextureViewDescriptor uvViewDesc{};
+    uvViewDesc.aspect = wgpu::TextureAspect::Plane1Only;
+    uvViewDesc.format = wgpu::TextureFormat::RG16Unorm;
+    uvPlaneView = inputTexture.CreateView(&uvViewDesc);
+  } else {
+    // Existing BGRA path
+    wgpu::TextureDescriptor inputTexDesc{};
+    inputTexDesc.size = {(uint32_t)_width, (uint32_t)_height, 1};
+    inputTexDesc.format = wgpu::TextureFormat::BGRA8Unorm;
+    inputTexDesc.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc;
+    inputTexDesc.dimension = wgpu::TextureDimension::e2D;
+    inputTexDesc.mipLevelCount = 1;
+    inputTexDesc.sampleCount = 1;
+    inputTexDesc.label = "CameraInput";
+
+    inputTexture = sharedMemory.CreateTexture(&inputTexDesc);
+    if (!inputTexture) return false;
+  }
 
   wgpu::SharedTextureMemoryBeginAccessDescriptor beginDesc{};
   beginDesc.initialized = true;
@@ -567,28 +597,48 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
       wgpu::Texture& writeTex = writeToA ? impl->texA : impl->texB;
 
       std::vector<wgpu::BindGroupEntry> entries;
-      wgpu::BindGroupEntry entry0{};
-      entry0.binding = 0;
-      entry0.textureView = inputTexture.CreateView();
-      entries.push_back(entry0);
 
-      wgpu::BindGroupEntry entry1{};
-      entry1.binding = 1;
-      entry1.textureView = writeTex.CreateView();
-      entries.push_back(entry1);
+      if (impl->appleLog) {
+        // YUV→RGB pass: Y plane (binding 0) + UV plane (binding 1) + output (binding 2)
+        wgpu::BindGroupEntry entry0{};
+        entry0.binding = 0;
+        entry0.textureView = yPlaneView;
+        entries.push_back(entry0);
 
-      if (pass.hasOutputBuffer && pass.bufferIndex >= 0) {
-        auto& sb = impl->buffers[pass.bufferIndex];
+        wgpu::BindGroupEntry entry1{};
+        entry1.binding = 1;
+        entry1.textureView = uvPlaneView;
+        entries.push_back(entry1);
+
         wgpu::BindGroupEntry entry2{};
         entry2.binding = 2;
-        entry2.buffer = sb.gpuBuffer;
-        entry2.size = sb.byteSize;
+        entry2.textureView = writeTex.CreateView();
         entries.push_back(entry2);
-      } else if (pass.hasTextureOutput && impl->passTextureOutputs[0]) {
-        wgpu::BindGroupEntry entry2{};
-        entry2.binding = 2;
-        entry2.textureView = impl->passTextureOutputs[0].CreateView();
-        entries.push_back(entry2);
+      } else {
+        // Standard SDR pass 0: camera input (binding 0) + output (binding 1)
+        wgpu::BindGroupEntry entry0{};
+        entry0.binding = 0;
+        entry0.textureView = inputTexture.CreateView();
+        entries.push_back(entry0);
+
+        wgpu::BindGroupEntry entry1{};
+        entry1.binding = 1;
+        entry1.textureView = writeTex.CreateView();
+        entries.push_back(entry1);
+
+        if (pass.hasOutputBuffer && pass.bufferIndex >= 0) {
+          auto& sb = impl->buffers[pass.bufferIndex];
+          wgpu::BindGroupEntry entry2{};
+          entry2.binding = 2;
+          entry2.buffer = sb.gpuBuffer;
+          entry2.size = sb.byteSize;
+          entries.push_back(entry2);
+        } else if (pass.hasTextureOutput && impl->passTextureOutputs[0]) {
+          wgpu::BindGroupEntry entry2{};
+          entry2.binding = 2;
+          entry2.textureView = impl->passTextureOutputs[0].CreateView();
+          entries.push_back(entry2);
+        }
       }
 
       // Append custom input bindings for pass 0
