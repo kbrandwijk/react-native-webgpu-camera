@@ -141,9 +141,10 @@ public class WebGPUCameraModule: Module {
       let bufferSpecsRaw = config["buffers"] as? [[NSNumber]] ?? []
       let useCanvas = config["useCanvas"] as? Bool ?? false
       let sync = config["sync"] as? Bool ?? false
+      let appleLog = config["appleLog"] as? Bool ?? false
       let resourcesRaw = config["resources"] as? [[String: Any]] ?? []
       let passInputsRaw = config["passInputs"] as? [[String: Any]] ?? []
-      let textureOutputPasses = (config["textureOutputPasses"] as? [NSNumber] ?? []).map { $0.intValue }
+      let textureOutputPasses = config["textureOutputPasses"] as? [NSNumber] ?? []
 
       let bufferSpecs = bufferSpecsRaw.map { spec in
         spec.map { $0 }
@@ -161,6 +162,7 @@ public class WebGPUCameraModule: Module {
         bufferSpecs: bufferSpecs,
         useCanvas: useCanvas,
         sync: sync,
+        appleLog: appleLog,
         resources: resourcesRaw,
         passInputs: passInputsRaw,
         textureOutputPasses: textureOutputPasses

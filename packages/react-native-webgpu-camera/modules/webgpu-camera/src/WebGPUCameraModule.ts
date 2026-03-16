@@ -16,6 +16,7 @@ interface WebGPUCameraModuleInterface extends NativeModule {
     buffers: [number, number, number][];
     useCanvas: boolean;
     sync: boolean;
+    appleLog: boolean;
     resources: {
       type: string;
       data: ArrayBuffer;

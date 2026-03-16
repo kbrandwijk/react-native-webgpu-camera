@@ -50,6 +50,7 @@ struct DawnComputePipeline::Impl {
   std::vector<StagingBuffer> buffers;
   bool syncMode = false;
   bool useCanvas = false;
+  bool appleLog = false;
   bool rawCamera = false;  // true when 0 shaders, no canvas, no buffers
   wgpu::Texture canvasTex;  // separate texture for Skia draws — not touched by compute
   sk_sp<SkSurface> surface;
@@ -161,7 +162,8 @@ bool DawnComputePipeline::setup(
     bool useCanvas, bool sync,
     const std::vector<ResourceSpec>& resources,
     const std::vector<PassInputSpec>& passInputs,
-    const std::vector<int>& textureOutputPasses) {
+    const std::vector<int>& textureOutputPasses,
+    bool appleLog) {
   std::lock_guard<std::mutex> lock(_mutex);
   cleanupLocked();
 
@@ -173,6 +175,7 @@ bool DawnComputePipeline::setup(
   _impl->device = ctx.getWGPUDevice();
   _impl->syncMode = sync;
   _impl->useCanvas = useCanvas;
+  _impl->appleLog = appleLog;
 
   // TODO: Raw camera path (0 shaders, no canvas, no buffers) needs texture
   // lifetime management — IOSurface texture is freed when processFrame returns.
@@ -936,7 +939,7 @@ bool dawn_pipeline_setup_multipass(
     const char** shaders, int shaderCount,
     int width, int height,
     const int* bufferSpecsFlat, int bufferCount,
-    bool useCanvas, bool sync,
+    bool useCanvas, bool sync, bool appleLog,
     const void* resourcesPtr, int resourceCount,
     const void* passInputsPtr, int passInputCount,
     const int* textureOutputPassesPtr, int textureOutputPassCount) {
@@ -976,7 +979,7 @@ bool dawn_pipeline_setup_multipass(
   }
 
   return pipeline->setup(wgslShaders, width, height, specs, useCanvas, sync,
-                         resourceVec, passInputVec, texOutVec);
+                         resourceVec, passInputVec, texOutVec, appleLog);
 }
 
 bool dawn_pipeline_process_frame(DawnComputePipelineRef ref, CVPixelBufferRef pixelBuffer) {

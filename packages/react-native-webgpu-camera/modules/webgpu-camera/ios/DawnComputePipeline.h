@@ -53,7 +53,8 @@ public:
              bool useCanvas, bool sync,
              const std::vector<ResourceSpec>& resources = {},
              const std::vector<PassInputSpec>& passInputs = {},
-             const std::vector<int>& textureOutputPasses = {});
+             const std::vector<int>& textureOutputPasses = {},
+             bool appleLog = false);
 
   bool processFrame(CVPixelBufferRef pixelBuffer);
 
@@ -134,7 +135,7 @@ bool dawn_pipeline_setup_multipass(
   const char** shaders, int shaderCount,
   int width, int height,
   const int* bufferSpecs, int bufferCount,
-  bool useCanvas, bool sync,
+  bool useCanvas, bool sync, bool appleLog,
   const void* resources, int resourceCount,
   const void* passInputs, int passInputCount,
   const int* textureOutputPasses, int textureOutputPassCount);

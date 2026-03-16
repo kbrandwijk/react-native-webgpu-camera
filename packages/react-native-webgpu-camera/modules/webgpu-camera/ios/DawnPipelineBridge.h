@@ -11,6 +11,7 @@
                       bufferSpecs:(nonnull NSArray<NSArray<NSNumber *> *> *)bufferSpecs
                         useCanvas:(BOOL)useCanvas
                              sync:(BOOL)sync
+                         appleLog:(BOOL)appleLog
                         resources:(nonnull NSArray<NSDictionary *> *)resources
                        passInputs:(nonnull NSArray<NSDictionary *> *)passInputs
                textureOutputPasses:(nonnull NSArray<NSNumber *> *)textureOutputPasses;

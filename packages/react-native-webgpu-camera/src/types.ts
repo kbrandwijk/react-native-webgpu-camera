@@ -19,6 +19,7 @@ export interface CameraHandle {
   width: number;
   height: number;
   fps: number;
+  colorSpace: ColorSpace;
 }
 
 // Format enumeration

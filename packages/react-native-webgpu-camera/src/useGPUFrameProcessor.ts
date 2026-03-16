@@ -244,6 +244,7 @@ function buildNativeConfig(
   useCanvas: boolean,
   sync: boolean,
   capturedResources: CapturedResource[],
+  appleLog: boolean,
 ) {
   const shaders = passes.map((p) => p.wgsl);
   const buffers: [number, number, number][] = [];
@@ -312,7 +313,7 @@ function buildNativeConfig(
     }
   });
 
-  return { shaders, width, height, buffers, useCanvas, sync, resources, passInputs, textureOutputPasses };
+  return { shaders, width, height, buffers, useCanvas, sync, appleLog, resources, passInputs, textureOutputPasses };
 }
 
 /**
@@ -428,6 +429,7 @@ export function useGPUFrameProcessor(
     const useCanvas = hasCanvas || (isObjectForm && !!onFrameFn);
 
     // Build and send native config
+    const appleLog = camera.colorSpace === 'appleLog';
     const nativeConfig = buildNativeConfig(
       passes,
       camera.width,
@@ -435,6 +437,7 @@ export function useGPUFrameProcessor(
       useCanvas,
       sync,
       capturedResources,
+      appleLog,
     );
 
     const ok = WebGPUCameraModule.setupMultiPassPipeline(nativeConfig);
@@ -453,7 +456,7 @@ export function useGPUFrameProcessor(
       stream.value = null;
       WebGPUCameraModule.cleanupComputePipeline();
     };
-  }, [camera.isReady, camera.width, camera.height, camera.fps]);
+  }, [camera.isReady, camera.width, camera.height, camera.fps, camera.colorSpace]);
 
   // Frame callback — runs on Reanimated UI thread every display frame
   useFrameCallback(() => {
