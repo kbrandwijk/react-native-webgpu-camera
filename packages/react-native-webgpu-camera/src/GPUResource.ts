@@ -3,7 +3,7 @@ export interface ResourceHandle<T extends string> {
   readonly __resourceType: T;
   readonly __handle: number;
   readonly __data?: ArrayBuffer;
-  readonly __dims?: { width: number; height: number; depth?: number };
+  readonly __dims?: { width: number; height: number; depth?: number; format?: string };
 }
 
 /** Sentinel for output type tokens */
@@ -13,7 +13,7 @@ export interface OutputTypeToken<T extends string> {
 
 function texture3D(
   data: ArrayBuffer,
-  dims: { width: number; height: number; depth: number },
+  dims: { width: number; height: number; depth: number; format?: 'rgba8unorm' | 'rgba32float' },
 ): ResourceHandle<'texture3d'> {
   return {
     __resourceType: 'texture3d',

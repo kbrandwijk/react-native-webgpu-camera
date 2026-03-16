@@ -43,6 +43,7 @@ interface CapturedResource {
   width?: number;
   height?: number;
   depth?: number;
+  format?: string;
 }
 
 /** Buffer metadata for resolving handles in the worklet */
@@ -88,6 +89,7 @@ function capturePipeline<B extends Record<string, any>, R extends Record<string,
           width: rh.__dims?.width,
           height: rh.__dims?.height,
           depth: rh.__dims?.depth,
+          format: rh.__dims?.format,
         });
         handleToIndex.set(handle, idx);
         resourceHandles[name] = handle;
@@ -268,6 +270,7 @@ function buildNativeConfig(
     width: r.width ?? 0,
     height: r.height ?? 0,
     depth: r.depth ?? 0,
+    format: r.format ?? 'rgba8unorm',
   }));
 
   // Build per-pass input bindings for native

@@ -23,6 +23,7 @@ interface WebGPUCameraModuleInterface extends NativeModule {
       width: number;
       height: number;
       depth: number;
+      format: string;
     }[];
     passInputs: {
       passIndex: number;

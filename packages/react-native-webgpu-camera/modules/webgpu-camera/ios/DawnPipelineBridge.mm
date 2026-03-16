@@ -67,6 +67,12 @@
     rs.width = [res[@"width"] intValue];
     rs.height = [res[@"height"] intValue];
     rs.depth = [res[@"depth"] intValue];
+    NSString *format = res[@"format"];
+    if ([format isEqualToString:@"rgba32float"]) {
+      rs.format = dawn_pipeline::ResourceFormat::RGBA32Float;
+    } else {
+      rs.format = dawn_pipeline::ResourceFormat::RGBA8Unorm;
+    }
     // Copy data to owned buffer (NSData may be released after this scope)
     NSData *data = res[@"data"];
     if (data) {

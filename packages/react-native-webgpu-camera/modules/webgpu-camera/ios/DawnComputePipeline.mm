@@ -350,8 +350,18 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     ur.type = spec.type;
 
     if (spec.type == ResourceType::Texture3D || spec.type == ResourceType::Texture2D) {
+      wgpu::TextureFormat texFmt;
+      int bytesPerPixel;
+      if (spec.format == ResourceFormat::RGBA32Float) {
+        texFmt = wgpu::TextureFormat::RGBA32Float;
+        bytesPerPixel = 16;  // 4 floats × 4 bytes
+      } else {
+        texFmt = wgpu::TextureFormat::RGBA8Unorm;
+        bytesPerPixel = 4;
+      }
+
       wgpu::TextureDescriptor texDesc{};
-      texDesc.format = wgpu::TextureFormat::RGBA8Unorm;
+      texDesc.format = texFmt;
       texDesc.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst;
       texDesc.mipLevelCount = 1;
       texDesc.sampleCount = 1;
@@ -377,7 +387,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         dst.origin = {0, 0, 0};
         dst.aspect = wgpu::TextureAspect::All;
 
-        uint32_t bytesPerRow = (uint32_t)spec.width * 4;
+        uint32_t bytesPerRow = (uint32_t)spec.width * bytesPerPixel;
         uint32_t rowsPerLayer = (uint32_t)spec.height;
 
         wgpu::TexelCopyBufferLayout layout{};

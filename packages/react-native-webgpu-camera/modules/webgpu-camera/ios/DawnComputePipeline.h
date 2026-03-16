@@ -12,9 +12,11 @@
 namespace dawn_pipeline {
 
 enum class ResourceType { Texture3D, Texture2D, StorageBuffer };
+enum class ResourceFormat { RGBA8Unorm, RGBA32Float };
 
 struct ResourceSpec {
   ResourceType type;
+  ResourceFormat format = ResourceFormat::RGBA8Unorm;
   std::vector<uint8_t> data;  // owns a copy of the upload data
   int width = 0;
   int height = 0;
