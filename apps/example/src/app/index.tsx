@@ -47,17 +47,15 @@ function CameraPreview({ shaderChain, format, colorSpace }: { shaderChain: reado
     colorSpace,
   });
 
-  const { currentFrame, fps, displayFps, metrics, error } = useGPUFrameProcessor(camera, (frame) => {
+  const { currentFrame, error } = useGPUFrameProcessor(camera, (frame) => {
     'worklet';
     for (const wgsl of shaderChain) {
-      frame.runShader(wgsl);
-    }
-  });
-
-  useDerivedValue(() => {
-    const m = metrics.value;
-    if (fps.value > 0 && m) {
-      console.log(`[FPS] ${fps.value}fps (display=${displayFps.value}) | lock=${m.lockWait.toFixed(2)}ms import=${m.import.toFixed(2)}ms bind=${m.bindGroup.toFixed(2)}ms compute=${m.compute.toFixed(2)}ms buf=${m.buffers.toFixed(2)}ms skImg=${m.makeImage.toFixed(2)}ms total=${m.total.toFixed(2)}ms wall=${m.wall.toFixed(2)}ms`);
+      // Only request debug buffer for passthrough shader (has @binding(2) debug array)
+      if (wgsl === shaderChain[0] && shaderChain.length === 1 && wgsl.includes('debug')) {
+        frame.runShader(wgsl, { output: Float32Array, count: 20 });
+      } else {
+        frame.runShader(wgsl);
+      }
     }
   });
 
@@ -184,7 +182,7 @@ function HistogramOnFramePreview({ format, colorSpace }: { format?: CameraFormat
     colorSpace,
   });
 
-  const { currentFrame, fps, displayFps, metrics, error } = useGPUFrameProcessor(camera, {
+  const { currentFrame, error } = useGPUFrameProcessor(camera, {
     sync: false,
     pipeline: (frame) => {
       'worklet';
@@ -237,12 +235,6 @@ function HistogramOnFramePreview({ format, colorSpace }: { format?: CameraFormat
     })(),
   });
 
-  useDerivedValue(() => {
-    const m = metrics.value;
-    if (fps.value > 0 && m) {
-      console.log(`[Hist-burn] ${fps.value}fps (display=${displayFps.value}) | lock=${m.lockWait.toFixed(2)}ms import=${m.import.toFixed(2)}ms bind=${m.bindGroup.toFixed(2)}ms compute=${m.compute.toFixed(2)}ms buf=${m.buffers.toFixed(2)}ms skImg=${m.makeImage.toFixed(2)}ms total=${m.total.toFixed(2)}ms wall=${m.wall.toFixed(2)}ms`);
-    }
-  });
 
   return (
     <>
@@ -266,7 +258,6 @@ function HistogramOnFramePreview({ format, colorSpace }: { format?: CameraFormat
 }
 
 function AppleLogPreview({ format, colorSpace, lutResource }: { format?: CameraFormat; colorSpace?: ColorSpace; lutResource: ReturnType<typeof GPUResource.texture3D> | null }) {
-  console.log('[AppleLogPreview] MOUNT, lutResource:', !!lutResource, 'format:', format?.width, 'x', format?.height, 'colorSpace:', colorSpace);
   const { width: screenW, height: screenH } = useWindowDimensions();
 
   const camera = useCamera({
@@ -275,26 +266,16 @@ function AppleLogPreview({ format, colorSpace, lutResource }: { format?: CameraF
     colorSpace,
   });
 
-  // TODO: Enable after native rebuild with .cube parser support
-  // const resources = lutResource ? { lut: lutResource } : undefined;
-  const resources = undefined;
+  const resources = lutResource ? { lut: lutResource } : undefined;
 
-  const { currentFrame, fps, displayFps, metrics, error } = useGPUFrameProcessor(camera, {
+  const { currentFrame, error } = useGPUFrameProcessor(camera, {
     resources,
     pipeline: (frame, res: any) => {
       'worklet';
-      // TODO: Enable after native rebuild with .cube parser support
-      // if (res?.lut) {
-      //   frame.runShader(LUT_WGSL, { inputs: { lut: res.lut } });
-      // }
+      if (res?.lut) {
+        frame.runShader(LUT_WGSL, { inputs: { lut: res.lut } });
+      }
     },
-  });
-
-  useDerivedValue(() => {
-    const m = metrics.value;
-    if (fps.value > 0 && m) {
-      console.log(`[AppleLog] ${fps.value}fps (display=${displayFps.value}) | lock=${m.lockWait.toFixed(2)}ms import=${m.import.toFixed(2)}ms bind=${m.bindGroup.toFixed(2)}ms compute=${m.compute.toFixed(2)}ms buf=${m.buffers.toFixed(2)}ms skImg=${m.makeImage.toFixed(2)}ms total=${m.total.toFixed(2)}ms wall=${m.wall.toFixed(2)}ms`);
-    }
   });
 
   return (
@@ -330,7 +311,6 @@ export default function CameraSpikeScreen() {
     (async () => {
       const [asset] = await Asset.loadAsync(require('../../assets/AppleLogToRec709-v1.0.cube'));
       if (!asset.localUri) return;
-      console.log('[LUT] asset localUri:', asset.localUri);
       setLutResource(GPUResource.texture3D(asset.localUri, {
         width: 0, height: 0, depth: 0,
         format: 'rgba32float',
@@ -399,7 +379,7 @@ export default function CameraSpikeScreen() {
 
         <Pressable
           style={[styles.button, isRunning && styles.buttonActive]}
-          onPress={() => { console.log('[CameraSpikeScreen] toggle isRunning, shader:', shader.name, 'type:', shader.type); setIsRunning(!isRunning); }}
+          onPress={() => setIsRunning(!isRunning)}
         >
           <Text style={styles.buttonText}>{isRunning ? 'Stop' : 'Start Pipeline'}</Text>
         </Pressable>

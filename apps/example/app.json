@@ -13,7 +13,8 @@
         "NSCameraUsageDescription": "Camera access is needed for WebGPU spike validation",
         "ITSAppUsesNonExemptEncryption": false
       },
-      "bundleIdentifier": "com.kbrandwijk.rnwc.example"
+      "bundleIdentifier": "com.kbrandwijk.rnwc.example",
+      "appleTeamId": "595N2Z35V7"
     },
     "android": {
       "permissions": [

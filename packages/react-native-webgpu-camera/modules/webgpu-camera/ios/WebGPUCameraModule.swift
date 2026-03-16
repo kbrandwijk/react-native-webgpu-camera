@@ -441,8 +441,16 @@ private class FrameDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferDeleg
     self.module = module
   }
 
+  private var frameCount: Int = 0
+
   func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
     guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+
+    frameCount += 1
+    if frameCount <= 3 || frameCount % 300 == 0 {
+      let hasBridge = module?.dawnBridge != nil
+      NSLog("[FrameDelegate] frame #%d, module=%d, dawnBridge=%d", frameCount, module != nil ? 1 : 0, hasBridge ? 1 : 0)
+    }
 
     // Run Dawn compute pipeline on the raw CVPixelBuffer (zero-copy via IOSurface)
     module?.dawnBridge?.processFrame(pixelBuffer)
