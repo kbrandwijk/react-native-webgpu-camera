@@ -315,11 +315,12 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
   auto effectiveShaders = wgslShaders;
   if (appleLog) {
-    // Auto-insert YUV→RGB as pass 0 before user shaders
+    // Auto-insert YUV→RGB (with rotation) as pass 0 before user shaders
     effectiveShaders.insert(effectiveShaders.begin(), kYUVtoRGBWGSL);
-  }
-  if (effectiveShaders.empty()) {
-    effectiveShaders.push_back(kPassthroughWGSL);
+  } else {
+    // Auto-insert passthrough (with rotation) as pass 0 for sRGB
+    // Handles BGRA→RGBA conversion + landscape→portrait rotation
+    effectiveShaders.insert(effectiveShaders.begin(), kPassthroughWGSL);
   }
 
   NSLog(@"[DawnPipeline] %zu effective shaders after prepend\n", effectiveShaders.size());

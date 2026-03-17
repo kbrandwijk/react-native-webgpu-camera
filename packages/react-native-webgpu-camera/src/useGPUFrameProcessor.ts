@@ -253,9 +253,9 @@ function buildNativeConfig(
   const shaders = passes.map((p) => p.wgsl);
   const buffers: [number, number, number][] = [];
 
-  // When appleLog is true, the native side prepends a YUV→RGB shader as pass 0,
-  // shifting all user shader indices by +1. Offset all pass indices accordingly.
-  const passOffset = appleLog ? 1 : 0;
+  // The native side always prepends a pass 0 shader (YUV→RGB for Apple Log,
+  // passthrough with rotation for sRGB), shifting all user shader indices by +1.
+  const passOffset = 1;
 
   passes.forEach((pass, passIndex) => {
     if (pass.buffer) {
