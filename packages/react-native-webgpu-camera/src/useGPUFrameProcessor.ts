@@ -38,7 +38,7 @@ interface CapturedInput {
 
 /** A resource spec to send to native for GPU upload */
 interface CapturedResource {
-  type: 'texture3d' | 'texture2d' | 'storageBuffer';
+  type: 'texture3d' | 'texture2d' | 'storageBuffer' | 'cameraDepth';
   data?: ArrayBuffer;
   fileUri?: string;
   width?: number;
@@ -124,11 +124,11 @@ function capturePipeline<B extends Record<string, any>, R extends Record<string,
             const rh = handle as ResourceHandle<any>;
             // Resource from resources block — look up by identity
             const resIndex = handleToIndex.get(handle)!;
-            if (rh.__resourceType === 'texture3d' || rh.__resourceType === 'texture2d') {
+            if (rh.__resourceType === 'texture3d' || rh.__resourceType === 'texture2d' || rh.__resourceType === 'cameraDepth') {
               pass.inputs.push({
                 name,
                 bindingIndex: nextBinding,
-                type: rh.__resourceType,
+                type: rh.__resourceType === 'texture3d' ? 'texture3d' : 'texture2d',
                 resourceHandle: resIndex,
               });
               nextBinding++;
@@ -322,7 +322,9 @@ function buildNativeConfig(
     }
   });
 
-  return { shaders, width, height, buffers, useCanvas, sync, appleLog, resources, passInputs, textureOutputPasses };
+  const useDepth = capturedResources.some((r) => r.type === 'cameraDepth');
+
+  return { shaders, width, height, buffers, useCanvas, sync, appleLog, resources, passInputs, textureOutputPasses, useDepth };
 }
 
 /**
