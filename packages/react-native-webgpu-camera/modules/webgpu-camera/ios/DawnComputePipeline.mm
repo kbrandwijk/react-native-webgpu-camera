@@ -644,13 +644,10 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     canvasTexDesc.label = "CanvasTex";
     _impl->canvasTex = _impl->device.CreateTexture(&canvasTexDesc);
 
-    auto tempSurface = ctx.MakeOffscreen(1, 1);
-    auto* recorder = tempSurface->recorder();
-
     auto backendTex = skgpu::graphite::BackendTextures::MakeDawn(
       _impl->canvasTex.Get());
     _impl->surface = SkSurfaces::WrapBackendTexture(
-      recorder, backendTex,
+      ctx.getRecorder(), backendTex,
       kRGBA_F16_SkColorType, nullptr, nullptr);
   }
 
