@@ -603,8 +603,11 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
       _impl->passInputBindings[piSpec.passIndex] = piSpec.bindings;
       // Check if any binding references a dynamic resource (e.g. cameraDepth)
       for (const auto& b : piSpec.bindings) {
+        NSLog(@"[DawnPipeline] passInput binding: passIndex=%d, bindingIndex=%d, resourceHandle=%d, depthResourceIndex=%d\n",
+              piSpec.passIndex, b.bindingIndex, b.resourceHandle, _impl->depthResourceIndex);
         if (b.resourceHandle >= 0 && b.resourceHandle == _impl->depthResourceIndex) {
           _impl->passes[piSpec.passIndex].hasDynamicInputs = true;
+          NSLog(@"[DawnPipeline] Pass %d marked as hasDynamicInputs\n", piSpec.passIndex);
           break;
         }
       }
@@ -1097,6 +1100,10 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
       bgDesc.entryCount = entries.size();
       bgDesc.entries = entries.data();
       bindGroup = device.CreateBindGroup(&bgDesc);
+      if (!bindGroup) {
+        // Dynamic input not available yet (e.g. depth not arrived) — skip this pass
+        continue;
+      }
     } else {
       // Passes 1+: cached bind group (static ping-pong textures)
       bindGroup = pass.cachedBindGroup;
