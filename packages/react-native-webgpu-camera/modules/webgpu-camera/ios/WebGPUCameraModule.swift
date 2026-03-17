@@ -14,6 +14,7 @@ public class WebGPUCameraModule: Module {
   private var computeSetup = false
   var isAppleLog = false
   var isHDR = false  // true for appleLog OR hlgBT2020 — both deliver 10-bit YUV
+  var isYUV422 = false  // true when camera delivers 4:2:2 (x422) instead of 4:2:0 (x420)
 
   /// Stored AVCaptureDevice.Format arrays, keyed by device position.
   /// Rebuilt on each getFormats() call. nativeHandle indexes into these.
@@ -211,6 +212,7 @@ public class WebGPUCameraModule: Module {
       NSLog("[WebGPUCamera] startCapture: step 1 — creating session")
       let session = AVCaptureSession()
       session.sessionPreset = .inputPriority
+      session.automaticallyConfiguresCaptureDeviceForWideColor = false
 
       let position: AVCaptureDevice.Position = deviceId == "front" ? .front : .back
       NSLog("[WebGPUCamera] startCapture: step 2 — getting camera device (position=\(position.rawValue))")
@@ -319,21 +321,26 @@ public class WebGPUCameraModule: Module {
       let availableHex = available.map { String(format: "0x%08x", $0) }
       NSLog("[WebGPUCamera] startCapture: step 10a — availableVideoPixelFormatTypes: \(availableHex)")
       if self.isHDR {
-        let videoRange = OSType(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
-        let fullRange = OSType(kCVPixelFormatType_420YpCbCr10BiPlanarFullRange)
+        // Prefer 4:2:2 (x422) — matches camera native format, Blackmagic uses this.
+        // Must disable automaticallyConfiguresCaptureDeviceForWideColor to preserve Apple Log.
+        let vr422 = OSType(kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange)
+        let vr420 = OSType(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
 
         let chosen: OSType
-        if available.contains(videoRange) {
-          chosen = videoRange
-          NSLog("[WebGPUCamera] startCapture: step 10b — using 10-bit YUV VideoRange")
-        } else if available.contains(fullRange) {
-          chosen = fullRange
-          NSLog("[WebGPUCamera] startCapture: step 10b — using 10-bit YUV FullRange (WARNING: Dawn may not import this)")
+        if available.contains(vr422) {
+          chosen = vr422
+          self.isYUV422 = true
+          NSLog("[WebGPUCamera] startCapture: step 10b — using 10-bit YUV 4:2:2 VideoRange (x422)")
+        } else if available.contains(vr420) {
+          chosen = vr420
+          self.isYUV422 = false
+          NSLog("[WebGPUCamera] startCapture: step 10b — using 10-bit YUV 4:2:0 VideoRange (x420)")
         } else {
           NSLog("[WebGPUCamera] startCapture: step 10b — NO 10-bit YUV format available, falling back to BGRA")
           chosen = OSType(kCVPixelFormatType_32BGRA)
           self.isHDR = false
           self.isAppleLog = false
+          self.isYUV422 = false
         }
         output.videoSettings = [
           kCVPixelBufferPixelFormatTypeKey as String: chosen
@@ -450,6 +457,18 @@ private class FrameDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferDeleg
     if frameCount <= 3 || frameCount % 300 == 0 {
       let hasBridge = module?.dawnBridge != nil
       NSLog("[FrameDelegate] frame #%d, module=%d, dawnBridge=%d", frameCount, module != nil ? 1 : 0, hasBridge ? 1 : 0)
+    }
+    if frameCount == 1 {
+      // Log CMFormatDescription extensions — may differ from CVPixelBuffer attachments
+      let fd = CMSampleBufferGetFormatDescription(sampleBuffer)
+      if let fd = fd {
+        let exts = CMFormatDescriptionGetExtensions(fd) as? [String: Any]
+        let tf = exts?[kCMFormatDescriptionExtension_TransferFunction as String]
+        let matrix = exts?[kCMFormatDescriptionExtension_YCbCrMatrix as String]
+        let primaries = exts?[kCMFormatDescriptionExtension_ColorPrimaries as String]
+        NSLog("[FrameDelegate] CMFormatDesc transfer=%@ matrix=%@ primaries=%@",
+              tf as? String ?? "(none)", matrix as? String ?? "(none)", primaries as? String ?? "(none)")
+      }
     }
 
     // Run Dawn compute pipeline on the raw CVPixelBuffer (zero-copy via IOSurface)

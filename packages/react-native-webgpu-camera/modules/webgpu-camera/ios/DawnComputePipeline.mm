@@ -223,7 +223,6 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   // Built-in YUV→RGB shader for Apple Log mode.
   // Converts 10-bit video range YCbCr (BT.2020) to Apple Log encoded RGB.
   // YUV unpack for Apple Log — recovers Apple Log encoded R'G'B' from 10-bit YCbCr.
-  // Apple Log uses full-range encoding despite kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange.
   // Output is Apple Log encoded RGB — the flat/washed-out look that viewing LUTs expect.
   static const std::string kYUVtoRGBWGSL = R"(
 @group(0) @binding(0) var yPlaneTex: texture_2d<f32>;
@@ -236,18 +235,26 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   if (id.x >= dims.x || id.y >= dims.y) { return; }
 
   let coord = vec2i(id.xy);
-  let uvCoord = vec2i(id.xy / 2u);
 
-  // Load normalized [0,1] values from R16Unorm/RG16Unorm planes
+  // Derive UV coord from plane dimensions — works for both 4:2:0 and 4:2:2
+  // 4:2:0: UV is half-width, half-height → id.xy / 2
+  // 4:2:2: UV is half-width, full-height → (id.x / 2, id.y)
+  let uvDims = textureDimensions(uvPlaneTex);
+  let yDims = textureDimensions(yPlaneTex);
+  let uvCoord = vec2i(vec2u(
+    id.x * uvDims.x / yDims.x,
+    id.y * uvDims.y / yDims.y
+  ));
+
   let yRaw = textureLoad(yPlaneTex, coord, 0).r;
   let uvRaw = textureLoad(uvPlaneTex, uvCoord, 0).rg;
 
-  // Full range: Y is [0,1], CbCr is [0,1] centered at 0.5
-  let y = yRaw;
-  let cb = uvRaw.r - 0.5;
-  let cr = uvRaw.g - 0.5;
+  // Video range expansion (10-bit: Y [64..940]/1023, CbCr [64..960]/1023)
+  let y = (yRaw - 0.06256) / (0.91887 - 0.06256);
+  let cb = (uvRaw.r - 0.06256) / (0.93842 - 0.06256) - 0.5;
+  let cr = (uvRaw.g - 0.06256) / (0.93842 - 0.06256) - 0.5;
 
-  // BT.2020 YCbCr -> R'G'B' (recovers Apple Log encoded RGB)
+  // BT.2020 YCbCr -> R'G'B' (Apple Log encoded)
   let r = y + 1.4746 * cr;
   let g = y - 0.16455 * cb - 0.57135 * cr;
   let b = y + 1.8814 * cb;
@@ -274,9 +281,10 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   if (appleLog) {
     bool hasMultiPlanar = _impl->device.HasFeature(wgpu::FeatureName::DawnMultiPlanarFormats);
     bool hasP010 = _impl->device.HasFeature(wgpu::FeatureName::MultiPlanarFormatP010);
+    bool hasP210 = _impl->device.HasFeature(wgpu::FeatureName::MultiPlanarFormatP210);
     bool hasExtUsages = _impl->device.HasFeature(wgpu::FeatureName::MultiPlanarFormatExtendedUsages);
-    NSLog(@"[DawnPipeline] Dawn features: DawnMultiPlanarFormats=%d, MultiPlanarFormatP010=%d, MultiPlanarFormatExtendedUsages=%d\n",
-           hasMultiPlanar, hasP010, hasExtUsages);
+    NSLog(@"[DawnPipeline] Dawn features: MultiPlanar=%d, P010=%d, P210=%d, ExtUsages=%d\n",
+           hasMultiPlanar, hasP010, hasP210, hasExtUsages);
   }
 
   // Compile shader passes
@@ -434,9 +442,36 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     if (spec.type == ResourceType::Texture3D || spec.type == ResourceType::Texture2D) {
       wgpu::TextureFormat texFmt;
       int bytesPerPixel;
+      // Use RGBA16Float for LUTs — RGBA32Float is not filterable in WebGPU,
+      // so textureSampleLevel with a linear sampler would return zeros.
+      // Convert float32 → float16 on upload. Precision loss is negligible for LUTs.
+      std::vector<uint8_t> f16Data;
       if (spec.format == ResourceFormat::RGBA32Float) {
-        texFmt = wgpu::TextureFormat::RGBA32Float;
-        bytesPerPixel = 16;  // 4 floats × 4 bytes
+        texFmt = wgpu::TextureFormat::RGBA16Float;
+        bytesPerPixel = 8;  // 4 halfs × 2 bytes
+        // Convert float32 data to float16
+        size_t floatCount = spec.data.size() / sizeof(float);
+        f16Data.resize(floatCount * sizeof(uint16_t));
+        const float *src = reinterpret_cast<const float *>(spec.data.data());
+        uint16_t *dst = reinterpret_cast<uint16_t *>(f16Data.data());
+        for (size_t i = 0; i < floatCount; i++) {
+          // IEEE 754 float32 to float16 conversion
+          uint32_t f32;
+          memcpy(&f32, &src[i], 4);
+          uint32_t sign = (f32 >> 16) & 0x8000;
+          int32_t exponent = ((f32 >> 23) & 0xFF) - 127 + 15;
+          uint32_t mantissa = (f32 >> 13) & 0x3FF;
+          if (exponent <= 0) {
+            dst[i] = (uint16_t)sign; // flush to zero
+          } else if (exponent >= 31) {
+            dst[i] = (uint16_t)(sign | 0x7C00); // infinity
+          } else {
+            dst[i] = (uint16_t)(sign | (exponent << 10) | mantissa);
+          }
+        }
+        // Replace spec data with f16 data for upload
+        spec.data = std::move(f16Data);
+        NSLog(@"[DawnPipeline] Converted LUT from RGBA32Float to RGBA16Float (%zu bytes)\n", spec.data.size());
       } else {
         texFmt = wgpu::TextureFormat::RGBA8Unorm;
         bytesPerPixel = 4;
@@ -647,6 +682,73 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   IOSurfaceRef ioSurface = CVPixelBufferGetIOSurface(pixelBuffer);
   if (!ioSurface) return false;
 
+  // CPU-side debug: read raw 10-bit Y/UV values from the CVPixelBuffer
+  if (impl->appleLog) {
+    static int debugCount = 0;
+    if (debugCount < 5) {
+      // Log the color space attached to this pixel buffer
+      CFTypeRef csAttachment = CVBufferCopyAttachment(pixelBuffer, kCVImageBufferCGColorSpaceKey, nullptr);
+      if (csAttachment) {
+        CGColorSpaceRef cs = (CGColorSpaceRef)csAttachment;
+        CFStringRef csName = CGColorSpaceCopyName(cs);
+        NSLog(@"[DawnPipeline] CVPixelBuffer colorSpace: %@", (__bridge NSString *)csName);
+        if (csName) CFRelease(csName);
+        CFRelease(csAttachment);
+      } else {
+        NSLog(@"[DawnPipeline] CVPixelBuffer colorSpace: (none attached)");
+      }
+
+      // Also check transfer function and matrix
+      CFTypeRef tf = CVBufferCopyAttachment(pixelBuffer, kCVImageBufferTransferFunctionKey, nullptr);
+      CFTypeRef matrix = CVBufferCopyAttachment(pixelBuffer, kCVImageBufferYCbCrMatrixKey, nullptr);
+      CFTypeRef primaries = CVBufferCopyAttachment(pixelBuffer, kCVImageBufferColorPrimariesKey, nullptr);
+      NSLog(@"[DawnPipeline] CVPixelBuffer transfer=%@, matrix=%@, primaries=%@",
+            tf ? (__bridge NSString *)tf : @"(none)",
+            matrix ? (__bridge NSString *)matrix : @"(none)",
+            primaries ? (__bridge NSString *)primaries : @"(none)");
+      if (tf) CFRelease(tf);
+      if (matrix) CFRelease(matrix);
+      if (primaries) CFRelease(primaries);
+
+      CVPixelBufferLockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
+
+      // Plane 0: Y (16-bit per pixel, only top 10 bits used)
+      uint16_t *yPlane = (uint16_t *)CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0);
+      size_t yBpr = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0) / sizeof(uint16_t);
+      size_t yW = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0);
+      size_t yH = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0);
+
+      // Plane 1: UV interleaved (16-bit per component, half res)
+      uint16_t *uvPlane = (uint16_t *)CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1);
+      size_t uvBpr = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1) / sizeof(uint16_t);
+      size_t uvW = CVPixelBufferGetWidthOfPlane(pixelBuffer, 1);
+      size_t uvH = CVPixelBufferGetHeightOfPlane(pixelBuffer, 1);
+
+      // Sample center pixel
+      size_t cx = yW / 2, cy = yH / 2;
+      uint16_t yVal = yPlane[cy * yBpr + cx];
+      uint16_t cbVal = uvPlane[(cy / 2) * uvBpr + (cx / 2) * 2];
+      uint16_t crVal = uvPlane[(cy / 2) * uvBpr + (cx / 2) * 2 + 1];
+
+      // 10-bit values are in upper 10 bits: shift right by 6
+      NSLog(@"[DawnPipeline] CPU RAW center: Y16=%u (10bit=%u, norm=%.4f) Cb16=%u (10bit=%u, norm=%.4f) Cr16=%u (10bit=%u, norm=%.4f) | Y plane %zux%zu bpr=%zu, UV plane %zux%zu bpr=%zu",
+            yVal, yVal >> 6, yVal / 65535.0,
+            cbVal, cbVal >> 6, cbVal / 65535.0,
+            crVal, crVal >> 6, crVal / 65535.0,
+            yW, yH, yBpr, uvW, uvH, uvBpr);
+
+      // Sample a few more points
+      uint16_t tlY = yPlane[100 * yBpr + 100];
+      uint16_t brY = yPlane[(yH - 100) * yBpr + (yW - 100)];
+      NSLog(@"[DawnPipeline] CPU RAW TL: Y16=%u (10bit=%u, norm=%.4f) BR: Y16=%u (10bit=%u, norm=%.4f)",
+            tlY, tlY >> 6, tlY / 65535.0,
+            brY, brY >> 6, brY / 65535.0);
+
+      CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
+      debugCount++;
+    }
+  }
+
   wgpu::SharedTextureMemoryIOSurfaceDescriptor ioDesc{};
   ioDesc.ioSurface = ioSurface;
 
@@ -665,20 +767,28 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   wgpu::TextureView uvPlaneView;  // only used in appleLog mode
 
   if (impl->appleLog) {
+    // Detect 4:2:2 vs 4:2:0 from pixel buffer format
+    OSType pixFmt = CVPixelBufferGetPixelFormatType(pixelBuffer);
+    bool is422 = (pixFmt == kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange ||
+                  pixFmt == kCVPixelFormatType_422YpCbCr10BiPlanarFullRange);
+
     static bool loggedFirst = false;
     if (!loggedFirst) {
-      NSLog(@"[DawnPipeline] processFrame: Apple Log path, importing %dx%d YUV IOSurface\n", _width, _height);
+      NSLog(@"[DawnPipeline] processFrame: Apple Log path, importing %dx%d YUV IOSurface (4:2:%s)\n",
+            _width, _height, is422 ? "2" : "0");
     }
 
-    // Import as multi-planar 10-bit YUV
+    // Import as multi-planar 10-bit YUV (4:2:2 or 4:2:0)
     wgpu::TextureDescriptor inputTexDesc{};
     inputTexDesc.size = {(uint32_t)_width, (uint32_t)_height, 1};
-    inputTexDesc.format = wgpu::TextureFormat::R10X6BG10X6Biplanar420Unorm;
+    inputTexDesc.format = is422
+      ? wgpu::TextureFormat::R10X6BG10X6Biplanar422Unorm
+      : wgpu::TextureFormat::R10X6BG10X6Biplanar420Unorm;
     inputTexDesc.usage = wgpu::TextureUsage::TextureBinding;
     inputTexDesc.dimension = wgpu::TextureDimension::e2D;
     inputTexDesc.mipLevelCount = 1;
     inputTexDesc.sampleCount = 1;
-    inputTexDesc.label = "CameraInputYUV";
+    inputTexDesc.label = is422 ? "CameraInputYUV422" : "CameraInputYUV420";
 
     inputTexture = sharedMemory.CreateTexture(&inputTexDesc);
     if (!inputTexture) {
