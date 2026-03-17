@@ -194,7 +194,7 @@ public class WebGPUCameraModule: Module {
 
         // If depth was requested but capture session started without it, restart the session
         if useDepth && self.captureSession != nil && self.depthOutput == nil {
-          NSLog("[WebGPUCamera] setupMultiPassPipeline: restarting capture session to add depth output")
+          NSLog("[WebGPUCamera] setupMultiPassPipeline: adding depth output to running session")
           let session = self.captureSession!
           self.sessionQueue.async {
             session.beginConfiguration()
@@ -205,26 +205,26 @@ public class WebGPUCameraModule: Module {
             if session.canAddOutput(depthOut) {
               session.addOutput(depthOut)
               self.depthOutput = depthOut
-
-              // Find the existing video output
-              if let videoOut = self.dataOutput {
-                // Remove individual video delegate — synchronizer takes over
-                videoOut.setSampleBufferDelegate(nil, queue: nil)
-                self.frameDelegate = nil
-
-                let syncDel = SynchronizedFrameDelegate(videoOutput: videoOut, depthOutput: depthOut, module: self)
-                self.syncDelegate = syncDel
-                let dataSynchronizer = AVCaptureDataOutputSynchronizer(dataOutputs: [videoOut, depthOut])
-                dataSynchronizer.setDelegate(syncDel, queue: self.frameQueue)
-                self.synchronizer = dataSynchronizer
-
-                NSLog("[WebGPUCamera] depth output added to running session, synchronizer configured")
-              }
             } else {
               NSLog("[WebGPUCamera] WARNING: could not add depth output to running session")
             }
 
             session.commitConfiguration()
+
+            // Create synchronizer AFTER commitConfiguration — outputs need valid connections
+            if let videoOut = self.dataOutput, let depthOut = self.depthOutput {
+              // Remove individual video delegate — synchronizer takes over
+              videoOut.setSampleBufferDelegate(nil, queue: nil)
+              self.frameDelegate = nil
+
+              let syncDel = SynchronizedFrameDelegate(videoOutput: videoOut, depthOutput: depthOut, module: self)
+              self.syncDelegate = syncDel
+              let dataSynchronizer = AVCaptureDataOutputSynchronizer(dataOutputs: [videoOut, depthOut])
+              dataSynchronizer.setDelegate(syncDel, queue: self.frameQueue)
+              self.synchronizer = dataSynchronizer
+
+              NSLog("[WebGPUCamera] depth synchronizer configured on running session")
+            }
           }
         }
       } else {
