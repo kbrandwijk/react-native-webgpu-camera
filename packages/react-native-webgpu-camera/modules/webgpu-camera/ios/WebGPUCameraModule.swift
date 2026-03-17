@@ -50,11 +50,16 @@ public class WebGPUCameraModule: Module {
     Function("getFormats") { (deviceId: String) -> [[String: Any]] in
         let position: AVCaptureDevice.Position = deviceId == "front" ? .front : .back
 
-        guard let camera = AVCaptureDevice.default(
-            .builtInWideAngleCamera,
-            for: .video,
-            position: position
-        ) else {
+        // Try LiDAR depth camera first (has both video + depth formats),
+        // fall back to wide angle
+        var camera: AVCaptureDevice?
+        if #available(iOS 15.4, *) {
+          camera = AVCaptureDevice.default(.builtInLiDARDepthCamera, for: .video, position: position)
+        }
+        if camera == nil {
+          camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position)
+        }
+        guard let camera = camera else {
             return []
         }
 
@@ -117,6 +122,7 @@ public class WebGPUCameraModule: Module {
                 "fieldOfView": format.videoFieldOfView,
                 "isBinned": format.isVideoBinned,
                 "isMultiCamSupported": format.isMultiCamSupported,
+                "supportsDepth": !format.supportedDepthDataFormats.isEmpty,
                 "nativeHandle": index,
             ] as [String: Any]
         }
@@ -197,16 +203,40 @@ public class WebGPUCameraModule: Module {
         }
         print("[WebGPUCamera] Multi-pass pipeline setup OK: \(shaders.count) passes, \(width)x\(height), useDepth=\(useDepth)")
 
-        // If depth was requested but capture session started without it, restart the session
-        // If depth was requested but session started without it (wrong device),
-        // restart the entire capture with the LiDAR depth camera
+        // If depth was requested but capture session started without it,
+        // add depth output to the running session (device is already LiDAR)
         if useDepth && self.captureSession != nil && self.depthOutput == nil {
-          NSLog("[WebGPUCamera] setupMultiPassPipeline: restarting capture with LiDAR device for depth")
-          let savedDevice = self.lastDeviceId ?? "back"
-          let savedColorSpace = self.lastColorSpace ?? "sRGB"
-          self.stopCapture()
-          // Use default format (-1) — LiDAR device has different formats than wide angle
-          self.startCapture(deviceId: savedDevice, nativeHandle: -1, colorSpace: savedColorSpace)
+          NSLog("[WebGPUCamera] setupMultiPassPipeline: adding depth output to running session")
+          let session = self.captureSession!
+          self.sessionQueue.async {
+            session.beginConfiguration()
+
+            let depthOut = AVCaptureDepthDataOutput()
+            depthOut.isFilteringEnabled = true
+            depthOut.alwaysDiscardsLateDepthData = true
+            if session.canAddOutput(depthOut) {
+              session.addOutput(depthOut)
+              self.depthOutput = depthOut
+              NSLog("[WebGPUCamera] depth output added to session")
+            } else {
+              NSLog("[WebGPUCamera] WARNING: could not add depth output")
+            }
+
+            session.commitConfiguration()
+
+            // Create synchronizer after commitConfiguration
+            if let videoOut = self.dataOutput, let depthOut = self.depthOutput {
+              videoOut.setSampleBufferDelegate(nil, queue: nil)
+              self.frameDelegate = nil
+
+              let syncDel = SynchronizedFrameDelegate(videoOutput: videoOut, depthOutput: depthOut, module: self)
+              self.syncDelegate = syncDel
+              let dataSynchronizer = AVCaptureDataOutputSynchronizer(dataOutputs: [videoOut, depthOut])
+              dataSynchronizer.setDelegate(syncDel, queue: self.frameQueue)
+              self.synchronizer = dataSynchronizer
+              NSLog("[WebGPUCamera] depth synchronizer configured")
+            }
+          }
         }
       } else {
         print("[WebGPUCamera] Multi-pass pipeline setup FAILED")
@@ -246,20 +276,18 @@ public class WebGPUCameraModule: Module {
       let position: AVCaptureDevice.Position = deviceId == "front" ? .front : .back
       NSLog("[WebGPUCamera] startCapture: step 2 — getting camera device (position=\(position.rawValue))")
 
-      // When depth is requested, use LiDAR depth camera (provides video + depth).
+      // Prefer LiDAR depth camera (supports both video + depth, same formats).
       // Fall back to wide angle if LiDAR not available.
       var camera: AVCaptureDevice?
-      if self.useDepth {
-        if #available(iOS 15.4, *) {
-          camera = AVCaptureDevice.default(.builtInLiDARDepthCamera, for: .video, position: position)
-        }
-        if camera == nil {
+      if #available(iOS 15.4, *) {
+        camera = AVCaptureDevice.default(.builtInLiDARDepthCamera, for: .video, position: position)
+      }
+      if camera == nil {
+        camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position)
+        if self.useDepth {
           NSLog("[WebGPUCamera] WARNING: LiDAR not available, depth will not work")
           self.useDepth = false
-          camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position)
         }
-      } else {
-        camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position)
       }
       guard let camera = camera else {
         NSLog("[WebGPUCamera] No camera found for position: \(deviceId)")

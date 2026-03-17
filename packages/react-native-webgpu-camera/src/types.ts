@@ -39,6 +39,7 @@ export interface CameraFormat {
   fieldOfView: number;
   isBinned: boolean;
   isMultiCamSupported: boolean;
+  supportsDepth: boolean;
   /** Opaque index into native format array — pass back to useCamera */
   nativeHandle: number;
 }
