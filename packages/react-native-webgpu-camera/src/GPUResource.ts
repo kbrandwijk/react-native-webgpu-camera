@@ -44,6 +44,13 @@ function texture2DResource(
   };
 }
 
+function cameraDepth(): ResourceHandle<'cameraDepth'> {
+  return {
+    __resourceType: 'cameraDepth',
+    __handle: -1,
+  };
+}
+
 function storageBuffer(data: ArrayBuffer): ResourceHandle<'storageBuffer'> {
   return {
     __resourceType: 'storageBuffer',
@@ -71,6 +78,7 @@ export const GPUResource = {
     readonly __outputType: 'texture2d';
   },
   storageBuffer,
+  cameraDepth,
 };
 
 /** Type guard: is this a ResourceHandle? */
