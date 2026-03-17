@@ -43,6 +43,7 @@ struct PassState {
   bool hasOutputBuffer = false;
   int bufferIndex = -1;
   bool hasTextureOutput = false;
+  bool hasDynamicInputs = false;  // true if pass references per-frame resources (e.g. depth)
 };
 
 struct DawnComputePipeline::Impl {
@@ -600,6 +601,13 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
            piSpec.passIndex, piSpec.bindings.size());
     if (piSpec.passIndex >= 0 && piSpec.passIndex < (int)_impl->passes.size()) {
       _impl->passInputBindings[piSpec.passIndex] = piSpec.bindings;
+      // Check if any binding references a dynamic resource (e.g. cameraDepth)
+      for (const auto& b : piSpec.bindings) {
+        if (b.resourceHandle >= 0 && b.resourceHandle == _impl->depthResourceIndex) {
+          _impl->passes[piSpec.passIndex].hasDynamicInputs = true;
+          break;
+        }
+      }
     } else {
       NSLog(@"[DawnPipeline] WARNING: passInput passIndex %d out of range (0..%zu)\n",
              piSpec.passIndex, _impl->passes.size() - 1);
@@ -626,9 +634,17 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
   // Cache bind groups for passes 1+ (static ping-pong textures).
   // Pass 0 reads from the camera input which changes every frame — can't cache.
+  // Passes with dynamic inputs (e.g. depth) also can't be cached.
   NSLog(@"[DawnPipeline] Caching bind groups for passes 1..%zu\n", _impl->passes.size() - 1);
   for (size_t i = 1; i < _impl->passes.size(); i++) {
     auto& pass = _impl->passes[i];
+
+    // Skip caching for passes with dynamic inputs — built per-frame in processFrame
+    if (pass.hasDynamicInputs) {
+      NSLog(@"[DawnPipeline] Pass %zu has dynamic inputs — skipping cache (built per-frame)\n", i);
+      continue;
+    }
+
     // Pass i reads from the output of pass i-1, writes to the next ping-pong texture.
     // Odd passes read texA write texB, even passes read texB write texA.
     bool readFromA = (i % 2 != 0);
@@ -1048,6 +1064,39 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
         NSLog(@"[DawnPipeline] FAILED to create bind group for pass 0\n");
         return false;
       }
+    } else if (pass.hasDynamicInputs) {
+      // Passes with dynamic inputs (e.g. depth): rebuild bind group every frame
+      bool readFromA = (i % 2 != 0);
+      wgpu::Texture& readTex = readFromA ? impl->texA : impl->texB;
+      wgpu::Texture& writeTex = readFromA ? impl->texB : impl->texA;
+
+      std::vector<wgpu::BindGroupEntry> entries;
+      wgpu::BindGroupEntry entry0{};
+      entry0.binding = 0;
+      entry0.textureView = readTex.CreateView();
+      entries.push_back(entry0);
+
+      wgpu::BindGroupEntry entry1{};
+      entry1.binding = 1;
+      entry1.textureView = writeTex.CreateView();
+      entries.push_back(entry1);
+
+      if (pass.hasOutputBuffer && pass.bufferIndex >= 0) {
+        auto& sb = impl->buffers[pass.bufferIndex];
+        wgpu::BindGroupEntry entry2{};
+        entry2.binding = 2;
+        entry2.buffer = sb.gpuBuffer;
+        entry2.size = sb.byteSize;
+        entries.push_back(entry2);
+      }
+
+      impl->appendCustomInputEntries((int)i, entries);
+
+      wgpu::BindGroupDescriptor bgDesc{};
+      bgDesc.layout = pass.bindGroupLayout;
+      bgDesc.entryCount = entries.size();
+      bgDesc.entries = entries.data();
+      bindGroup = device.CreateBindGroup(&bgDesc);
     } else {
       // Passes 1+: cached bind group (static ping-pong textures)
       bindGroup = pass.cachedBindGroup;
