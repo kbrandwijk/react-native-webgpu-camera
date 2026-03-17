@@ -19,13 +19,15 @@ import { SOBEL_WGSL } from '@/shaders/sobel.wgsl';
 import { SOBEL_COLOR_WGSL } from '@/shaders/sobel-color.wgsl';
 import { HISTOGRAM_WGSL } from '@/shaders/histogram.wgsl';
 import { LUT_WGSL } from '@/shaders/lut.wgsl';
+import { DEPTH_COLORMAP_WGSL } from '@/shaders/depth-colormap.wgsl';
 import DepthEstimation from '@/components/DepthEstimation';
 
 type ShaderMode =
   | { name: string; wgsl: readonly string[]; type: 'simple' }
   | { name: string; type: 'histogram' }
   | { name: string; type: 'histogram-onframe' }
-  | { name: string; type: 'applelog' };
+  | { name: string; type: 'applelog' }
+  | { name: string; type: 'depth' };
 
 const SHADERS: ShaderMode[] = [
   { name: 'None', wgsl: [], type: 'simple' },
@@ -36,6 +38,7 @@ const SHADERS: ShaderMode[] = [
   { name: 'Histogram', type: 'histogram' },
   { name: 'Hist (burn)', type: 'histogram-onframe' },
   { name: 'LUT', type: 'applelog' },
+  { name: 'Depth', type: 'depth' },
 ];
 
 function CameraPreview({ shaderChain, format, colorSpace }: { shaderChain: readonly string[]; format?: CameraFormat; colorSpace?: ColorSpace }) {
@@ -293,6 +296,41 @@ function AppleLogPreview({ format, colorSpace, lutResource }: { format?: CameraF
   );
 }
 
+function DepthPreview({ format, colorSpace }: { format?: CameraFormat; colorSpace?: ColorSpace }) {
+  const { width: screenW, height: screenH } = useWindowDimensions();
+
+  const camera = useCamera({
+    device: 'back',
+    format,
+    colorSpace,
+  });
+
+  const { currentFrame, error } = useGPUFrameProcessor(camera, {
+    resources: {
+      depth: GPUResource.cameraDepth(),
+    },
+    pipeline: (frame, res: any) => {
+      'worklet';
+      frame.runShader(DEPTH_COLORMAP_WGSL, { inputs: { depth: res.depth } });
+    },
+  });
+
+  return (
+    <>
+      <Canvas style={StyleSheet.absoluteFill}>
+        <Fill color="black" />
+        <SkImage image={currentFrame} x={0} y={0} width={screenW} height={screenH} fit="cover" />
+      </Canvas>
+
+      <View style={styles.statusBar}>
+        <Text style={styles.statusText}>
+          {error ? `Error: ${error}` : camera.isReady ? `Depth ${camera.width}x${camera.height}` : 'Starting camera...'}
+        </Text>
+      </View>
+    </>
+  );
+}
+
 export default function CameraSpikeScreen() {
   const [isRunning, setIsRunning] = useState(false);
   const [shaderIndex, setShaderIndex] = useState(0);
@@ -351,6 +389,7 @@ export default function CameraSpikeScreen() {
       {isRunning && shader.type === 'histogram-onframe' && <HistogramOnFramePreview key={`${shader.name}-${selectedColorSpace}`} format={selectedFormat} colorSpace={selectedColorSpace} />}
       {isRunning && shader.type === 'simple' && <CameraPreview key={`${shader.name}-${selectedColorSpace}`} shaderChain={shader.wgsl} format={selectedFormat} colorSpace={selectedColorSpace} />}
       {isRunning && shader.type === 'applelog' && <AppleLogPreview key={`${shader.name}-${selectedColorSpace}`} format={selectedFormat} colorSpace={selectedColorSpace} lutResource={lutResource} />}
+      {isRunning && shader.type === 'depth' && <DepthPreview key={`${shader.name}-${selectedColorSpace}`} format={selectedFormat} colorSpace={selectedColorSpace} />}
 
       <View style={styles.controls}>
         {isRunning && (
