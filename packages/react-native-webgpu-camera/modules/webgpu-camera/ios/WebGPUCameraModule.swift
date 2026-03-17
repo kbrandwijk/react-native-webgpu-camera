@@ -248,25 +248,22 @@ public class WebGPUCameraModule: Module {
 
       // When depth is requested, use LiDAR depth camera (provides video + depth).
       // Fall back to wide angle if LiDAR not available.
-      let deviceType: AVCaptureDevice.DeviceType = self.useDepth
-        ? .builtInLiDARDepthCamera
-        : .builtInWideAngleCamera
-
-      guard let camera = AVCaptureDevice.default(
-        deviceType,
-        for: .video,
-        position: position
-      ) ?? (self.useDepth ? AVCaptureDevice.default(
-        .builtInWideAngleCamera,
-        for: .video,
-        position: position
-      ) : nil) else {
+      var camera: AVCaptureDevice?
+      if self.useDepth {
+        if #available(iOS 15.4, *) {
+          camera = AVCaptureDevice.default(.builtInLiDARDepthCamera, for: .video, position: position)
+        }
+        if camera == nil {
+          NSLog("[WebGPUCamera] WARNING: LiDAR not available, depth will not work")
+          self.useDepth = false
+          camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position)
+        }
+      } else {
+        camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position)
+      }
+      guard let camera = camera else {
         NSLog("[WebGPUCamera] No camera found for position: \(deviceId)")
         return
-      }
-      if self.useDepth && camera.deviceType != .builtInLiDARDepthCamera {
-        NSLog("[WebGPUCamera] WARNING: LiDAR not available, depth will not work")
-        self.useDepth = false
       }
       NSLog("[WebGPUCamera] startCapture: step 3 — creating input")
 
