@@ -226,9 +226,9 @@ bool DawnComputePipeline::setup(
   // lifetime management — IOSurface texture is freed when processFrame returns.
   // For now, always use the compute path with auto-inserted passthrough shader.
 
-  // Create ping-pong textures
+  // Create ping-pong textures (portrait dimensions — rotation done in pass 0)
   wgpu::TextureDescriptor texDesc{};
-  texDesc.size = {(uint32_t)width, (uint32_t)height, 1};
+  texDesc.size = {(uint32_t)_width, (uint32_t)_height, 1};
   texDesc.format = wgpu::TextureFormat::RGBA16Float;
   texDesc.usage = wgpu::TextureUsage::StorageBinding |
                   wgpu::TextureUsage::TextureBinding |
@@ -612,7 +612,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
       _impl->passes[passIdx].hasTextureOutput = true;
 
       wgpu::TextureDescriptor texOutDesc{};
-      texOutDesc.size = {(uint32_t)width, (uint32_t)height, 1};
+      texOutDesc.size = {(uint32_t)_width, (uint32_t)_height, 1};
       texOutDesc.format = wgpu::TextureFormat::RGBA16Float;
       texOutDesc.usage = wgpu::TextureUsage::StorageBinding | wgpu::TextureUsage::TextureBinding;
       texOutDesc.dimension = wgpu::TextureDimension::e2D;
@@ -685,7 +685,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   // processFrame writes to finalTex; Skia draws go on canvasTex to avoid races.
   if (useCanvas) {
     wgpu::TextureDescriptor canvasTexDesc{};
-    canvasTexDesc.size = {(uint32_t)width, (uint32_t)height, 1};
+    canvasTexDesc.size = {(uint32_t)_width, (uint32_t)_height, 1};
     canvasTexDesc.format = wgpu::TextureFormat::RGBA16Float;
     canvasTexDesc.usage = wgpu::TextureUsage::TextureBinding |
                           wgpu::TextureUsage::CopySrc |
