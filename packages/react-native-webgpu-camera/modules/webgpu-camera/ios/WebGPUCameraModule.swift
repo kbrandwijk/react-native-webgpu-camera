@@ -225,9 +225,14 @@ public class WebGPUCameraModule: Module {
               self.depthDelegate = depthDel
 
               // Tell the video frame delegate where to find latest depth
-              self.frameDelegate?.depthDelegate = depthDel
+              if let fd = self.frameDelegate {
+                fd.depthDelegate = depthDel
+                NSLog("[WebGPUCamera] depth delegate linked to frameDelegate")
+              } else {
+                NSLog("[WebGPUCamera] WARNING: frameDelegate is nil, can't link depth")
+              }
 
-              NSLog("[WebGPUCamera] depth output + delegate added to session")
+              NSLog("[WebGPUCamera] depth output + delegate added to session, isRunning=%d", session.isRunning ? 1 : 0)
             } else {
               NSLog("[WebGPUCamera] WARNING: could not add depth output")
             }
