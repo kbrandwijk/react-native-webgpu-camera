@@ -36,9 +36,8 @@ public class WebGPUCameraModule: Module {
   public func definition() -> ModuleDefinition {
     Name("WebGPUCamera")
 
-    Function("startCameraPreview") { (deviceId: String, nativeHandle: Int, colorSpace: String) in
-      // isAppleLog and isHDR are set inside startCapture after validating
-      // that the format actually supports the requested color space
+    Function("startCameraPreview") { (deviceId: String, nativeHandle: Int, colorSpace: String, useDepth: Bool) in
+      self.useDepth = useDepth
       self.startCapture(deviceId: deviceId, nativeHandle: nativeHandle, colorSpace: colorSpace)
     }
 
@@ -203,43 +202,8 @@ public class WebGPUCameraModule: Module {
         print("[WebGPUCamera] Multi-pass pipeline setup OK: \(shaders.count) passes, \(width)x\(height), useDepth=\(useDepth)")
 
         // If depth was requested but capture session started without it,
-        // add depth output to the running session (device is already LiDAR).
-        // Use a separate depth delegate instead of synchronizer — simpler and
-        // avoids synchronizer issues where it stops delivering frames.
-        if useDepth && self.captureSession != nil && self.depthOutput == nil {
-          NSLog("[WebGPUCamera] setupMultiPassPipeline: adding depth output to running session")
-          let session = self.captureSession!
-          self.sessionQueue.async {
-            session.beginConfiguration()
-
-            let depthOut = AVCaptureDepthDataOutput()
-            depthOut.isFilteringEnabled = true
-            depthOut.alwaysDiscardsLateDepthData = true
-            if session.canAddOutput(depthOut) {
-              session.addOutput(depthOut)
-              self.depthOutput = depthOut
-
-              // Separate delegate for depth — caches latest depth buffer
-              let depthDel = DepthDelegate()
-              depthOut.setDelegate(depthDel, callbackQueue: self.frameQueue)
-              self.depthDelegate = depthDel
-
-              // Tell the video frame delegate where to find latest depth
-              if let fd = self.frameDelegate {
-                fd.depthDelegate = depthDel
-                NSLog("[WebGPUCamera] depth delegate linked to frameDelegate")
-              } else {
-                NSLog("[WebGPUCamera] WARNING: frameDelegate is nil, can't link depth")
-              }
-
-              NSLog("[WebGPUCamera] depth output + delegate added to session, isRunning=%d", session.isRunning ? 1 : 0)
-            } else {
-              NSLog("[WebGPUCamera] WARNING: could not add depth output")
-            }
-
-            session.commitConfiguration()
-          }
-        }
+        // Depth output is now configured in startCapture via useCamera({ useDepth: true })
+        // No mid-session depth addition needed.
       } else {
         print("[WebGPUCamera] Multi-pass pipeline setup FAILED")
       }
@@ -385,6 +349,28 @@ public class WebGPUCameraModule: Module {
       NSLog("[WebGPUCamera] startCapture: step 10 — adding output to session")
       if session.canAddOutput(output) {
         session.addOutput(output)
+      }
+
+      // Depth output — added here in the same session setup, not later
+      if self.useDepth {
+        NSLog("[WebGPUCamera] startCapture: step 10-depth — adding depth output")
+        let depthOut = AVCaptureDepthDataOutput()
+        depthOut.isFilteringEnabled = true
+        depthOut.alwaysDiscardsLateDepthData = true
+        if session.canAddOutput(depthOut) {
+          session.addOutput(depthOut)
+          self.depthOutput = depthOut
+
+          let depthDel = DepthDelegate()
+          depthOut.setDelegate(depthDel, callbackQueue: self.frameQueue)
+          self.depthDelegate = depthDel
+          delegate.depthDelegate = depthDel
+
+          NSLog("[WebGPUCamera] startCapture: depth output + delegate configured")
+        } else {
+          NSLog("[WebGPUCamera] startCapture: WARNING — could not add depth output")
+          self.useDepth = false
+        }
       }
 
       // Query available pixel formats AFTER adding output to session

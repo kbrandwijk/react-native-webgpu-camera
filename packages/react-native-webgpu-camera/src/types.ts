@@ -10,6 +10,8 @@ export interface CameraConfig {
   format?: CameraFormat;
   /** Color space to activate. Default: 'sRGB'. Must be in format.supportedColorSpaces. */
   colorSpace?: ColorSpace;
+  /** Enable depth data capture (requires LiDAR device). Default: false. */
+  useDepth?: boolean;
 }
 
 export interface CameraHandle {

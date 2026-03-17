@@ -11,9 +11,10 @@ export function useCamera(config: CameraConfig): CameraHandle {
   const device = config.device;
   const nativeHandle = config.format?.nativeHandle ?? -1;
   const colorSpace = config.colorSpace ?? 'sRGB';
+  const useDepth = config.useDepth ?? false;
 
   useEffect(() => {
-    WebGPUCameraModule.startCameraPreview(device, nativeHandle, colorSpace);
+    WebGPUCameraModule.startCameraPreview(device, nativeHandle, colorSpace, useDepth);
 
     // Camera needs time to produce first frame
     const timeout = setTimeout(() => {
@@ -32,7 +33,7 @@ export function useCamera(config: CameraConfig): CameraHandle {
       WebGPUCameraModule.stopCameraPreview();
       setIsReady(false);
     };
-  }, [device, nativeHandle, colorSpace]);
+  }, [device, nativeHandle, colorSpace, useDepth]);
 
   return {
     isReady,

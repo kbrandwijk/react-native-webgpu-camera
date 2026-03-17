@@ -303,6 +303,7 @@ function DepthPreview({ format, colorSpace }: { format?: CameraFormat; colorSpac
     device: 'back',
     format,
     colorSpace,
+    useDepth: true,
   });
 
   const { currentFrame, error } = useGPUFrameProcessor(camera, {
