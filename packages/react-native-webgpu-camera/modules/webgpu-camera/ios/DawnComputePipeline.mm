@@ -89,6 +89,14 @@ struct DawnComputePipeline::Impl {
   };
   std::vector<UploadedResource> uploadedResources;
 
+  // Depth support
+  bool useDepth = false;
+  int depthResourceIndex = -1;
+  CVPixelBufferRef currentDepthBuffer = nullptr;  // set per-frame before processFrame
+  wgpu::Sampler depthSampler;
+  wgpu::Texture depthTexture;   // per-frame
+  wgpu::TextureView depthView;  // per-frame
+
   // Default linear sampler for texture outputs (always created if any custom inputs exist)
   wgpu::Sampler defaultSampler;
 
@@ -111,7 +119,11 @@ struct DawnComputePipeline::Impl {
     switch (ib.type) {
       case InputBindingType::Texture3D:
       case InputBindingType::Texture2D:
-        if (ib.resourceHandle >= 0 && (size_t)ib.resourceHandle < uploadedResources.size()) {
+        if (ib.resourceHandle >= 0 && ib.resourceHandle == depthResourceIndex && depthView) {
+          // Per-frame depth texture from camera
+          entry.textureView = depthView;
+          entries.push_back(entry);
+        } else if (ib.resourceHandle >= 0 && (size_t)ib.resourceHandle < uploadedResources.size()) {
           entry.textureView = uploadedResources[ib.resourceHandle].textureView;
           entries.push_back(entry);
         } else if (ib.sourcePass >= 0 && (size_t)ib.sourcePass < passTextureOutputs.size()
@@ -122,7 +134,10 @@ struct DawnComputePipeline::Impl {
         break;
 
       case InputBindingType::Sampler:
-        if (ib.resourceHandle >= 0 && (size_t)ib.resourceHandle < uploadedResources.size()
+        if (ib.resourceHandle >= 0 && ib.resourceHandle == depthResourceIndex && depthSampler) {
+          // Depth sampler for upsampling
+          entry.sampler = depthSampler;
+        } else if (ib.resourceHandle >= 0 && (size_t)ib.resourceHandle < uploadedResources.size()
             && uploadedResources[ib.resourceHandle].sampler) {
           entry.sampler = uploadedResources[ib.resourceHandle].sampler;
         } else {
@@ -166,7 +181,8 @@ bool DawnComputePipeline::setup(
     const std::vector<ResourceSpec>& resources,
     const std::vector<PassInputSpec>& passInputs,
     const std::vector<int>& textureOutputPasses,
-    bool appleLog) {
+    bool appleLog,
+    bool useDepth) {
   std::lock_guard<std::mutex> lock(_mutex);
   cleanupLocked();
 
@@ -182,6 +198,29 @@ bool DawnComputePipeline::setup(
   _impl->syncMode = sync;
   _impl->useCanvas = useCanvas;
   _impl->appleLog = appleLog;
+  _impl->useDepth = useDepth;
+
+  // Find CameraDepth resource index and create depth sampler
+  if (useDepth) {
+    for (size_t i = 0; i < resources.size(); i++) {
+      if (resources[i].type == ResourceType::CameraDepth) {
+        _impl->depthResourceIndex = (int)i;
+        break;
+      }
+    }
+
+    // Create linear sampler for depth upsampling
+    wgpu::SamplerDescriptor depthSampDesc{};
+    depthSampDesc.magFilter = wgpu::FilterMode::Linear;
+    depthSampDesc.minFilter = wgpu::FilterMode::Linear;
+    depthSampDesc.mipmapFilter = wgpu::MipmapFilterMode::Linear;
+    depthSampDesc.addressModeU = wgpu::AddressMode::ClampToEdge;
+    depthSampDesc.addressModeV = wgpu::AddressMode::ClampToEdge;
+    depthSampDesc.addressModeW = wgpu::AddressMode::ClampToEdge;
+    _impl->depthSampler = _impl->device.CreateSampler(&depthSampDesc);
+
+    NSLog(@"[DawnPipeline] Depth enabled: resourceIndex=%d\n", _impl->depthResourceIndex);
+  }
 
   // TODO: Raw camera path (0 shaders, no canvas, no buffers) needs texture
   // lifetime management — IOSurface texture is freed when processFrame returns.
@@ -382,6 +421,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     auto spec = resources[ri];  // mutable copy — fileUri may populate data/dims
     auto& ur = _impl->uploadedResources[ri];
     ur.type = spec.type;
+
+    // CameraDepth resources are bound per-frame from IOSurface — skip GPU upload
+    if (spec.type == ResourceType::CameraDepth) continue;
 
     // Load .cube LUT file if fileUri is set
     if (!spec.fileUri.empty() && spec.data.empty()) {
@@ -854,6 +896,44 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
 
   double tAfterImport = CACurrentMediaTime();
 
+  // ── Import depth IOSurface when available ──
+  wgpu::SharedTextureMemory depthSharedMemory;
+  if (impl->useDepth && impl->currentDepthBuffer) {
+    IOSurfaceRef depthSurface = CVPixelBufferGetIOSurface(impl->currentDepthBuffer);
+    if (depthSurface) {
+      size_t depthW = CVPixelBufferGetWidth(impl->currentDepthBuffer);
+      size_t depthH = CVPixelBufferGetHeight(impl->currentDepthBuffer);
+
+      wgpu::SharedTextureMemoryIOSurfaceDescriptor depthIoDesc{};
+      depthIoDesc.ioSurface = depthSurface;
+      wgpu::SharedTextureMemoryDescriptor depthSharedDesc{};
+      depthSharedDesc.nextInChain = &depthIoDesc;
+
+      depthSharedMemory = device.ImportSharedTextureMemory(&depthSharedDesc);
+      if (depthSharedMemory) {
+        wgpu::TextureDescriptor depthTexDesc{};
+        depthTexDesc.size = {(uint32_t)depthW, (uint32_t)depthH, 1};
+        depthTexDesc.format = wgpu::TextureFormat::R16Float;
+        depthTexDesc.usage = wgpu::TextureUsage::TextureBinding;
+        depthTexDesc.label = "CameraDepth";
+
+        impl->depthTexture = depthSharedMemory.CreateTexture(&depthTexDesc);
+        if (impl->depthTexture) {
+          wgpu::SharedTextureMemoryBeginAccessDescriptor depthBeginDesc{};
+          depthBeginDesc.initialized = true;
+          depthSharedMemory.BeginAccess(impl->depthTexture, &depthBeginDesc);
+          impl->depthView = impl->depthTexture.CreateView();
+
+          static bool loggedDepth = false;
+          if (!loggedDepth) {
+            NSLog(@"[DawnPipeline] Depth texture imported: %zux%zu R16Float", depthW, depthH);
+            loggedDepth = true;
+          }
+        }
+      }
+    }
+  }
+
   // ── Raw camera path: no compute, just wrap the BGRA texture as SkImage ──
   if (impl->rawCamera) {
     auto outputImage = ctx.MakeImageFromTexture(
@@ -1055,6 +1135,15 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   wgpu::SharedTextureMemoryEndAccessState endState{};
   sharedMemory.EndAccess(inputTexture, &endState);
 
+  // Cleanup depth IOSurface access
+  if (depthSharedMemory && impl->depthTexture) {
+    wgpu::SharedTextureMemoryEndAccessState depthEndState{};
+    depthSharedMemory.EndAccess(impl->depthTexture, &depthEndState);
+    impl->depthTexture = nullptr;
+    impl->depthView = nullptr;
+  }
+  impl->currentDepthBuffer = nullptr;
+
   // ── Brief lock to publish results ──
   {
     std::lock_guard<std::mutex> lock(_mutex);
@@ -1085,6 +1174,13 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   }
 
   return true;
+}
+
+bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer, CVPixelBufferRef depthBuffer) {
+  if (_impl) {
+    _impl->currentDepthBuffer = depthBuffer;
+  }
+  return processFrame(pixelBuffer);
 }
 
 const void* DawnComputePipeline::readBuffer(int bufferIndex) const {
@@ -1283,6 +1379,10 @@ void DawnComputePipeline::cleanupLocked() {
   _impl->passTextureOutputs.clear();
   _impl->passInputBindings.clear();
   _impl->defaultSampler = nullptr;
+  _impl->depthSampler = nullptr;
+  _impl->depthTexture = nullptr;
+  _impl->depthView = nullptr;
+  _impl->currentDepthBuffer = nullptr;
 
   delete _impl;
   _impl = nullptr;
@@ -1307,7 +1407,7 @@ bool dawn_pipeline_setup_multipass(
     const char** shaders, int shaderCount,
     int width, int height,
     const int* bufferSpecsFlat, int bufferCount,
-    bool useCanvas, bool sync, bool appleLog,
+    bool useCanvas, bool sync, bool appleLog, bool useDepth,
     const void* resourcesPtr, int resourceCount,
     const void* passInputsPtr, int passInputCount,
     const int* textureOutputPassesPtr, int textureOutputPassCount) {
@@ -1347,12 +1447,20 @@ bool dawn_pipeline_setup_multipass(
   }
 
   return pipeline->setup(wgslShaders, width, height, specs, useCanvas, sync,
-                         resourceVec, passInputVec, texOutVec, appleLog);
+                         resourceVec, passInputVec, texOutVec, appleLog, useDepth);
 }
 
 bool dawn_pipeline_process_frame(DawnComputePipelineRef ref, CVPixelBufferRef pixelBuffer) {
   auto* pipeline = static_cast<dawn_pipeline::DawnComputePipeline*>(ref);
   return pipeline->processFrame(pixelBuffer);
+}
+
+bool dawn_pipeline_process_frame_with_depth(DawnComputePipelineRef ref,
+                                             CVPixelBufferRef pixelBuffer,
+                                             CVPixelBufferRef depthBuffer) {
+  if (!ref) return false;
+  auto* pipeline = static_cast<dawn_pipeline::DawnComputePipeline*>(ref);
+  return pipeline->processFrame(pixelBuffer, depthBuffer);
 }
 
 const void* dawn_pipeline_read_buffer(DawnComputePipelineRef ref, int index) {

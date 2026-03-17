@@ -12,11 +12,14 @@
                         useCanvas:(BOOL)useCanvas
                              sync:(BOOL)sync
                          appleLog:(BOOL)appleLog
+                         useDepth:(BOOL)useDepth
                         resources:(nonnull NSArray<NSDictionary *> *)resources
                        passInputs:(nonnull NSArray<NSDictionary *> *)passInputs
                textureOutputPasses:(nonnull NSArray<NSNumber *> *)textureOutputPasses;
 
 - (BOOL)processFrame:(nonnull CVPixelBufferRef)pixelBuffer;
+- (BOOL)processFrame:(nonnull CVPixelBufferRef)pixelBuffer
+         depthBuffer:(nullable CVPixelBufferRef)depthBuffer;
 - (void)cleanup;
 - (void)installJSIBindings:(nonnull id)expoRuntime;
 

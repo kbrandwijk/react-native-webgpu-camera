@@ -28,6 +28,7 @@
                         useCanvas:(BOOL)useCanvas
                              sync:(BOOL)sync
                          appleLog:(BOOL)appleLog
+                         useDepth:(BOOL)useDepth
                         resources:(NSArray<NSDictionary *> *)resources
                        passInputs:(NSArray<NSDictionary *> *)passInputs
                textureOutputPasses:(NSArray<NSNumber *> *)textureOutputPasses {
@@ -61,6 +62,8 @@
       rs.type = dawn_pipeline::ResourceType::Texture3D;
     } else if ([type isEqualToString:@"texture2d"]) {
       rs.type = dawn_pipeline::ResourceType::Texture2D;
+    } else if ([type isEqualToString:@"cameraDepth"]) {
+      rs.type = dawn_pipeline::ResourceType::CameraDepth;
     } else {
       rs.type = dawn_pipeline::ResourceType::StorageBuffer;
     }
@@ -130,7 +133,7 @@
     cShaders.data(), shaderCount,
     width, height,
     flatSpecs.data(), bufferCount,
-    useCanvas, sync, (bool)appleLog,
+    useCanvas, sync, (bool)appleLog, (bool)useDepth,
     resourceSpecs.data(), (int)resourceSpecs.size(),
     passInputSpecs.data(), (int)passInputSpecs.size(),
     texOutPasses.data(), (int)texOutPasses.size()
@@ -138,6 +141,10 @@
 }
 
 - (BOOL)processFrame:(CVPixelBufferRef)pixelBuffer {
+  return [self processFrame:pixelBuffer depthBuffer:nil];
+}
+
+- (BOOL)processFrame:(CVPixelBufferRef)pixelBuffer depthBuffer:(CVPixelBufferRef)depthBuffer {
   if (!_pipeline) return NO;
   static bool loggedFormat = false;
   if (!loggedFormat) {
@@ -150,9 +157,16 @@
           (char)((fmt >> 24) & 0xFF), (char)((fmt >> 16) & 0xFF),
           (char)((fmt >> 8) & 0xFF), (char)(fmt & 0xFF),
           w, h, planes);
+    if (depthBuffer) {
+      OSType depthFmt = CVPixelBufferGetPixelFormatType(depthBuffer);
+      size_t dw = CVPixelBufferGetWidth(depthBuffer);
+      size_t dh = CVPixelBufferGetHeight(depthBuffer);
+      NSLog(@"[DawnBridge] First frame depth format: 0x%08x, %zux%zu",
+            (unsigned)depthFmt, dw, dh);
+    }
     loggedFormat = true;
   }
-  return dawn_pipeline_process_frame(_pipeline, pixelBuffer);
+  return dawn_pipeline_process_frame_with_depth(_pipeline, pixelBuffer, depthBuffer);
 }
 
 - (void)cleanup {

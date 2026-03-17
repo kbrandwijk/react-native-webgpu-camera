@@ -15,6 +15,10 @@ public class WebGPUCameraModule: Module {
   var isAppleLog = false
   var isHDR = false  // true for appleLog OR hlgBT2020 — both deliver 10-bit YUV
   var isYUV422 = false  // true when camera delivers 4:2:2 (x422) instead of 4:2:0 (x420)
+  var useDepth = false
+  private var depthOutput: AVCaptureDepthDataOutput?
+  private var synchronizer: AVCaptureDataOutputSynchronizer?
+  private var syncDelegate: SynchronizedFrameDelegate?
 
   /// Stored AVCaptureDevice.Format arrays, keyed by device position.
   /// Rebuilt on each getFormats() call. nativeHandle indexes into these.
@@ -150,6 +154,8 @@ public class WebGPUCameraModule: Module {
       let resourcesRaw = config["resources"] as? [[String: Any]] ?? []
       let passInputsRaw = config["passInputs"] as? [[String: Any]] ?? []
       let textureOutputPasses = config["textureOutputPasses"] as? [NSNumber] ?? []
+      let useDepth = config["useDepth"] as? Bool ?? false
+      self.useDepth = useDepth
 
       let bufferSpecs = bufferSpecsRaw.map { spec in
         spec.map { $0 }
@@ -170,6 +176,7 @@ public class WebGPUCameraModule: Module {
         useCanvas: useCanvas,
         sync: sync,
         appleLog: appleLog,
+        useDepth: useDepth,
         resources: resourcesRaw,
         passInputs: passInputsRaw,
         textureOutputPasses: textureOutputPasses
@@ -305,14 +312,38 @@ public class WebGPUCameraModule: Module {
       let output = AVCaptureVideoDataOutput()
       output.alwaysDiscardsLateVideoFrames = true
 
-      NSLog("[WebGPUCamera] startCapture: step 9 — setting up frame delegate")
-      let delegate = FrameDelegate(width: UInt32(width), height: UInt32(height), module: self)
-      self.frameDelegate = delegate
-      output.setSampleBufferDelegate(delegate, queue: self.frameQueue)
+      NSLog("[WebGPUCamera] startCapture: step 9 — setting up frame delegate (useDepth=%d)", self.useDepth ? 1 : 0)
+      if !self.useDepth {
+        let delegate = FrameDelegate(width: UInt32(width), height: UInt32(height), module: self)
+        self.frameDelegate = delegate
+        output.setSampleBufferDelegate(delegate, queue: self.frameQueue)
+      }
 
       NSLog("[WebGPUCamera] startCapture: step 10 — adding output to session")
       if session.canAddOutput(output) {
         session.addOutput(output)
+      }
+
+      // Depth output setup (when useDepth is enabled)
+      if self.useDepth {
+        NSLog("[WebGPUCamera] startCapture: step 10-depth — adding depth output")
+        let depthOut = AVCaptureDepthDataOutput()
+        depthOut.isFilteringEnabled = true
+        depthOut.alwaysDiscardsLateDepthData = true
+        if session.canAddOutput(depthOut) {
+          session.addOutput(depthOut)
+          self.depthOutput = depthOut
+
+          let syncDel = SynchronizedFrameDelegate(videoOutput: output, depthOutput: depthOut, module: self)
+          self.syncDelegate = syncDel
+          let dataSynchronizer = AVCaptureDataOutputSynchronizer(dataOutputs: [output, depthOut])
+          dataSynchronizer.setDelegate(syncDel, queue: self.frameQueue)
+          self.synchronizer = dataSynchronizer
+
+          NSLog("[WebGPUCamera] startCapture: depth synchronizer configured")
+        } else {
+          NSLog("[WebGPUCamera] startCapture: WARNING — could not add depth output to session")
+        }
       }
 
       // Query available pixel formats AFTER adding output to session
@@ -431,6 +462,9 @@ public class WebGPUCameraModule: Module {
       self.captureSession = nil
       self.dataOutput = nil
       self.frameDelegate = nil
+      self.synchronizer = nil
+      self.syncDelegate = nil
+      self.depthOutput = nil
       print("[WebGPUCamera] Camera stopped")
     }
   }
@@ -473,5 +507,42 @@ private class FrameDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferDeleg
 
     // Run Dawn compute pipeline on the raw CVPixelBuffer (zero-copy via IOSurface)
     module?.dawnBridge?.processFrame(pixelBuffer)
+  }
+}
+
+private class SynchronizedFrameDelegate: NSObject, AVCaptureDataOutputSynchronizerDelegate {
+  let videoOutput: AVCaptureVideoDataOutput
+  let depthOutput: AVCaptureDepthDataOutput
+  weak var module: WebGPUCameraModule?
+  private var frameCount: Int = 0
+
+  init(videoOutput: AVCaptureVideoDataOutput, depthOutput: AVCaptureDepthDataOutput, module: WebGPUCameraModule) {
+    self.videoOutput = videoOutput
+    self.depthOutput = depthOutput
+    self.module = module
+  }
+
+  func dataOutputSynchronizer(_ synchronizer: AVCaptureDataOutputSynchronizer,
+                               didOutput synchronizedDataCollection: AVCaptureSynchronizedDataCollection) {
+    guard let syncedVideoData = synchronizedDataCollection.synchronizedData(for: videoOutput) as? AVCaptureSynchronizedSampleBufferData,
+          !syncedVideoData.sampleBufferWasDropped,
+          let pixelBuffer = CMSampleBufferGetImageBuffer(syncedVideoData.sampleBuffer) else { return }
+
+    var depthBuffer: CVPixelBuffer? = nil
+    if let syncedDepthData = synchronizedDataCollection.synchronizedData(for: depthOutput) as? AVCaptureSynchronizedDepthData,
+       !syncedDepthData.depthDataWasDropped {
+      depthBuffer = syncedDepthData.depthData.depthDataMap
+    }
+
+    frameCount += 1
+    if frameCount <= 3 {
+      let depthFmt = depthBuffer.map { CVPixelBufferGetPixelFormatType($0) } ?? 0
+      let depthW = depthBuffer.map { CVPixelBufferGetWidth($0) } ?? 0
+      let depthH = depthBuffer.map { CVPixelBufferGetHeight($0) } ?? 0
+      NSLog("[SyncDelegate] frame #%d, depth=%@, depthFmt=0x%08x, depthSize=%dx%d",
+            frameCount, depthBuffer != nil ? "YES" : "NO", depthFmt, depthW, depthH)
+    }
+
+    module?.dawnBridge?.processFrame(pixelBuffer, depthBuffer: depthBuffer)
   }
 }

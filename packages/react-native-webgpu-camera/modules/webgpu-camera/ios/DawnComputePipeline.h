@@ -11,7 +11,7 @@
 
 namespace dawn_pipeline {
 
-enum class ResourceType { Texture3D, Texture2D, StorageBuffer };
+enum class ResourceType { Texture3D, Texture2D, StorageBuffer, CameraDepth };
 enum class ResourceFormat { RGBA8Unorm, RGBA32Float };
 
 struct ResourceSpec {
@@ -57,9 +57,11 @@ public:
              const std::vector<ResourceSpec>& resources = {},
              const std::vector<PassInputSpec>& passInputs = {},
              const std::vector<int>& textureOutputPasses = {},
-             bool appleLog = false);
+             bool appleLog = false,
+             bool useDepth = false);
 
   bool processFrame(CVPixelBufferRef pixelBuffer);
+  bool processFrame(CVPixelBufferRef pixelBuffer, CVPixelBufferRef depthBuffer);
 
   const void* readBuffer(int bufferIndex) const;
   int getBufferByteSize(int bufferIndex) const;
@@ -140,13 +142,17 @@ bool dawn_pipeline_setup_multipass(
   const char** shaders, int shaderCount,
   int width, int height,
   const int* bufferSpecs, int bufferCount,
-  bool useCanvas, bool sync, bool appleLog,
+  bool useCanvas, bool sync, bool appleLog, bool useDepth,
   const void* resources, int resourceCount,
   const void* passInputs, int passInputCount,
   const int* textureOutputPasses, int textureOutputPassCount);
 
 bool dawn_pipeline_process_frame(DawnComputePipelineRef ref,
                                   CVPixelBufferRef pixelBuffer);
+
+bool dawn_pipeline_process_frame_with_depth(DawnComputePipelineRef ref,
+                                             CVPixelBufferRef pixelBuffer,
+                                             CVPixelBufferRef depthBuffer);
 
 const void* dawn_pipeline_read_buffer(DawnComputePipelineRef ref, int index);
 int dawn_pipeline_get_buffer_byte_size(DawnComputePipelineRef ref, int index);
