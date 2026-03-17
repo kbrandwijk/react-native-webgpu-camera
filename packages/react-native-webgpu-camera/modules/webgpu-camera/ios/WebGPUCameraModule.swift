@@ -203,10 +203,10 @@ public class WebGPUCameraModule: Module {
         if useDepth && self.captureSession != nil && self.depthOutput == nil {
           NSLog("[WebGPUCamera] setupMultiPassPipeline: restarting capture with LiDAR device for depth")
           let savedDevice = self.lastDeviceId ?? "back"
-          let savedHandle = self.lastNativeHandle ?? -1
           let savedColorSpace = self.lastColorSpace ?? "sRGB"
           self.stopCapture()
-          self.startCapture(deviceId: savedDevice, nativeHandle: savedHandle, colorSpace: savedColorSpace)
+          // Use default format (-1) — LiDAR device has different formats than wide angle
+          self.startCapture(deviceId: savedDevice, nativeHandle: -1, colorSpace: savedColorSpace)
         }
       } else {
         print("[WebGPUCamera] Multi-pass pipeline setup FAILED")
