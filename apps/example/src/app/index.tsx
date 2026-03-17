@@ -358,11 +358,11 @@ export default function CameraSpikeScreen() {
   );
   const [selected, setSelected] = useState<FormatEntry | undefined>();
 
-  // Auto-select best sRGB format
+  // Auto-select best sRGB format (prefer depth-capable)
   useEffect(() => {
     if (formatEntries.length === 0) return;
     const best =
-      formatEntries.find(e => e.colorSpace === 'sRGB' && e.format.width >= 3840 && e.format.maxFps >= 120) ??
+      formatEntries.find(e => e.colorSpace === 'sRGB' && e.format.supportsDepth && e.format.width >= 1920 && e.format.maxFps >= 60) ??
       formatEntries.find(e => e.colorSpace === 'sRGB' && e.format.width >= 1920 && e.format.maxFps >= 60) ??
       formatEntries.find(e => e.colorSpace === 'sRGB') ??
       formatEntries[0];
@@ -442,7 +442,7 @@ export default function CameraSpikeScreen() {
                       {e.format.width}x{e.format.height}
                     </Text>
                     <Text style={[styles.formatDetail, isSelected && styles.formatTextSelected]}>
-                      {Math.round(e.format.minFps)}-{Math.round(e.format.maxFps)}fps {e.colorSpace}{e.format.isBinned ? ' bin' : ''}
+                      {Math.round(e.format.minFps)}-{Math.round(e.format.maxFps)}fps {e.colorSpace}{e.format.isBinned ? ' bin' : ''}{e.format.supportsDepth ? ' D' : ''}
                     </Text>
                   </Pressable>
                 );
