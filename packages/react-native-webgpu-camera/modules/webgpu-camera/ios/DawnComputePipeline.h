@@ -114,8 +114,10 @@ private:
   struct Impl;
   Impl* _impl = nullptr;
   std::mutex _mutex;
-  int _width = 0;
-  int _height = 0;
+  int _width = 0;         // output (portrait) width
+  int _height = 0;        // output (portrait) height
+  int _inputWidth = 0;    // camera (landscape) width
+  int _inputHeight = 0;   // camera (landscape) height
   std::shared_ptr<std::atomic<bool>> _alive;
 };
 

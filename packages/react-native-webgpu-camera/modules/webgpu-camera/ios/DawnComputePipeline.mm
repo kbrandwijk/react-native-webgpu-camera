@@ -170,8 +170,11 @@ bool DawnComputePipeline::setup(
   std::lock_guard<std::mutex> lock(_mutex);
   cleanupLocked();
 
-  _width = width;
-  _height = height;
+  // Camera delivers landscape; output is portrait (rotated 90° CW)
+  _inputWidth = width;
+  _inputHeight = height;
+  _width = height;   // portrait width = landscape height
+  _height = width;   // portrait height = landscape width
   _impl = new Impl();
 
   auto& ctx = RNSkia::DawnContext::getInstance();
@@ -207,16 +210,21 @@ bool DawnComputePipeline::setup(
   }
 
   // Auto-insert passthrough shader when no user shaders but canvas/buffers needed.
-  // Handles BGRA→RGBA conversion and gives onFrame a canvas to draw on.
+  // Handles BGRA→RGBA conversion, rotates landscape→portrait (90° CW),
+  // and gives onFrame a canvas to draw on.
   static const std::string kPassthroughWGSL = R"(
 @group(0) @binding(0) var inputTex: texture_2d<f32>;
 @group(0) @binding(1) var outputTex: texture_storage_2d<rgba16float, write>;
 
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) id: vec3u) {
-  let dims = textureDimensions(inputTex);
-  if (id.x >= dims.x || id.y >= dims.y) { return; }
-  textureStore(outputTex, vec2i(id.xy), textureLoad(inputTex, vec2i(id.xy), 0));
+  let outDims = textureDimensions(outputTex);
+  if (id.x >= outDims.x || id.y >= outDims.y) { return; }
+
+  // 90° CW rotation: output(x, y) ← input(y, inW - 1 - x)
+  let inDims = textureDimensions(inputTex);
+  let srcCoord = vec2i(vec2u(id.y, inDims.y - 1u - id.x));
+  textureStore(outputTex, vec2i(id.xy), textureLoad(inputTex, srcCoord, 0));
 }
 )";
 
@@ -224,6 +232,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   // Converts 10-bit video range YCbCr (BT.2020) to Apple Log encoded RGB.
   // YUV unpack for Apple Log — recovers Apple Log encoded R'G'B' from 10-bit YCbCr.
   // Output is Apple Log encoded RGB — the flat/washed-out look that viewing LUTs expect.
+  // Also rotates landscape→portrait (90° CW) so all downstream shaders work in portrait coords.
   static const std::string kYUVtoRGBWGSL = R"(
 @group(0) @binding(0) var yPlaneTex: texture_2d<f32>;
 @group(0) @binding(1) var uvPlaneTex: texture_2d<f32>;
@@ -231,22 +240,21 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) id: vec3u) {
-  let dims = textureDimensions(yPlaneTex);
-  if (id.x >= dims.x || id.y >= dims.y) { return; }
+  let outDims = textureDimensions(outputTex);
+  if (id.x >= outDims.x || id.y >= outDims.y) { return; }
 
-  let coord = vec2i(id.xy);
+  // 90° CW rotation: output(x, y) reads from input(y, inH - 1 - x)
+  let yDims = textureDimensions(yPlaneTex);
+  let srcCoord = vec2u(id.y, yDims.y - 1u - id.x);
 
   // Derive UV coord from plane dimensions — works for both 4:2:0 and 4:2:2
-  // 4:2:0: UV is half-width, half-height → id.xy / 2
-  // 4:2:2: UV is half-width, full-height → (id.x / 2, id.y)
   let uvDims = textureDimensions(uvPlaneTex);
-  let yDims = textureDimensions(yPlaneTex);
   let uvCoord = vec2i(vec2u(
-    id.x * uvDims.x / yDims.x,
-    id.y * uvDims.y / yDims.y
+    srcCoord.x * uvDims.x / yDims.x,
+    srcCoord.y * uvDims.y / yDims.y
   ));
 
-  let yRaw = textureLoad(yPlaneTex, coord, 0).r;
+  let yRaw = textureLoad(yPlaneTex, vec2i(srcCoord), 0).r;
   let uvRaw = textureLoad(uvPlaneTex, uvCoord, 0).rg;
 
   // Video range expansion (10-bit: Y [64..940]/1023, CbCr [64..960]/1023)
@@ -259,12 +267,12 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   let g = y - 0.16455 * cb - 0.57135 * cr;
   let b = y + 1.8814 * cb;
 
-  textureStore(outputTex, coord, vec4f(r, g, b, 1.0));
+  textureStore(outputTex, vec2i(id.xy), vec4f(r, g, b, 1.0));
 }
 )";
 
-  NSLog(@"[DawnPipeline] setup() appleLog=%d, %zu user shaders, %dx%d\n",
-         appleLog, wgslShaders.size(), width, height);
+  NSLog(@"[DawnPipeline] setup() appleLog=%d, %zu user shaders, input=%dx%d, output=%dx%d (rotated)\n",
+         appleLog, wgslShaders.size(), _inputWidth, _inputHeight, _width, _height);
 
   auto effectiveShaders = wgslShaders;
   if (appleLog) {
@@ -772,12 +780,12 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
     static bool loggedFirst = false;
     if (!loggedFirst) {
       NSLog(@"[DawnPipeline] processFrame: Apple Log path, importing %dx%d YUV IOSurface (4:2:%s)\n",
-            _width, _height, is422 ? "2" : "0");
+            _inputWidth, _inputHeight, is422 ? "2" : "0");
     }
 
-    // Import as multi-planar 10-bit YUV (4:2:2 or 4:2:0)
+    // Import as multi-planar 10-bit YUV (4:2:2 or 4:2:0) — landscape dimensions
     wgpu::TextureDescriptor inputTexDesc{};
-    inputTexDesc.size = {(uint32_t)_width, (uint32_t)_height, 1};
+    inputTexDesc.size = {(uint32_t)_inputWidth, (uint32_t)_inputHeight, 1};
     inputTexDesc.format = is422
       ? wgpu::TextureFormat::R10X6BG10X6Biplanar422Unorm
       : wgpu::TextureFormat::R10X6BG10X6Biplanar420Unorm;
@@ -817,9 +825,9 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
       loggedFirst = true;
     }
   } else {
-    // Existing BGRA path
+    // Existing BGRA path — landscape dimensions
     wgpu::TextureDescriptor inputTexDesc{};
-    inputTexDesc.size = {(uint32_t)_width, (uint32_t)_height, 1};
+    inputTexDesc.size = {(uint32_t)_inputWidth, (uint32_t)_inputHeight, 1};
     inputTexDesc.format = wgpu::TextureFormat::BGRA8Unorm;
     inputTexDesc.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc;
     inputTexDesc.dimension = wgpu::TextureDimension::e2D;
@@ -849,7 +857,7 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   // ── Raw camera path: no compute, just wrap the BGRA texture as SkImage ──
   if (impl->rawCamera) {
     auto outputImage = ctx.MakeImageFromTexture(
-      inputTexture, _width, _height, wgpu::TextureFormat::BGRA8Unorm);
+      inputTexture, _inputWidth, _inputHeight, wgpu::TextureFormat::BGRA8Unorm);
 
     wgpu::SharedTextureMemoryEndAccessState endState{};
     sharedMemory.EndAccess(inputTexture, &endState);

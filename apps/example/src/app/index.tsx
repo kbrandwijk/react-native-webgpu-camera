@@ -47,7 +47,7 @@ function CameraPreview({ shaderChain, format, colorSpace }: { shaderChain: reado
     colorSpace,
   });
 
-  const { currentFrame, error } = useGPUFrameProcessor(camera, (frame) => {
+  const { currentFrame, fps, displayFps, metrics, error } = useGPUFrameProcessor(camera, (frame) => {
     'worklet';
     for (const wgsl of shaderChain) {
       // Only request debug buffer for passthrough shader (has @binding(2) debug array)
@@ -59,16 +59,18 @@ function CameraPreview({ shaderChain, format, colorSpace }: { shaderChain: reado
     }
   });
 
+  useDerivedValue(() => {
+    const m = metrics.value;
+    if (fps.value > 0 && m) {
+      console.log(`[FPS] ${fps.value}fps (display=${displayFps.value}) | lock=${m.lockWait.toFixed(2)}ms import=${m.import.toFixed(2)}ms bind=${m.bindGroup.toFixed(2)}ms compute=${m.compute.toFixed(2)}ms buf=${m.buffers.toFixed(2)}ms skImg=${m.makeImage.toFixed(2)}ms total=${m.total.toFixed(2)}ms wall=${m.wall.toFixed(2)}ms`);
+    }
+  });
+
   return (
     <>
       <Canvas style={StyleSheet.absoluteFill}>
         <Fill color="black" />
-        <Group transform={[
-          { translateX: screenW },
-          { rotate: Math.PI / 2 },
-        ]}>
-          <SkImage image={currentFrame} x={0} y={0} width={screenH} height={screenW} fit="cover" />
-        </Group>
+        <SkImage image={currentFrame} x={0} y={0} width={screenW} height={screenH} fit="cover" />
       </Canvas>
 
       <View style={styles.statusBar}>
@@ -101,12 +103,12 @@ function HistogramPreview({ format, colorSpace }: { format?: CameraFormat; color
 
   const emptyPicture = createPicture(() => {});
 
-  // Portrait texture dimensions (same coordinate space as onFrame)
-  const texPortraitW = camera.height; // e.g. 2160 in landscape
-  const texPortraitH = camera.width;  // e.g. 3840 in landscape
+  // Texture is now portrait (rotation done in GPU) — dimensions match directly
+  const texW = camera.height;  // portrait width (was landscape height)
+  const texH = camera.width;   // portrait height (was landscape width)
 
   // Scale factor: screen points → texture pixels
-  const overlayScale = screenW / texPortraitW;
+  const overlayScale = screenW / texW;
 
   // Create a Skia Picture from buffer data — draws in texture coordinates
   const histPicture = useDerivedValue(() => {
@@ -117,8 +119,8 @@ function HistogramPreview({ format, colorSpace }: { format?: CameraFormat; color
     // Same coordinates as onFrame burn-in
     const histW = 1200;
     const histH = 500;
-    const x0 = texPortraitW - histW - 60;
-    const y0 = texPortraitH - histH - 120;
+    const x0 = texW - histW - 60;
+    const y0 = texH - histH - 120;
 
     return createPicture((canvas) => {
       // Background
@@ -152,12 +154,7 @@ function HistogramPreview({ format, colorSpace }: { format?: CameraFormat; color
     <>
       <Canvas style={StyleSheet.absoluteFill}>
         <Fill color="black" />
-        <Group transform={[
-          { translateX: screenW },
-          { rotate: Math.PI / 2 },
-        ]}>
-          <SkImage image={currentFrame} x={0} y={0} width={screenH} height={screenW} fit="cover" />
-        </Group>
+        <SkImage image={currentFrame} x={0} y={0} width={screenW} height={screenH} fit="cover" />
         {/* Histogram overlay — drawn in texture coords, scaled to screen */}
         <Group transform={[{ scale: overlayScale }]}>
           <Picture picture={histPicture} />
@@ -240,12 +237,7 @@ function HistogramOnFramePreview({ format, colorSpace }: { format?: CameraFormat
     <>
       <Canvas style={StyleSheet.absoluteFill}>
         <Fill color="black" />
-        <Group transform={[
-          { translateX: screenW },
-          { rotate: Math.PI / 2 },
-        ]}>
-          <SkImage image={currentFrame} x={0} y={0} width={screenH} height={screenW} fit="cover" />
-        </Group>
+        <SkImage image={currentFrame} x={0} y={0} width={screenW} height={screenH} fit="cover" />
       </Canvas>
 
       <View style={styles.statusBar}>
@@ -268,7 +260,7 @@ function AppleLogPreview({ format, colorSpace, lutResource }: { format?: CameraF
 
   const resources = lutResource ? { lut: lutResource } : undefined;
 
-  const { currentFrame, error } = useGPUFrameProcessor(camera, {
+  const { currentFrame, fps, displayFps, metrics, error } = useGPUFrameProcessor(camera, {
     resources,
     pipeline: (frame, res: any) => {
       'worklet';
@@ -278,16 +270,18 @@ function AppleLogPreview({ format, colorSpace, lutResource }: { format?: CameraF
     },
   });
 
+  useDerivedValue(() => {
+    const m = metrics.value;
+    if (fps.value > 0 && m) {
+      console.log(`[AppleLog] ${fps.value}fps (display=${displayFps.value}) | lock=${m.lockWait.toFixed(2)}ms import=${m.import.toFixed(2)}ms bind=${m.bindGroup.toFixed(2)}ms compute=${m.compute.toFixed(2)}ms buf=${m.buffers.toFixed(2)}ms skImg=${m.makeImage.toFixed(2)}ms total=${m.total.toFixed(2)}ms wall=${m.wall.toFixed(2)}ms`);
+    }
+  });
+
   return (
     <>
       <Canvas style={StyleSheet.absoluteFill}>
         <Fill color="black" />
-        <Group transform={[
-          { translateX: screenW },
-          { rotate: Math.PI / 2 },
-        ]}>
-          <SkImage image={currentFrame} x={0} y={0} width={screenH} height={screenW} fit="cover" />
-        </Group>
+        <SkImage image={currentFrame} x={0} y={0} width={screenW} height={screenH} fit="cover" />
       </Canvas>
 
       <View style={styles.statusBar}>

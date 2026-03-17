@@ -527,10 +527,11 @@ export function useGPUFrameProcessor(
 
     // onFrame canvas path — always flush to produce the composited image
     if (hasOnFrame.value && onFrameFn && frame.canvas) {
+      // Canvas is portrait-oriented (rotation done in GPU pass 0)
       const renderFrame = {
         canvas: frame.canvas,
-        width: camera.width,
-        height: camera.height,
+        width: camera.height,
+        height: camera.width,
       };
       onFrameFn(renderFrame, (buffers.value ?? {}) as any);
 
