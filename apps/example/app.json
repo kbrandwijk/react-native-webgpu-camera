@@ -35,6 +35,14 @@
     },
     "plugins": [
       "./plugins/withSkiaGraphiteHeaders",
+      [
+        "expo-build-properties",
+        {
+          "ios": {
+            "deploymentTarget": "16.3"
+          }
+        }
+      ],
       "expo-router",
       [
         "expo-camera",

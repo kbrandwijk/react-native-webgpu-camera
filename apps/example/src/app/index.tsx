@@ -378,6 +378,8 @@ export default function CameraSpikeScreen() {
   const selectedFormat = selected?.format;
   const selectedColorSpace = selected?.colorSpace ?? 'sRGB';
 
+  const [showFormatPicker, setShowFormatPicker] = useState(false);
+
   if (showDepth) {
     return <DepthEstimation onBack={() => setShowDepth(false)} />;
   }
@@ -385,8 +387,6 @@ export default function CameraSpikeScreen() {
   if (showOrt) {
     return <OrtTest />;
   }
-
-  const [showFormatPicker, setShowFormatPicker] = useState(false);
 
   const formatLabel = selected
     ? `${selected.format.width}x${selected.format.height} @${Math.round(selected.format.maxFps)} ${selected.colorSpace}`

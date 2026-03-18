@@ -18,12 +18,12 @@
     "@shopify/react-native-skia": "workspace:*",
     "expo": "~55.0.6",
     "expo-asset": "~55.0.8",
+    "expo-build-properties": "^55.0.10",
     "expo-camera": "*",
     "expo-constants": "~55.0.7",
     "expo-dev-client": "~55.0.16",
     "expo-device": "~55.0.9",
     "expo-file-system": "*",
-    "onnxruntime-react-native": "workspace:*",
     "expo-font": "~55.0.4",
     "expo-glass-effect": "~55.0.8",
     "expo-image": "~55.0.6",
@@ -34,6 +34,7 @@
     "expo-symbols": "~55.0.5",
     "expo-system-ui": "~55.0.9",
     "expo-web-browser": "~55.0.9",
+    "onnxruntime-react-native": "workspace:*",
     "react": "19.2.0",
     "react-dom": "19.2.0",
     "react-native": "0.83.2",
@@ -51,5 +52,12 @@
     "babel-preset-expo": "~55.0.8",
     "typescript": "~5.9.2"
   },
-  "private": true
+  "private": true,
+  "expo": {
+    "install": {
+      "exclude": [
+        "@shopify/react-native-skia"
+      ]
+    }
+  }
 }
