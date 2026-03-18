@@ -16,7 +16,8 @@
                          lidarYUV:(BOOL)lidarYUV
                         resources:(nonnull NSArray<NSDictionary *> *)resources
                        passInputs:(nonnull NSArray<NSDictionary *> *)passInputs
-               textureOutputPasses:(nonnull NSArray<NSNumber *> *)textureOutputPasses;
+               textureOutputPasses:(nonnull NSArray<NSNumber *> *)textureOutputPasses
+                       modelSpecs:(nonnull NSArray<NSDictionary *> *)modelSpecs;
 
 - (BOOL)processFrame:(nonnull CVPixelBufferRef)pixelBuffer;
 - (BOOL)processFrame:(nonnull CVPixelBufferRef)pixelBuffer

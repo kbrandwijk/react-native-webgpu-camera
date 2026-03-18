@@ -35,7 +35,8 @@
                          lidarYUV:(BOOL)lidarYUV
                         resources:(NSArray<NSDictionary *> *)resources
                        passInputs:(NSArray<NSDictionary *> *)passInputs
-               textureOutputPasses:(NSArray<NSNumber *> *)textureOutputPasses {
+               textureOutputPasses:(NSArray<NSNumber *> *)textureOutputPasses
+                       modelSpecs:(NSArray<NSDictionary *> *)modelSpecs {
   if (!_pipeline) return NO;
 
   // Convert NSArray<NSString*> to C string array
@@ -121,6 +122,7 @@
       ib.resourceHandle = b[@"resourceHandle"] ? [b[@"resourceHandle"] intValue] : -1;
       ib.sourcePass = b[@"sourcePass"] ? [b[@"sourcePass"] intValue] : -1;
       ib.sourceBuffer = b[@"sourceBuffer"] ? [b[@"sourceBuffer"] intValue] : -1;
+      ib.modelOutput = b[@"modelOutput"] ? [b[@"modelOutput"] intValue] : -1;
       pis.bindings.push_back(ib);
     }
     passInputSpecs.push_back(pis);
@@ -132,6 +134,43 @@
     texOutPasses.push_back([n intValue]);
   }
 
+  // Convert model specs
+  std::vector<dawn_pipeline::ModelSpec> modelSpecsCpp;
+  for (NSDictionary *ms in modelSpecs) {
+    dawn_pipeline::ModelSpec spec;
+    NSString *path = ms[@"path"];
+    if ([path hasPrefix:@"file://"]) {
+      path = [path substringFromIndex:7];
+    }
+    spec.path = [path UTF8String];
+
+    NSArray<NSNumber *> *shape = ms[@"inputShape"];
+    if (shape) {
+      for (NSNumber *n in shape) {
+        spec.inputShape.push_back([n longLongValue]);
+      }
+    }
+
+    NSArray<NSNumber *> *mean = ms[@"normMean"];
+    if (mean && mean.count == 3) {
+      spec.normMean[0] = [mean[0] floatValue];
+      spec.normMean[1] = [mean[1] floatValue];
+      spec.normMean[2] = [mean[2] floatValue];
+    }
+
+    NSArray<NSNumber *> *std = ms[@"normStd"];
+    if (std && std.count == 3) {
+      spec.normStd[0] = [std[0] floatValue];
+      spec.normStd[1] = [std[1] floatValue];
+      spec.normStd[2] = [std[2] floatValue];
+    }
+
+    spec.sync = [ms[@"sync"] boolValue];
+    spec.pipelineIndex = [ms[@"pipelineIndex"] intValue];
+
+    modelSpecsCpp.push_back(spec);
+  }
+
   return dawn_pipeline_setup_multipass(
     _pipeline,
     cShaders.data(), shaderCount,
@@ -141,7 +180,7 @@
     resourceSpecs.data(), (int)resourceSpecs.size(),
     passInputSpecs.data(), (int)passInputSpecs.size(),
     texOutPasses.data(), (int)texOutPasses.size(),
-    nullptr, 0
+    modelSpecsCpp.data(), (int)modelSpecsCpp.size()
   );
 }
 

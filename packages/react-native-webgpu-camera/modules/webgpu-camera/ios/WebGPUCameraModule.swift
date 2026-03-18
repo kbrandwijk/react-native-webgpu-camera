@@ -172,6 +172,24 @@ public class WebGPUCameraModule: Module {
       let useDepth = config["useDepth"] as? Bool ?? false
       self.useDepth = useDepth
 
+      // Extract model specs — flatten normalization.mean/std into normMean/normStd
+      let modelsRaw = config["models"] as? [[String: Any]] ?? []
+      let modelSpecs: [[String: Any]] = modelsRaw.map { m in
+        var spec: [String: Any] = [
+          "path": m["path"] as? String ?? "",
+          "sync": m["sync"] as? Bool ?? false,
+          "pipelineIndex": m["pipelineIndex"] as? Int ?? -1,
+        ]
+        if let inputShape = m["inputShape"] {
+          spec["inputShape"] = inputShape
+        }
+        if let norm = m["normalization"] as? [String: Any] {
+          spec["normMean"] = norm["mean"]
+          spec["normStd"] = norm["std"]
+        }
+        return spec
+      }
+
       let bufferSpecs = bufferSpecsRaw.map { spec in
         spec.map { $0 }
       }
@@ -195,7 +213,8 @@ public class WebGPUCameraModule: Module {
         lidarYUV: self.isLiDARYUV,
         resources: resourcesRaw,
         passInputs: passInputsRaw,
-        textureOutputPasses: textureOutputPasses
+        textureOutputPasses: textureOutputPasses,
+        modelSpecs: modelSpecs
       )
 
       if ok {
