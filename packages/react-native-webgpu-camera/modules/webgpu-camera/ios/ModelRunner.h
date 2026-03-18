@@ -59,15 +59,18 @@ private:
   // Resize + normalize compute shader
   wgpu::ComputePipeline _resizePipeline;
   wgpu::BindGroupLayout _resizeBindGroupLayout;
-  wgpu::Buffer _modelInputBuffer;  // NCHW float32 storage buffer
+  wgpu::Buffer _modelInputBuffer;  // NCHW float32 storage buffer — shared with ORT via IO binding
   wgpu::Buffer _paramBuffer;       // uniform buffer for resize params
   wgpu::Sampler _resizeSampler;    // linear sampler for bilinear resize
 
-  // Staging buffer for CPU readback of model input (CPU tensor fallback)
-  wgpu::Buffer _stagingBuffer;
-
-  // ONNX Runtime session (opaque -- ort headers only in .mm)
+  // ONNX Runtime session and IO binding (opaque — ort headers only in .mm)
   void* _session = nullptr;       // Ort::Session*
+  void* _ioBinding = nullptr;     // Ort::IoBinding*
+  void* _gpuMemInfo = nullptr;    // Ort::MemoryInfo* for WebGPU_Buf
+
+  // Pre-allocated output buffer — ORT writes here via IO binding
+  wgpu::Buffer _modelOutputBuffer;
+  size_t _outputElements = 0;
 
   // Input/output names (cached from model metadata)
   std::vector<std::string> _inputNames;

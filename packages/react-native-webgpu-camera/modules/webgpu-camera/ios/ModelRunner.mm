@@ -203,6 +203,7 @@ bool ModelRunner::setup(const ModelSpec& spec) {
   }
 
   // ── 7. Allocate model input buffer (NCHW float32) ──
+  // This buffer is shared: resize shader writes to it, ORT reads from it via IO binding.
   {
     uint32_t inputElements = 1 * 3 * _modelH * _modelW;
     uint32_t inputBytes = inputElements * sizeof(float);
@@ -212,13 +213,6 @@ bool ModelRunner::setup(const ModelSpec& spec) {
     bufDesc.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc;
     bufDesc.label = "ModelInputNCHW";
     _modelInputBuffer = _device.CreateBuffer(&bufDesc);
-
-    // Staging buffer for CPU readback (CPU tensor fallback path)
-    wgpu::BufferDescriptor stagingDesc{};
-    stagingDesc.size = inputBytes;
-    stagingDesc.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
-    stagingDesc.label = "ModelInputStaging";
-    _stagingBuffer = _device.CreateBuffer(&stagingDesc);
 
     NSLog(@"[ModelRunner] Input buffer: %u elements (%u bytes)", inputElements, inputBytes);
   }
@@ -243,9 +237,18 @@ bool ModelRunner::setup(const ModelSpec& spec) {
     _device.GetQueue().WriteBuffer(_paramBuffer, 0, &params, sizeof(params));
   }
 
-  // ── 9. Create output texture (R16Float for depth models) ──
-  // Phase 1: single-channel depth output. Future: determine from output channels.
+  // ── 9. Allocate model output buffer + texture ──
+  // ORT writes output here via IO binding, then we copy to the texture.
   {
+    _outputElements = (size_t)_outputW * _outputH;
+    uint32_t outputBytes = (uint32_t)(_outputElements * sizeof(float));
+
+    wgpu::BufferDescriptor outBufDesc{};
+    outBufDesc.size = outputBytes;
+    outBufDesc.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc;
+    outBufDesc.label = "ModelOutputBuffer";
+    _modelOutputBuffer = _device.CreateBuffer(&outBufDesc);
+
     wgpu::TextureDescriptor outTexDesc{};
     outTexDesc.size = {(uint32_t)_outputW, (uint32_t)_outputH, 1};
     outTexDesc.format = wgpu::TextureFormat::R16Float;
@@ -257,7 +260,52 @@ bool ModelRunner::setup(const ModelSpec& spec) {
     _outputTexture = _device.CreateTexture(&outTexDesc);
     _outputView = _outputTexture.CreateView();
 
-    NSLog(@"[ModelRunner] Output texture: %dx%d R16Float", _outputW, _outputH);
+    NSLog(@"[ModelRunner] Output: %dx%d (%u elements, buffer=%u bytes, texture=R16Float)",
+          _outputW, _outputH, (uint32_t)_outputElements, outputBytes);
+  }
+
+  // ── 10. Set up IO binding — GPU buffers bound directly as input/output ──
+  {
+    auto* gpuMem = new Ort::MemoryInfo("WebGPU_Buf", OrtDeviceAllocator, 0, OrtMemTypeDefault);
+    _gpuMemInfo = gpuMem;
+
+    size_t inputElements = 3 * _modelH * _modelW;
+    int64_t inputShapeArr[] = {1, 3, (int64_t)_modelH, (int64_t)_modelW};
+
+    // Create input tensor backed by the GPU buffer (resize shader output)
+    Ort::Value inputTensor = Ort::Value::CreateTensor(
+      *gpuMem,
+      (void*)_modelInputBuffer.Get(),  // GPU buffer pointer
+      inputElements * sizeof(float),
+      inputShapeArr, 4,
+      ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
+
+    auto* binding = new Ort::IoBinding(*session);
+    binding->BindInput(_inputNames[0].c_str(), inputTensor);
+
+    // Bind output to pre-allocated GPU buffer
+    int64_t outputShapeArr[] = {1, 1, (int64_t)_outputH, (int64_t)_outputW};
+    int outputShapeLen = 4;
+    // Handle different output shapes
+    auto outputInfo2 = session->GetOutputTypeInfo(0);
+    auto outTensorInfo2 = outputInfo2.GetTensorTypeAndShapeInfo();
+    auto outShape2 = outTensorInfo2.GetShape();
+    std::vector<int64_t> outputShapeVec;
+    for (auto d : outShape2) {
+      outputShapeVec.push_back(d > 0 ? d : (d == -1 ? _outputH : 1));
+    }
+
+    Ort::Value outputTensor = Ort::Value::CreateTensor(
+      *gpuMem,
+      (void*)_modelOutputBuffer.Get(),
+      _outputElements * sizeof(float),
+      outputShapeVec.data(), outputShapeVec.size(),
+      ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
+
+    binding->BindOutput(_outputNames[0].c_str(), outputTensor);
+
+    _ioBinding = binding;
+    NSLog(@"[ModelRunner] IO binding created — zero-copy GPU path");
   }
 
   // ── 10. Start background inference thread for async models ──
@@ -318,110 +366,77 @@ void ModelRunner::runResizeShader(wgpu::Texture inputTexture) {
   pass.DispatchWorkgroups(groupsX, groupsY, 1);
   pass.End();
 
-  // Copy model input buffer to staging buffer for CPU readback
-  encoder.CopyBufferToBuffer(_modelInputBuffer, 0, _stagingBuffer, 0, _modelInputBuffer.GetSize());
-
   auto commands = encoder.Finish();
   _device.GetQueue().Submit(1, &commands);
 }
 
-// ── CPU tensor fallback inference ──
+// ── GPU-native inference via IO binding ──
 
 void ModelRunner::runInference() {
   if (!_running && !_spec.sync) return;  // shutting down
 
   auto* session = static_cast<Ort::Session*>(_session);
-  if (!session) return;
-
-  auto& ctx = RNSkia::DawnContext::getInstance();
-  auto instance = ctx.getWGPUInstance();
-
-  // ── Map staging buffer to CPU (sync wait — we're on the inference thread) ──
-  bool mapSuccess = false;
-  auto future = _stagingBuffer.MapAsync(
-    wgpu::MapMode::Read, 0, _stagingBuffer.GetSize(),
-    wgpu::CallbackMode::WaitAnyOnly,
-    [&mapSuccess](wgpu::MapAsyncStatus status, wgpu::StringView) {
-      if (status == wgpu::MapAsyncStatus::Success) {
-        mapSuccess = true;
-      }
-    }
-  );
-  instance.WaitAny(future, UINT64_MAX);
-
-  if (!mapSuccess) {
-    NSLog(@"[ModelRunner] FAILED to map staging buffer");
-    return;
-  }
-
-  const float* mappedData = static_cast<const float*>(
-    _stagingBuffer.GetConstMappedRange(0, _stagingBuffer.GetSize()));
-  if (!mappedData) {
-    NSLog(@"[ModelRunner] FAILED to get mapped range");
-    _stagingBuffer.Unmap();
-    return;
-  }
-
-  // ── Create CPU input tensor from mapped GPU data ──
-  int64_t inputShape[] = {1, 3, (int64_t)_modelH, (int64_t)_modelW};
-  size_t inputElements = 3 * _modelH * _modelW;
-
-  // Copy mapped data to a local buffer — we need to unmap before running inference
-  // (the staging buffer must be unmapped before the GPU can write to it again)
-  std::vector<float> inputData(inputElements);
-  std::memcpy(inputData.data(), mappedData, inputElements * sizeof(float));
-  _stagingBuffer.Unmap();
+  auto* binding = static_cast<Ort::IoBinding*>(_ioBinding);
+  if (!session || !binding) return;
 
   try {
-    Ort::MemoryInfo cpuMemInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-
-    Ort::Value inputTensor = Ort::Value::CreateTensor<float>(
-      cpuMemInfo, inputData.data(), inputElements, inputShape, 4);
-
-    // Prepare input/output name C strings
-    std::vector<const char*> inputNamePtrs;
-    for (const auto& name : _inputNames) {
-      inputNamePtrs.push_back(name.c_str());
-    }
-    std::vector<const char*> outputNamePtrs;
-    for (const auto& name : _outputNames) {
-      outputNamePtrs.push_back(name.c_str());
-    }
-
-    // ── Run inference ──
+    // ── Run inference — all GPU, no CPU data movement ──
     auto startTime = std::chrono::high_resolution_clock::now();
 
-    auto outputTensors = session->Run(
-      Ort::RunOptions{nullptr},
-      inputNamePtrs.data(), &inputTensor, 1,
-      outputNamePtrs.data(), outputNamePtrs.size());
+    session->Run(Ort::RunOptions{nullptr}, *binding);
 
     auto endTime = std::chrono::high_resolution_clock::now();
     double inferMs = std::chrono::duration<double, std::milli>(endTime - startTime).count();
 
-    // Log inference time periodically (every ~60 frames based on atomic counter)
+    // Log inference time periodically
     static std::atomic<int> logCounter{0};
     if (logCounter.fetch_add(1) % 60 == 0) {
-      NSLog(@"[ModelRunner] Inference: %.1fms", inferMs);
+      NSLog(@"[ModelRunner] Inference: %.1fms (GPU IO binding)", inferMs);
     }
 
-    // ── Read output tensor and upload to GPU texture ──
-    if (outputTensors.empty() || !outputTensors[0].IsTensor()) {
-      NSLog(@"[ModelRunner] No valid output tensor");
+    // Output is already in _modelOutputBuffer on GPU.
+    // Copy GPU buffer → output texture via a compute shader or buffer-to-texture copy.
+    // Since the output is float32 in the buffer but R16Float in the texture,
+    // we need a conversion compute shader. For now, use a staging readback
+    // ONLY for the float32→float16 conversion, then WriteTexture.
+    // TODO: replace with a f32→f16 compute shader for fully zero-copy.
+
+    // Map output buffer for float32→float16 conversion
+    // Create a staging buffer for output readback
+    wgpu::BufferDescriptor stagingDesc{};
+    stagingDesc.size = _outputElements * sizeof(float);
+    stagingDesc.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
+    stagingDesc.label = "ModelOutputStaging";
+    auto stagingBuf = _device.CreateBuffer(&stagingDesc);
+
+    auto encoder = _device.CreateCommandEncoder();
+    encoder.CopyBufferToBuffer(_modelOutputBuffer, 0, stagingBuf, 0, _outputElements * sizeof(float));
+    auto commands = encoder.Finish();
+    _device.GetQueue().Submit(1, &commands);
+
+    // Sync map on inference thread
+    auto& ctx = RNSkia::DawnContext::getInstance();
+    bool mapSuccess = false;
+    auto future = stagingBuf.MapAsync(
+      wgpu::MapMode::Read, 0, _outputElements * sizeof(float),
+      wgpu::CallbackMode::WaitAnyOnly,
+      [&mapSuccess](wgpu::MapAsyncStatus status, wgpu::StringView) {
+        mapSuccess = (status == wgpu::MapAsyncStatus::Success);
+      }
+    );
+    ctx.getWGPUInstance().WaitAny(future, UINT64_MAX);
+
+    if (!mapSuccess) {
+      NSLog(@"[ModelRunner] FAILED to map output staging buffer");
       return;
     }
 
-    auto& outputValue = outputTensors[0];
-    auto outInfo = outputValue.GetTensorTypeAndShapeInfo();
-    auto outShape = outInfo.GetShape();
-    size_t outputElements = outInfo.GetElementCount();
+    const float* outputData = static_cast<const float*>(
+      stagingBuf.GetConstMappedRange(0, _outputElements * sizeof(float)));
 
-    const float* outputData = outputValue.GetTensorData<float>();
-
-    // Convert float32 output to float16 for R16Float texture
-    std::vector<uint16_t> f16Data(outputElements);
-    for (size_t i = 0; i < outputElements; i++) {
-      // IEEE 754 float32 to float16 conversion
+    // Convert float32 → float16 for R16Float texture
+    std::vector<uint16_t> f16Data(_outputElements);
+    for (size_t i = 0; i < _outputElements; i++) {
       float val = outputData[i];
       uint32_t f32;
       std::memcpy(&f32, &val, 4);
@@ -429,35 +444,32 @@ void ModelRunner::runInference() {
       int32_t exponent = ((f32 >> 23) & 0xFF) - 127 + 15;
       uint32_t mantissa = (f32 >> 13) & 0x3FF;
       if (exponent <= 0) {
-        f16Data[i] = (uint16_t)sign;  // flush to zero
+        f16Data[i] = (uint16_t)sign;
       } else if (exponent >= 31) {
-        f16Data[i] = (uint16_t)(sign | 0x7C00);  // infinity
+        f16Data[i] = (uint16_t)(sign | 0x7C00);
       } else {
         f16Data[i] = (uint16_t)(sign | (exponent << 10) | mantissa);
       }
     }
+    stagingBuf.Unmap();
 
-    // Upload float16 data to output texture via WriteTexture
-    {
-      wgpu::TexelCopyTextureInfo dst{};
-      dst.texture = _outputTexture;
-      dst.mipLevel = 0;
-      dst.origin = {0, 0, 0};
-      dst.aspect = wgpu::TextureAspect::All;
+    // Upload to output texture
+    wgpu::TexelCopyTextureInfo dst{};
+    dst.texture = _outputTexture;
+    dst.mipLevel = 0;
+    dst.origin = {0, 0, 0};
+    dst.aspect = wgpu::TextureAspect::All;
 
-      uint32_t bytesPerRow = (uint32_t)_outputW * sizeof(uint16_t);  // R16Float = 2 bytes/pixel
+    wgpu::TexelCopyBufferLayout layout{};
+    layout.offset = 0;
+    layout.bytesPerRow = (uint32_t)_outputW * sizeof(uint16_t);
+    layout.rowsPerImage = (uint32_t)_outputH;
 
-      wgpu::TexelCopyBufferLayout layout{};
-      layout.offset = 0;
-      layout.bytesPerRow = bytesPerRow;
-      layout.rowsPerImage = (uint32_t)_outputH;
+    wgpu::Extent3D extent = {(uint32_t)_outputW, (uint32_t)_outputH, 1};
+    _device.GetQueue().WriteTexture(
+      &dst, f16Data.data(), f16Data.size() * sizeof(uint16_t), &layout, &extent);
 
-      wgpu::Extent3D extent = {(uint32_t)_outputW, (uint32_t)_outputH, 1};
-      _device.GetQueue().WriteTexture(
-        &dst, f16Data.data(), f16Data.size() * sizeof(uint16_t), &layout, &extent);
-    }
-
-    // Update output view under mutex
+    // Update output view
     {
       std::lock_guard<std::mutex> lock(_outputMutex);
       _outputView = _outputTexture.CreateView();
@@ -549,6 +561,14 @@ void ModelRunner::shutdown() {
   if (_inferenceThread.joinable()) {
     _inferenceThread.join();
   }
+  if (_ioBinding) {
+    delete static_cast<Ort::IoBinding*>(_ioBinding);
+    _ioBinding = nullptr;
+  }
+  if (_gpuMemInfo) {
+    delete static_cast<Ort::MemoryInfo*>(_gpuMemInfo);
+    _gpuMemInfo = nullptr;
+  }
   if (_session) {
     delete static_cast<Ort::Session*>(_session);
     _session = nullptr;
@@ -558,8 +578,8 @@ void ModelRunner::shutdown() {
   _resizePipeline = nullptr;
   _resizeBindGroupLayout = nullptr;
   _modelInputBuffer = nullptr;
+  _modelOutputBuffer = nullptr;
   _paramBuffer = nullptr;
-  _stagingBuffer = nullptr;
   _resizeSampler = nullptr;
   _outputTexture = nullptr;
   _outputView = nullptr;
