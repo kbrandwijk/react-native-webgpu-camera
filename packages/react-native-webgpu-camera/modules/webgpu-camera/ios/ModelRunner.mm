@@ -275,6 +275,8 @@ bool ModelRunner::setup(const ModelSpec& spec) {
 // ── Resize shader dispatch ──
 
 void ModelRunner::runResizeShader(wgpu::Texture inputTexture) {
+  if (!_running && !_spec.sync) return;  // shutting down
+
   // Create bind group for this frame's input texture
   wgpu::TextureView inputView = inputTexture.CreateView();
 
@@ -326,6 +328,8 @@ void ModelRunner::runResizeShader(wgpu::Texture inputTexture) {
 // ── CPU tensor fallback inference ──
 
 void ModelRunner::runInference() {
+  if (!_running && !_spec.sync) return;  // shutting down
+
   auto* session = static_cast<Ort::Session*>(_session);
   if (!session) return;
 

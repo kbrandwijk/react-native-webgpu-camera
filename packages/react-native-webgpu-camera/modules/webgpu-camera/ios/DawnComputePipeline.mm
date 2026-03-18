@@ -186,6 +186,15 @@ DawnComputePipeline::DawnComputePipeline()
 
 DawnComputePipeline::~DawnComputePipeline() {
   _alive->store(false);
+  // Shut down model inference threads BEFORE acquiring the lock.
+  // The inference thread may be mid-inference, and join() blocks until it finishes.
+  // Doing this outside the mutex avoids deadlock with processFrame.
+  if (_impl) {
+    for (auto& model : _impl->models) {
+      model->shutdown();
+    }
+    _impl->models.clear();
+  }
   std::lock_guard<std::mutex> lock(_mutex);
   cleanupLocked();
 }
@@ -1625,10 +1634,13 @@ void DawnComputePipeline::cleanupLocked() {
     }
   }
 
-  for (auto& model : _impl->models) {
-    model->shutdown();
+  // Models may already be shut down by the destructor (outside lock)
+  if (!_impl->models.empty()) {
+    for (auto& model : _impl->models) {
+      model->shutdown();
+    }
+    _impl->models.clear();
   }
-  _impl->models.clear();
 
   _impl->outputImage.reset();
   _impl->surface.reset();
