@@ -16,6 +16,7 @@ public class WebGPUCameraModule: Module {
   var isHDR = false  // true for appleLog OR hlgBT2020 — both deliver 10-bit YUV
   var isYUV422 = false  // true when camera delivers 4:2:2 (x422) instead of 4:2:0 (x420)
   var useDepth = false
+  var isLiDARYUV = false  // true when LiDAR device delivers 8-bit YUV (420f) instead of BGRA
   private var depthOutput: AVCaptureDepthDataOutput?
   private var depthDelegate: DepthDelegate?
 
@@ -366,6 +367,22 @@ public class WebGPUCameraModule: Module {
           self.depthDelegate = depthDel
           delegate.depthDelegate = depthDel
 
+          // Set activeDepthDataFormat to DepthFloat16
+          do {
+            try camera.lockForConfiguration()
+            if let depthFormat = camera.activeFormat.supportedDepthDataFormats.first(where: {
+              CMFormatDescriptionGetMediaSubType($0.formatDescription) == kCVPixelFormatType_DepthFloat16
+            }) {
+              camera.activeDepthDataFormat = depthFormat
+              NSLog("[WebGPUCamera] startCapture: activeDepthDataFormat set to DepthFloat16")
+            } else {
+              NSLog("[WebGPUCamera] startCapture: WARNING — no DepthFloat16 format available")
+            }
+            camera.unlockForConfiguration()
+          } catch {
+            NSLog("[WebGPUCamera] startCapture: failed to lock camera for depth format: \(error)")
+          }
+
           NSLog("[WebGPUCamera] startCapture: depth output + delegate configured")
         } else {
           NSLog("[WebGPUCamera] startCapture: WARNING — could not add depth output")
@@ -403,11 +420,28 @@ public class WebGPUCameraModule: Module {
         output.videoSettings = [
           kCVPixelBufferPixelFormatTypeKey as String: chosen
         ]
+      } else if self.useDepth {
+        // LiDAR depth camera only supports YUV output — request 420f (8-bit full range)
+        let fr420 = OSType(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+        if available.contains(fr420) {
+          output.videoSettings = [
+            kCVPixelBufferPixelFormatTypeKey as String: fr420
+          ]
+          self.isLiDARYUV = true
+          NSLog("[WebGPUCamera] startCapture: step 10b — LiDAR: using 8-bit YUV 4:2:0 FullRange (420f)")
+        } else {
+          NSLog("[WebGPUCamera] startCapture: step 10b — LiDAR: 420f not available, trying BGRA")
+          output.videoSettings = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+          ]
+          self.isLiDARYUV = false
+        }
       } else {
         NSLog("[WebGPUCamera] startCapture: step 10b — requesting BGRA pixel format")
         output.videoSettings = [
           kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
         ]
+        self.isLiDARYUV = false
       }
 
       self.activeWidth = width

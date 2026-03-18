@@ -268,6 +268,46 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 }
 )";
 
+  // Built-in YUV→RGB shader for 8-bit NV12 (LiDAR camera).
+  // Full-range BT.709 YCbCr → RGB with landscape→portrait rotation.
+  static const std::string kNV12toRGBWGSL = R"(
+@group(0) @binding(0) var yPlaneTex: texture_2d<f32>;
+@group(0) @binding(1) var uvPlaneTex: texture_2d<f32>;
+@group(0) @binding(2) var outputTex: texture_storage_2d<rgba16float, write>;
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  let outDims = textureDimensions(outputTex);
+  if (id.x >= outDims.x || id.y >= outDims.y) { return; }
+
+  // 90° CW rotation: output(x, y) reads from input(y, inH - 1 - x)
+  let yDims = textureDimensions(yPlaneTex);
+  let srcCoord = vec2u(id.y, yDims.y - 1u - id.x);
+
+  // Derive UV coord from plane dimensions (4:2:0: half width, half height)
+  let uvDims = textureDimensions(uvPlaneTex);
+  let uvCoord = vec2i(vec2u(
+    srcCoord.x * uvDims.x / yDims.x,
+    srcCoord.y * uvDims.y / yDims.y
+  ));
+
+  let yRaw = textureLoad(yPlaneTex, vec2i(srcCoord), 0).r;
+  let uvRaw = textureLoad(uvPlaneTex, uvCoord, 0).rg;
+
+  // Full range: Y [0,1], CbCr [0,1] centered at 0.5
+  let y = yRaw;
+  let cb = uvRaw.r - 0.5;
+  let cr = uvRaw.g - 0.5;
+
+  // BT.709 YCbCr -> RGB
+  let r = y + 1.5748 * cr;
+  let g = y - 0.1873 * cb - 0.4681 * cr;
+  let b = y + 1.8556 * cb;
+
+  textureStore(outputTex, vec2i(id.xy), vec4f(r, g, b, 1.0));
+}
+)";
+
   // Built-in YUV→RGB shader for Apple Log mode.
   // Converts 10-bit video range YCbCr (BT.2020) to Apple Log encoded RGB.
   // YUV unpack for Apple Log — recovers Apple Log encoded R'G'B' from 10-bit YCbCr.
@@ -316,11 +356,13 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
   auto effectiveShaders = wgslShaders;
   if (appleLog) {
-    // Auto-insert YUV→RGB (with rotation) as pass 0 before user shaders
+    // Auto-insert YUV→RGB (with rotation) as pass 0 — 10-bit Apple Log
     effectiveShaders.insert(effectiveShaders.begin(), kYUVtoRGBWGSL);
+  } else if (useDepth) {
+    // Auto-insert NV12→RGB (with rotation) as pass 0 — 8-bit LiDAR YUV
+    effectiveShaders.insert(effectiveShaders.begin(), kNV12toRGBWGSL);
   } else {
-    // Auto-insert passthrough (with rotation) as pass 0 for sRGB
-    // Handles BGRA→RGBA conversion + landscape→portrait rotation
+    // Auto-insert passthrough (with rotation) as pass 0 for BGRA
     effectiveShaders.insert(effectiveShaders.begin(), kPassthroughWGSL);
   }
 
@@ -839,10 +881,57 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   }
 
   wgpu::Texture inputTexture;
-  wgpu::TextureView yPlaneView;   // only used in appleLog mode
-  wgpu::TextureView uvPlaneView;  // only used in appleLog mode
+  wgpu::TextureView yPlaneView;   // only used in YUV modes
+  wgpu::TextureView uvPlaneView;  // only used in YUV modes
 
-  if (impl->appleLog) {
+  // Detect YUV pixel format — LiDAR delivers 8-bit 420f, Apple Log delivers 10-bit
+  OSType pixFmt = CVPixelBufferGetPixelFormatType(pixelBuffer);
+  bool is8bitYUV = (pixFmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
+                    pixFmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
+  bool isYUV = impl->appleLog || is8bitYUV;
+
+  if (is8bitYUV) {
+    // 8-bit NV12 YUV (LiDAR camera) — R8BG8Biplanar420Unorm
+    static bool loggedFirst8 = false;
+    if (!loggedFirst8) {
+      NSLog(@"[DawnPipeline] processFrame: 8-bit YUV path (LiDAR), importing %dx%d NV12 IOSurface",
+            _inputWidth, _inputHeight);
+    }
+
+    wgpu::TextureDescriptor inputTexDesc{};
+    inputTexDesc.size = {(uint32_t)_inputWidth, (uint32_t)_inputHeight, 1};
+    inputTexDesc.format = wgpu::TextureFormat::R8BG8Biplanar420Unorm;
+    inputTexDesc.usage = wgpu::TextureUsage::TextureBinding;
+    inputTexDesc.dimension = wgpu::TextureDimension::e2D;
+    inputTexDesc.mipLevelCount = 1;
+    inputTexDesc.sampleCount = 1;
+    inputTexDesc.label = "CameraInputNV12";
+
+    inputTexture = sharedMemory.CreateTexture(&inputTexDesc);
+    if (!inputTexture) {
+      if (!loggedFirst8) { NSLog(@"[DawnPipeline] processFrame: CreateTexture (NV12) FAILED"); loggedFirst8 = true; }
+      return false;
+    }
+
+    wgpu::TextureViewDescriptor yViewDesc{};
+    yViewDesc.aspect = wgpu::TextureAspect::Plane0Only;
+    yViewDesc.format = wgpu::TextureFormat::R8Unorm;
+    yPlaneView = inputTexture.CreateView(&yViewDesc);
+
+    wgpu::TextureViewDescriptor uvViewDesc{};
+    uvViewDesc.aspect = wgpu::TextureAspect::Plane1Only;
+    uvViewDesc.format = wgpu::TextureFormat::RG8Unorm;
+    uvPlaneView = inputTexture.CreateView(&uvViewDesc);
+
+    if (!yPlaneView || !uvPlaneView) {
+      if (!loggedFirst8) { NSLog(@"[DawnPipeline] processFrame: NV12 plane views FAILED"); loggedFirst8 = true; }
+      return false;
+    }
+    if (!loggedFirst8) {
+      NSLog(@"[DawnPipeline] processFrame: NV12 texture + plane views OK");
+      loggedFirst8 = true;
+    }
+  } else if (impl->appleLog) {
     // Detect 4:2:2 vs 4:2:0 from pixel buffer format
     OSType pixFmt = CVPixelBufferGetPixelFormatType(pixelBuffer);
     bool is422 = (pixFmt == kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange ||
@@ -1010,7 +1099,7 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
 
       std::vector<wgpu::BindGroupEntry> entries;
 
-      if (impl->appleLog) {
+      if (isYUV) {
         // YUV→RGB pass: Y plane (binding 0) + UV plane (binding 1) + output (binding 2)
         wgpu::BindGroupEntry entry0{};
         entry0.binding = 0;
