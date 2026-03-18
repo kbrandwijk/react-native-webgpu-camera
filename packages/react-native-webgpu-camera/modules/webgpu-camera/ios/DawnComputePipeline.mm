@@ -875,8 +875,15 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
 
   auto sharedMemory = device.ImportSharedTextureMemory(&sharedDesc);
   if (!sharedMemory) {
-    static bool logged = false;
-    if (!logged) { NSLog(@"[DawnPipeline] processFrame: ImportSharedTextureMemory FAILED\n"); logged = true; }
+    static int importFailCount = 0;
+    if (importFailCount++ < 3) {
+      OSType fmt = CVPixelBufferGetPixelFormatType(pixelBuffer);
+      NSLog(@"[DawnPipeline] processFrame: ImportSharedTextureMemory FAILED! fmt=0x%08x (%c%c%c%c), ioSurface=%p",
+            (unsigned)fmt,
+            (char)((fmt >> 24) & 0xFF), (char)((fmt >> 16) & 0xFF),
+            (char)((fmt >> 8) & 0xFF), (char)(fmt & 0xFF),
+            (void*)ioSurface);
+    }
     return false;
   }
 
