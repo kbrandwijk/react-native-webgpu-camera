@@ -25,7 +25,7 @@ export type {
 
 // GPU Resources
 export { GPUResource } from './GPUResource';
-export type { ResourceHandle } from './GPUResource';
+export type { ResourceHandle, ModelResourceHandle, ModelOptions } from './GPUResource';
 
 // Utilities
 export { parseCubeFile } from './parseCubeFile';

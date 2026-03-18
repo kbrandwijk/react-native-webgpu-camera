@@ -1,6 +1,6 @@
 import type { SharedValue } from 'react-native-reanimated';
 import type { SkImage, SkCanvas } from '@shopify/react-native-skia';
-import type { ResourceHandle } from './GPUResource';
+import type { ResourceHandle, ModelResourceHandle } from './GPUResource';
 
 // useCamera
 
@@ -110,6 +110,10 @@ export interface ProcessorFrame {
     options: { output: { readonly __outputType: 'texture2d' }; inputs?: Record<string, any> },
   ): ResourceHandle<'texture2d'>;
 
+  /** Run an ONNX model on the current frame. Returns a texture handle with the model output.
+   *  Async by default — returns the latest available result (null if not ready yet). */
+  runModel(model: ModelResourceHandle): ResourceHandle<'texture2d'> | null;
+
   /** Skia canvas targeting the current pass's output texture */
   canvas: SkCanvas;
   /** Current frame dimensions */
@@ -176,7 +180,7 @@ export interface GPUFrameProcessorResult {
 }
 
 export type { SharedValue };
-export type { ResourceHandle } from './GPUResource';
+export type { ResourceHandle, ModelResourceHandle } from './GPUResource';
 
 // Global JSI bindings installed by the native pipeline
 declare global {

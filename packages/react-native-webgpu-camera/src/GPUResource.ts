@@ -64,6 +64,32 @@ const texture2DToken: OutputTypeToken<'texture2d'> = {
   __outputType: 'texture2d',
 };
 
+export interface ModelOptions {
+  /** Model input shape, e.g. [1, 3, 518, 518]. Inferred from model if omitted. */
+  inputShape?: number[];
+  /** ImageNet normalization params. Default: ImageNet standard. */
+  normalization?: { mean: [number, number, number]; std: [number, number, number] };
+  /** When true, inference blocks the pipeline (for small models). Default: false (async). */
+  sync?: boolean;
+}
+
+/** Model-specific resource handle — extends ResourceHandle with model options */
+export interface ModelResourceHandle extends ResourceHandle<'model'> {
+  readonly __modelOptions?: ModelOptions;
+}
+
+function model(
+  pathOrUrl: string,
+  options?: ModelOptions,
+): ModelResourceHandle {
+  return {
+    __resourceType: 'model',
+    __handle: -1,
+    __fileUri: pathOrUrl,
+    __modelOptions: options,
+  };
+}
+
 /**
  * GPUResource constructors for creating typed GPU handles.
  *
@@ -79,6 +105,7 @@ export const GPUResource = {
   },
   storageBuffer,
   cameraDepth,
+  model,
 };
 
 /** Type guard: is this a ResourceHandle? */
