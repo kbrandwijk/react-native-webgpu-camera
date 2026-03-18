@@ -5,6 +5,9 @@ package = JSON.parse(File.read(File.join(__dir__, '..', '..', '..', 'package.jso
 # Resolve react-native-skia cpp root for Dawn/Skia headers
 skia_pkg_root = File.expand_path('../../../../../packages/react-native-skia/packages/skia', __dir__)
 
+# Resolve onnxruntime framework root for ORT headers
+ort_framework_root = File.expand_path('../../../../../packages/onnxruntime/js/react_native/libs/ios/onnxruntime.framework', __dir__)
+
 Pod::Spec.new do |s|
   s.name           = 'WebGPUCamera'
   s.version        = package['version']
@@ -22,6 +25,7 @@ Pod::Spec.new do |s|
 
   s.dependency 'ExpoModulesCore'
   s.dependency 'react-native-skia'
+  s.dependency 'onnxruntime-react-native'
 
   s.source_files = "*.{h,m,mm,swift,hpp,cpp}"
   s.exclude_files = "rust/**"
@@ -46,6 +50,7 @@ Pod::Spec.new do |s|
       "\"#{skia_pkg_root}/cpp/dawn/include\"",
       "\"#{skia_pkg_root}/apple\"",
       "\"#{skia_pkg_root}/cpp/api\"",
+      "\"#{ort_framework_root}/Headers\"",
     ].join(' '),
   }
 end
