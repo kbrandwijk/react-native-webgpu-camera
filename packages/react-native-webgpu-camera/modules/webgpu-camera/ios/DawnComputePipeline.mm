@@ -1010,11 +1010,10 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   beginDesc.initialized = true;
   bool accessOk = sharedMemory.BeginAccess(inputTexture, &beginDesc);
   if (!accessOk) {
-    static bool loggedAccessFail = false;
-    if (!loggedAccessFail) {
-      NSLog(@"[DawnPipeline] processFrame: BeginAccess FAILED for %s texture",
-            impl->appleLog ? "YUV" : "BGRA");
-      loggedAccessFail = true;
+    static int accessFailCount = 0;
+    if (accessFailCount++ < 3) {
+      NSLog(@"[DawnPipeline] processFrame: BeginAccess FAILED for %s texture (is8bitYUV=%d)",
+            impl->appleLog ? "YUV10" : (is8bitYUV ? "NV12" : "BGRA"), is8bitYUV ? 1 : 0);
     }
     return false;
   }

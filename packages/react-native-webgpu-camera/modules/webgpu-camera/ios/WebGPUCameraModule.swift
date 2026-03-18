@@ -421,16 +421,24 @@ public class WebGPUCameraModule: Module {
           kCVPixelBufferPixelFormatTypeKey as String: chosen
         ]
       } else if self.useDepth {
-        // LiDAR depth camera only supports YUV output — request 420f (8-bit full range)
+        // LiDAR depth camera — try video range YUV first (420v matches Dawn's NV12),
+        // then full range (420f), then BGRA as fallback
+        let vr420 = OSType(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
         let fr420 = OSType(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
-        if available.contains(fr420) {
+        if available.contains(vr420) {
+          output.videoSettings = [
+            kCVPixelBufferPixelFormatTypeKey as String: vr420
+          ]
+          self.isLiDARYUV = true
+          NSLog("[WebGPUCamera] startCapture: step 10b — LiDAR: using 8-bit YUV 4:2:0 VideoRange (420v)")
+        } else if available.contains(fr420) {
           output.videoSettings = [
             kCVPixelBufferPixelFormatTypeKey as String: fr420
           ]
           self.isLiDARYUV = true
           NSLog("[WebGPUCamera] startCapture: step 10b — LiDAR: using 8-bit YUV 4:2:0 FullRange (420f)")
         } else {
-          NSLog("[WebGPUCamera] startCapture: step 10b — LiDAR: 420f not available, trying BGRA")
+          NSLog("[WebGPUCamera] startCapture: step 10b — LiDAR: no YUV available, trying BGRA")
           output.videoSettings = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
           ]
