@@ -47,18 +47,29 @@ export default function OrtTest() {
 
       // Get Dawn device pointers for WebGPU EP
       const dawn = WebGPUCameraModule.getDawnPointers();
-      console.log('[ORT] Dawn pointers:', dawn);
+      console.log('[ORT] Dawn pointers:', JSON.stringify(dawn));
 
       // Create session with WebGPU EP
       console.log('[ORT] Creating session from:', MODEL_PATH);
       setStatus('Creating inference session (WebGPU)...');
+      const epConfig = {
+        name: 'webgpu' as const,
+        deviceId: '1',
+        device: dawn.device,
+        instance: dawn.instance,
+        dawnProcTable: dawn.dawnProcTable,
+      };
+      console.log('[ORT] EP config:', JSON.stringify(epConfig));
       const t0 = performance.now();
-      const session = await InferenceSession.create(MODEL_PATH, {
-        executionProviders: [{
-          name: 'webgpu',
-          ...dawn,
-        }],
-      });
+      let session;
+      try {
+        session = await InferenceSession.create(MODEL_PATH, {
+          executionProviders: [epConfig as any],
+        });
+      } catch (e: any) {
+        console.error('[ORT] Session create failed:', e.message);
+        throw e;
+      }
       const loadTime = performance.now() - t0;
       console.log('[ORT] Session created in', loadTime.toFixed(0), 'ms');
 
