@@ -1100,8 +1100,19 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
       bgDesc.entryCount = entries.size();
       bgDesc.entries = entries.data();
       bindGroup = device.CreateBindGroup(&bgDesc);
+
+      static int dynLogCount = 0;
+      if (dynLogCount < 3) {
+        NSLog(@"[DawnPipeline] Dynamic pass %zu: %zu entries, bindGroup=%s, depthView=%s",
+              i, entries.size(),
+              bindGroup ? "OK" : "FAILED",
+              impl->depthView ? "OK" : "nil");
+        dynLogCount++;
+      }
+
       if (!bindGroup) {
         // Dynamic input not available yet (e.g. depth not arrived) — skip this pass
+        NSLog(@"[DawnPipeline] Skipping dynamic pass %zu — bind group creation failed", i);
         continue;
       }
     } else {
