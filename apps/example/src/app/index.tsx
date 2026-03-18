@@ -21,6 +21,7 @@ import { HISTOGRAM_WGSL } from '@/shaders/histogram.wgsl';
 import { LUT_WGSL } from '@/shaders/lut.wgsl';
 import { DEPTH_COLORMAP_WGSL } from '@/shaders/depth-colormap.wgsl';
 import DepthEstimation from '@/components/DepthEstimation';
+import OrtTest from '@/components/OrtTest';
 
 type ShaderMode =
   | { name: string; wgsl: readonly string[]; type: 'simple' }
@@ -339,6 +340,7 @@ export default function CameraSpikeScreen() {
   const [isRunning, setIsRunning] = useState(false);
   const [shaderIndex, setShaderIndex] = useState(0);
   const [showDepth, setShowDepth] = useState(false);
+  const [showOrt, setShowOrt] = useState(false);
   const [lutResource, setLutResource] = useState<ReturnType<typeof GPUResource.texture3D> | null>(null);
   const shader = SHADERS[shaderIndex];
 
@@ -378,6 +380,10 @@ export default function CameraSpikeScreen() {
 
   if (showDepth) {
     return <DepthEstimation onBack={() => setShowDepth(false)} />;
+  }
+
+  if (showOrt) {
+    return <OrtTest />;
   }
 
   const [showFormatPicker, setShowFormatPicker] = useState(false);
@@ -422,9 +428,14 @@ export default function CameraSpikeScreen() {
         </Pressable>
 
         {!isRunning && (
-          <Pressable style={styles.button} onPress={() => setShowDepth(true)}>
-            <Text style={styles.buttonText}>Depth AI</Text>
-          </Pressable>
+          <>
+            <Pressable style={styles.button} onPress={() => setShowDepth(true)}>
+              <Text style={styles.buttonText}>Depth AI</Text>
+            </Pressable>
+            <Pressable style={styles.button} onPress={() => setShowOrt(true)}>
+              <Text style={styles.buttonText}>ORT Test</Text>
+            </Pressable>
+          </>
         )}
       </View>
 

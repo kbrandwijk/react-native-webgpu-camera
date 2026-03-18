@@ -1,8 +1,28 @@
 # Exclude react-native-skia submodule pieces not needed for iOS EAS build
 # The submodule is only needed locally for `bun run build:skia`
 
-# ONNX Runtime submodule (2.5 GB) — not needed for camera builds yet
-packages/onnxruntime
+# ONNX Runtime — exclude source tree and build intermediates, keep framework + JS
+packages/onnxruntime/onnxruntime
+packages/onnxruntime/cmake
+packages/onnxruntime/tools
+packages/onnxruntime/docs
+packages/onnxruntime/samples
+packages/onnxruntime/orttraining
+packages/onnxruntime/csharp
+packages/onnxruntime/java
+packages/onnxruntime/rust
+packages/onnxruntime/objectivec
+packages/onnxruntime/dockerfiles
+packages/onnxruntime/cgmanifests
+packages/onnxruntime/winml
+packages/onnxruntime/build_ios_webgpu/intermediates
+packages/onnxruntime/build_ios_webgpu/Release/_deps
+packages/onnxruntime/build_ios_webgpu/Release/build
+packages/onnxruntime/build_ios_webgpu/Release/Release-iphonesimulator
+packages/onnxruntime/js/node
+packages/onnxruntime/js/web
+packages/onnxruntime/js/react_native/e2e
+packages/onnxruntime/js/react_native/android
 
 # Local docs not needed for builds
 device-docs

@@ -23,6 +23,7 @@
     "expo-dev-client": "~55.0.16",
     "expo-device": "~55.0.9",
     "expo-file-system": "*",
+    "onnxruntime-react-native": "workspace:*",
     "expo-font": "~55.0.4",
     "expo-glass-effect": "~55.0.8",
     "expo-image": "~55.0.6",

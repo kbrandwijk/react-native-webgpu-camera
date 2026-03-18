@@ -4,6 +4,8 @@
   "workspaces": [
     "packages/*",
     "packages/react-native-skia/packages/skia",
+    "packages/onnxruntime/js/react_native",
+    "packages/onnxruntime/js/common",
     "apps/*"
   ],
   "scripts": {
