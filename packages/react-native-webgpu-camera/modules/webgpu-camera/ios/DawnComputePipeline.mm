@@ -891,10 +891,35 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   wgpu::TextureView yPlaneView;   // only used in YUV modes
   wgpu::TextureView uvPlaneView;  // only used in YUV modes
 
-  // Detect YUV pixel format — LiDAR delivers 8-bit 420f, Apple Log delivers 10-bit
+  // Detect YUV pixel format — LiDAR delivers 8-bit 420v, Apple Log delivers 10-bit
   OSType pixFmt = CVPixelBufferGetPixelFormatType(pixelBuffer);
   bool is8bitYUV = (pixFmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
                     pixFmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
+
+  // CPU-side readback for 8-bit NV12 to verify data is present
+  if (is8bitYUV) {
+    static int nv12DebugCount = 0;
+    if (nv12DebugCount < 3) {
+      CVPixelBufferLockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
+      uint8_t *yPlane = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0);
+      size_t yBpr = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0);
+      size_t yW = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0);
+      size_t yH = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0);
+      uint8_t *uvPlane = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1);
+      size_t uvW = CVPixelBufferGetWidthOfPlane(pixelBuffer, 1);
+      size_t uvH = CVPixelBufferGetHeightOfPlane(pixelBuffer, 1);
+
+      size_t cx = yW / 2, cy = yH / 2;
+      uint8_t yVal = yPlane[cy * yBpr + cx];
+      uint8_t cbVal = uvPlane[(cy / 2) * uvW * 2 + (cx / 2) * 2];
+      uint8_t crVal = uvPlane[(cy / 2) * uvW * 2 + (cx / 2) * 2 + 1];
+
+      NSLog(@"[DawnPipeline] NV12 CPU RAW center: Y=%u Cb=%u Cr=%u | Y plane %zux%zu bpr=%zu, UV plane %zux%zu",
+            yVal, cbVal, crVal, yW, yH, yBpr, uvW, uvH);
+      CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
+      nv12DebugCount++;
+    }
+  }
   bool isYUV = impl->appleLog || is8bitYUV;
 
   if (is8bitYUV) {
