@@ -58,7 +58,8 @@ public:
              const std::vector<PassInputSpec>& passInputs = {},
              const std::vector<int>& textureOutputPasses = {},
              bool appleLog = false,
-             bool useDepth = false);
+             bool useDepth = false,
+             bool lidarYUV = false);
 
   bool processFrame(CVPixelBufferRef pixelBuffer);
   bool processFrame(CVPixelBufferRef pixelBuffer, CVPixelBufferRef depthBuffer);
@@ -142,7 +143,7 @@ bool dawn_pipeline_setup_multipass(
   const char** shaders, int shaderCount,
   int width, int height,
   const int* bufferSpecs, int bufferCount,
-  bool useCanvas, bool sync, bool appleLog, bool useDepth,
+  bool useCanvas, bool sync, bool appleLog, bool useDepth, bool lidarYUV,
   const void* resources, int resourceCount,
   const void* passInputs, int passInputCount,
   const int* textureOutputPasses, int textureOutputPassCount);

@@ -187,6 +187,7 @@ public class WebGPUCameraModule: Module {
         sync: sync,
         appleLog: appleLog,
         useDepth: useDepth,
+        lidarYUV: self.isLiDARYUV,
         resources: resourcesRaw,
         passInputs: passInputsRaw,
         textureOutputPasses: textureOutputPasses

@@ -13,6 +13,7 @@
                              sync:(BOOL)sync
                          appleLog:(BOOL)appleLog
                          useDepth:(BOOL)useDepth
+                         lidarYUV:(BOOL)lidarYUV
                         resources:(nonnull NSArray<NSDictionary *> *)resources
                        passInputs:(nonnull NSArray<NSDictionary *> *)passInputs
                textureOutputPasses:(nonnull NSArray<NSNumber *> *)textureOutputPasses;

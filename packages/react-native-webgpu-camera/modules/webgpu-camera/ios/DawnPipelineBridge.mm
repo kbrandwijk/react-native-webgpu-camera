@@ -30,6 +30,7 @@
                              sync:(BOOL)sync
                          appleLog:(BOOL)appleLog
                          useDepth:(BOOL)useDepth
+                         lidarYUV:(BOOL)lidarYUV
                         resources:(NSArray<NSDictionary *> *)resources
                        passInputs:(NSArray<NSDictionary *> *)passInputs
                textureOutputPasses:(NSArray<NSNumber *> *)textureOutputPasses {
@@ -134,7 +135,7 @@
     cShaders.data(), shaderCount,
     width, height,
     flatSpecs.data(), bufferCount,
-    useCanvas, sync, (bool)appleLog, (bool)useDepth,
+    useCanvas, sync, (bool)appleLog, (bool)useDepth, (bool)lidarYUV,
     resourceSpecs.data(), (int)resourceSpecs.size(),
     passInputSpecs.data(), (int)passInputSpecs.size(),
     texOutPasses.data(), (int)texOutPasses.size()

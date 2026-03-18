@@ -90,6 +90,9 @@ struct DawnComputePipeline::Impl {
   };
   std::vector<UploadedResource> uploadedResources;
 
+  // LiDAR YUV — camera delivers 8-bit NV12 instead of BGRA
+  bool lidarYUV = false;
+
   // Depth support
   bool useDepth = false;
   int depthResourceIndex = -1;
@@ -183,7 +186,8 @@ bool DawnComputePipeline::setup(
     const std::vector<PassInputSpec>& passInputs,
     const std::vector<int>& textureOutputPasses,
     bool appleLog,
-    bool useDepth) {
+    bool useDepth,
+    bool lidarYUV) {
   std::lock_guard<std::mutex> lock(_mutex);
   cleanupLocked();
 
@@ -200,6 +204,7 @@ bool DawnComputePipeline::setup(
   _impl->useCanvas = useCanvas;
   _impl->appleLog = appleLog;
   _impl->useDepth = useDepth;
+  _impl->lidarYUV = lidarYUV;
 
   // Find CameraDepth resource index and create depth sampler
   if (useDepth) {
@@ -358,7 +363,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   if (appleLog) {
     // Auto-insert YUV→RGB (with rotation) as pass 0 — 10-bit Apple Log
     effectiveShaders.insert(effectiveShaders.begin(), kYUVtoRGBWGSL);
-  } else if (useDepth) {
+  } else if (lidarYUV) {
     // Auto-insert NV12→RGB (with rotation) as pass 0 — 8-bit LiDAR YUV
     effectiveShaders.insert(effectiveShaders.begin(), kNV12toRGBWGSL);
   } else {
@@ -1604,7 +1609,7 @@ bool dawn_pipeline_setup_multipass(
     const char** shaders, int shaderCount,
     int width, int height,
     const int* bufferSpecsFlat, int bufferCount,
-    bool useCanvas, bool sync, bool appleLog, bool useDepth,
+    bool useCanvas, bool sync, bool appleLog, bool useDepth, bool lidarYUV,
     const void* resourcesPtr, int resourceCount,
     const void* passInputsPtr, int passInputCount,
     const int* textureOutputPassesPtr, int textureOutputPassCount) {
@@ -1644,7 +1649,7 @@ bool dawn_pipeline_setup_multipass(
   }
 
   return pipeline->setup(wgslShaders, width, height, specs, useCanvas, sync,
-                         resourceVec, passInputVec, texOutVec, appleLog, useDepth);
+                         resourceVec, passInputVec, texOutVec, appleLog, useDepth, lidarYUV);
 }
 
 bool dawn_pipeline_process_frame(DawnComputePipelineRef ref, CVPixelBufferRef pixelBuffer) {
