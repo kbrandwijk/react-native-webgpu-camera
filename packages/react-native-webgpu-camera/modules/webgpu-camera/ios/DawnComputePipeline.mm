@@ -728,6 +728,15 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 }
 
 bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
+  // Always log first frame per impl (uses impl's frameCount which resets on setup)
+  if (_impl && _impl->frameCount <= 2) {
+    NSLog(@"[DawnPipeline] processFrame ENTER #%d: _impl=OK, pixelBuffer=%s, depth=%s, useDepth=%d",
+          _impl->frameCount,
+          pixelBuffer ? "OK" : "nil",
+          _impl->currentDepthBuffer ? "OK" : "nil",
+          _impl->useDepth ? 1 : 0);
+  }
+
   double tWallStart = CACurrentMediaTime();
 
   // Brief lock just to check _impl and grab stable references
