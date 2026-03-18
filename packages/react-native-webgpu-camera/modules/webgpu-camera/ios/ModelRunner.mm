@@ -414,11 +414,25 @@ void ModelRunner::runInference() {
 
     const float* outputData = outputValue.GetTensorData<float>();
 
-    // Convert float32 output to float16 for R16Float texture
+    // Normalize output to 0-1 range (depth models output raw disparity)
+    float minVal = outputData[0], maxVal = outputData[0];
+    for (size_t i = 1; i < outputElements; i++) {
+      if (outputData[i] < minVal) minVal = outputData[i];
+      if (outputData[i] > maxVal) maxVal = outputData[i];
+    }
+    float range = maxVal - minVal;
+    if (range < 1e-6f) range = 1.0f;
+
+    static std::atomic<int> normLogCounter{0};
+    if (normLogCounter.fetch_add(1) % 60 == 0) {
+      NSLog(@"[ModelRunner] Output range: min=%.3f max=%.3f", minVal, maxVal);
+    }
+
+    // Convert float32 output to float16 for R16Float texture (normalized to 0-1)
     std::vector<uint16_t> f16Data(outputElements);
     for (size_t i = 0; i < outputElements; i++) {
-      // IEEE 754 float32 to float16 conversion
-      float val = outputData[i];
+      // Normalize to 0-1
+      float val = (outputData[i] - minVal) / range;
       uint32_t f32;
       std::memcpy(&f32, &val, 4);
       uint32_t sign = (f32 >> 16) & 0x8000;
