@@ -464,6 +464,18 @@ void ModelRunner::runInference() {
     }
     _hasResult = true;
 
+    // Model FPS tracking
+    _inferenceCount++;
+    double now = CACurrentMediaTime();
+    if (_lastFpsTime == 0) {
+      _lastFpsTime = now;
+    } else if (now - _lastFpsTime >= 1.0) {
+      int fps = (int)(_inferenceCount / (now - _lastFpsTime));
+      NSLog(@"[ModelRunner] %d fps (%.1fms avg)", fps, 1000.0 / std::max(fps, 1));
+      _inferenceCount = 0;
+      _lastFpsTime = now;
+    }
+
   } catch (const Ort::Exception& e) {
     NSLog(@"[ModelRunner] Inference FAILED: %s", e.what());
   }

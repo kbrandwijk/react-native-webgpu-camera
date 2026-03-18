@@ -89,6 +89,10 @@ private:
   std::mutex _frameMutex;
 
   ModelSpec _spec;
+
+  // FPS tracking
+  int _inferenceCount = 0;
+  double _lastFpsTime = 0;
 };
 
 }  // namespace dawn_pipeline
