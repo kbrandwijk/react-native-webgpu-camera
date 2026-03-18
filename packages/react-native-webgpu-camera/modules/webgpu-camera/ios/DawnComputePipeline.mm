@@ -294,10 +294,10 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   let yRaw = textureLoad(yPlaneTex, vec2i(srcCoord), 0).r;
   let uvRaw = textureLoad(uvPlaneTex, uvCoord, 0).rg;
 
-  // Full range: Y [0,1], CbCr [0,1] centered at 0.5
-  let y = yRaw;
-  let cb = uvRaw.r - 0.5;
-  let cr = uvRaw.g - 0.5;
+  // Video range 8-bit: Y [16..235]/255, CbCr [16..240]/255
+  let y = (yRaw - 0.0627) / (0.9216 - 0.0627);
+  let cb = (uvRaw.r - 0.0627) / (0.9412 - 0.0627) - 0.5;
+  let cr = (uvRaw.g - 0.0627) / (0.9412 - 0.0627) - 0.5;
 
   // BT.709 YCbCr -> RGB
   let r = y + 1.5748 * cr;
