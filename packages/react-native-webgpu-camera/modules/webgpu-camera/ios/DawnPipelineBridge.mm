@@ -150,7 +150,12 @@
   _frameCount++;
   // Log first 5 frames with depth status (ObjC NSLog — not privacy-redacted)
   if (_frameCount <= 5) {
-    NSLog(@"[DawnBridge] frame #%d, hasDepth=%d", _frameCount, depthBuffer != nil ? 1 : 0);
+    OSType vfmt = CVPixelBufferGetPixelFormatType(pixelBuffer);
+    NSLog(@"[DawnBridge] frame #%d, hasDepth=%d, videoFmt=0x%08x (%c%c%c%c)",
+          _frameCount, depthBuffer != nil ? 1 : 0,
+          (unsigned)vfmt,
+          (char)((vfmt >> 24) & 0xFF), (char)((vfmt >> 16) & 0xFF),
+          (char)((vfmt >> 8) & 0xFF), (char)(vfmt & 0xFF));
     if (depthBuffer && _frameCount == 1) {
       OSType depthFmt = CVPixelBufferGetPixelFormatType(depthBuffer);
       size_t dw = CVPixelBufferGetWidth(depthBuffer);
