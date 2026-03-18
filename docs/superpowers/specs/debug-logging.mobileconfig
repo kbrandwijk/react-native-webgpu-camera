@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>PayloadContent</key>
+	<array>
+		<dict>
+			<key>PayloadType</key>
+			<string>com.apple.system.logging</string>
+			<key>PayloadIdentifier</key>
+			<string>com.apple.system.logging.rnwc</string>
+			<key>PayloadUUID</key>
+			<string>A1B2C3D4-E5F6-7890-ABCD-EF1234567890</string>
+			<key>PayloadVersion</key>
+			<integer>1</integer>
+			<key>PayloadDisplayName</key>
+			<string>RNWC Debug Logging</string>
+			<key>Subsystems</key>
+			<dict>
+				<key>com.kbrandwijk.rnwc.example</key>
+				<dict>
+					<key>DEFAULT-OPTIONS</key>
+					<dict>
+						<key>Level</key>
+						<dict>
+							<key>Enable</key>
+							<string>Debug</string>
+							<key>Persist</key>
+							<string>Debug</string>
+						</dict>
+						<key>Private-Data</key>
+						<dict>
+							<key>Enable</key>
+							<true/>
+						</dict>
+					</dict>
+				</dict>
+				<key>com.apple.avfoundation</key>
+				<dict>
+					<key>DEFAULT-OPTIONS</key>
+					<dict>
+						<key>Level</key>
+						<dict>
+							<key>Enable</key>
+							<string>Debug</string>
+							<key>Persist</key>
+							<string>Debug</string>
+						</dict>
+						<key>Private-Data</key>
+						<dict>
+							<key>Enable</key>
+							<true/>
+						</dict>
+					</dict>
+				</dict>
+			</dict>
+		</dict>
+	</array>
+	<key>PayloadDescription</key>
+	<string>Enables debug logging with private data for RNWC and AVFoundation</string>
+	<key>PayloadDisplayName</key>
+	<string>RNWC Debug Logging</string>
+	<key>PayloadIdentifier</key>
+	<string>com.kbrandwijk.rnwc.example.logging</string>
+	<key>PayloadOrganization</key>
+	<string>RNWC Development</string>
+	<key>PayloadRemovalDisallowed</key>
+	<false/>
+	<key>PayloadType</key>
+	<string>Configuration</string>
+	<key>PayloadUUID</key>
+	<string>F1E2D3C4-B5A6-7890-1234-567890ABCDEF</string>
+	<key>PayloadVersion</key>
+	<integer>1</integer>
+</dict>
+</plist>

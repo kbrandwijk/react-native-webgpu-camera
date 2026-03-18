@@ -1,6 +1,7 @@
 // Depth colormap visualization shader — blends camera color with a
 // depth-based colormap (blue=near, green=mid, yellow=far).
-// Depth texture (320x240 R16Float, meters) is bilinearly upsampled to output resolution.
+// Depth texture (320x180 R16Float) is bilinearly upsampled to output resolution.
+// Note: LiDAR delivers disparity (1/meters), not depth — invert for distance.
 
 export const DEPTH_COLORMAP_WGSL = /* wgsl */ `
 @group(0) @binding(0) var inputTex: texture_2d<f32>;
@@ -23,27 +24,20 @@ fn depthColormap(depth: f32) -> vec3f {
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) id: vec3u) {
   let outDims = textureDimensions(outputTex);
-  if (id.x >= outDims.x || id.y >= outDims.y) {
-    return;
-  }
+  if (id.x >= outDims.x || id.y >= outDims.y) { return; }
 
   // Load camera color
   let color = textureLoad(inputTex, vec2i(id.xy), 0);
 
-  // Sample depth with bilinear interpolation
+  // Sample depth (meters) with bilinear interpolation
   let uv = (vec2f(id.xy) + 0.5) / vec2f(outDims);
-  let depthSample = textureSampleLevel(depthTex, depthSampler, uv, 0.0);
-  let depth = depthSample.r;
+  let depth = textureSampleLevel(depthTex, depthSampler, uv, 0.0).r;
 
   // Map depth to colormap
   let mapped = depthColormap(depth);
 
   // Blend 60% camera + 40% depth colormap
-  let blended = vec4f(
-    color.rgb * 0.6 + mapped * 0.4,
-    color.a
-  );
-
-  textureStore(outputTex, vec2i(id.xy), blended);
+  let blended = mix(color.rgb, mapped, 0.4);
+  textureStore(outputTex, vec2i(id.xy), vec4f(blended, 1.0));
 }
 `;
