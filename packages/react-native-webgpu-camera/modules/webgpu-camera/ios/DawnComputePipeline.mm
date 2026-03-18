@@ -104,6 +104,9 @@ struct DawnComputePipeline::Impl {
   // Default linear sampler for texture outputs (always created if any custom inputs exist)
   wgpu::Sampler defaultSampler;
 
+  // Model runners (indexed by model spec order)
+  std::vector<std::unique_ptr<ModelRunner>> models;
+
   // Per-pass custom input bindings (indexed by pass index)
   std::vector<std::vector<InputBinding>> passInputBindings;
 
@@ -123,7 +126,14 @@ struct DawnComputePipeline::Impl {
     switch (ib.type) {
       case InputBindingType::Texture3D:
       case InputBindingType::Texture2D:
-        if (ib.resourceHandle >= 0 && ib.resourceHandle == depthResourceIndex && depthView) {
+        if (ib.modelOutput >= 0 && (size_t)ib.modelOutput < models.size()) {
+          // Model output texture
+          auto view = models[ib.modelOutput]->getOutputView();
+          if (view) {
+            entry.textureView = view;
+            entries.push_back(entry);
+          }
+        } else if (ib.resourceHandle >= 0 && ib.resourceHandle == depthResourceIndex && depthView) {
           // Per-frame depth texture from camera
           entry.textureView = depthView;
           entries.push_back(entry);
@@ -138,7 +148,10 @@ struct DawnComputePipeline::Impl {
         break;
 
       case InputBindingType::Sampler:
-        if (ib.resourceHandle >= 0 && ib.resourceHandle == depthResourceIndex && depthSampler) {
+        if (ib.modelOutput >= 0 && (size_t)ib.modelOutput < models.size()) {
+          // Model output sampler — use default linear sampler
+          entry.sampler = defaultSampler;
+        } else if (ib.resourceHandle >= 0 && ib.resourceHandle == depthResourceIndex && depthSampler) {
           // Depth sampler for upsampling
           entry.sampler = depthSampler;
         } else if (ib.resourceHandle >= 0 && (size_t)ib.resourceHandle < uploadedResources.size()
@@ -187,7 +200,8 @@ bool DawnComputePipeline::setup(
     const std::vector<int>& textureOutputPasses,
     bool appleLog,
     bool useDepth,
-    bool lidarYUV) {
+    bool lidarYUV,
+    const std::vector<ModelSpec>& models) {
   std::lock_guard<std::mutex> lock(_mutex);
   cleanupLocked();
 
@@ -453,8 +467,8 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   _impl->finalTex = (effectiveShaders.size() % 2 != 0) ? &_impl->texA : &_impl->texB;
 
   // ── Upload custom resources ──
-  if (!passInputs.empty()) {
-    // Create default linear sampler (used for pass texture outputs)
+  if (!passInputs.empty() || !models.empty()) {
+    // Create default linear sampler (used for pass texture outputs and model outputs)
     wgpu::SamplerDescriptor samplerDesc{};
     samplerDesc.magFilter = wgpu::FilterMode::Linear;
     samplerDesc.minFilter = wgpu::FilterMode::Linear;
@@ -639,6 +653,20 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     }
   }
 
+  // ── Setup model runners ──
+  for (const auto& modelSpec : models) {
+    auto runner = std::make_unique<ModelRunner>(_impl->device, _width, _height);
+    if (!runner->setup(modelSpec)) {
+      NSLog(@"[DawnPipeline] FAILED to setup model: %s", modelSpec.path.c_str());
+      cleanupLocked();
+      return false;
+    }
+    _impl->models.push_back(std::move(runner));
+  }
+  if (!models.empty()) {
+    NSLog(@"[DawnPipeline] Setup %zu model runners OK", models.size());
+  }
+
   // Store per-pass custom input bindings
   NSLog(@"[DawnPipeline] Storing %zu passInput specs across %zu passes\n",
          passInputs.size(), _impl->passes.size());
@@ -650,11 +678,16 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
       _impl->passInputBindings[piSpec.passIndex] = piSpec.bindings;
       // Check if any binding references a dynamic resource (e.g. cameraDepth)
       for (const auto& b : piSpec.bindings) {
-        NSLog(@"[DawnPipeline] passInput binding: passIndex=%d, bindingIndex=%d, resourceHandle=%d, depthResourceIndex=%d\n",
-              piSpec.passIndex, b.bindingIndex, b.resourceHandle, _impl->depthResourceIndex);
+        NSLog(@"[DawnPipeline] passInput binding: passIndex=%d, bindingIndex=%d, resourceHandle=%d, depthResourceIndex=%d, modelOutput=%d\n",
+              piSpec.passIndex, b.bindingIndex, b.resourceHandle, _impl->depthResourceIndex, b.modelOutput);
         if (b.resourceHandle >= 0 && b.resourceHandle == _impl->depthResourceIndex) {
           _impl->passes[piSpec.passIndex].hasDynamicInputs = true;
-          NSLog(@"[DawnPipeline] Pass %d marked as hasDynamicInputs\n", piSpec.passIndex);
+          NSLog(@"[DawnPipeline] Pass %d marked as hasDynamicInputs (depth)\n", piSpec.passIndex);
+          break;
+        }
+        if (b.modelOutput >= 0) {
+          _impl->passes[piSpec.passIndex].hasDynamicInputs = true;
+          NSLog(@"[DawnPipeline] Pass %d marked as hasDynamicInputs (model output %d)\n", piSpec.passIndex, b.modelOutput);
           break;
         }
       }
@@ -1275,6 +1308,15 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   auto commands = encoder.Finish();
   device.GetQueue().Submit(1, &commands);
 
+  // ── Submit frame to model runners ──
+  if (!impl->models.empty()) {
+    bool finalIsA = (impl->passes.size() % 2 != 0);
+    wgpu::Texture& currentOutput = finalIsA ? impl->texA : impl->texB;
+    for (auto& model : impl->models) {
+      model->submitFrame(currentOutput);
+    }
+  }
+
   double tAfterCompute = CACurrentMediaTime();
 
   // Copy output buffers to staging in a separate submission
@@ -1583,6 +1625,11 @@ void DawnComputePipeline::cleanupLocked() {
     }
   }
 
+  for (auto& model : _impl->models) {
+    model->shutdown();
+  }
+  _impl->models.clear();
+
   _impl->outputImage.reset();
   _impl->surface.reset();
   _impl->texA = nullptr;
@@ -1624,7 +1671,8 @@ bool dawn_pipeline_setup_multipass(
     bool useCanvas, bool sync, bool appleLog, bool useDepth, bool lidarYUV,
     const void* resourcesPtr, int resourceCount,
     const void* passInputsPtr, int passInputCount,
-    const int* textureOutputPassesPtr, int textureOutputPassCount) {
+    const int* textureOutputPassesPtr, int textureOutputPassCount,
+    const void* modelSpecsPtr, int modelCount) {
   auto* pipeline = static_cast<dawn_pipeline::DawnComputePipeline*>(ref);
 
   std::vector<std::string> wgslShaders;
@@ -1660,8 +1708,16 @@ bool dawn_pipeline_setup_multipass(
     texOutVec.assign(textureOutputPassesPtr, textureOutputPassesPtr + textureOutputPassCount);
   }
 
+  const dawn_pipeline::ModelSpec* modelSpecs =
+    static_cast<const dawn_pipeline::ModelSpec*>(modelSpecsPtr);
+  std::vector<dawn_pipeline::ModelSpec> modelVec;
+  if (modelCount > 0 && modelSpecs) {
+    modelVec.assign(modelSpecs, modelSpecs + modelCount);
+  }
+
   return pipeline->setup(wgslShaders, width, height, specs, useCanvas, sync,
-                         resourceVec, passInputVec, texOutVec, appleLog, useDepth, lidarYUV);
+                         resourceVec, passInputVec, texOutVec, appleLog, useDepth, lidarYUV,
+                         modelVec);
 }
 
 bool dawn_pipeline_process_frame(DawnComputePipelineRef ref, CVPixelBufferRef pixelBuffer) {

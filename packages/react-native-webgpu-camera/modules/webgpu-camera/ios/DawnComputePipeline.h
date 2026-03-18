@@ -8,6 +8,7 @@
 #include <memory>
 #include <atomic>
 #include <CoreVideo/CVPixelBuffer.h>
+#include "ModelRunner.h"
 
 namespace dawn_pipeline {
 
@@ -32,6 +33,7 @@ struct InputBinding {
   int resourceHandle = -1;  // index into resources array
   int sourcePass = -1;      // pass that produced this buffer/texture
   int sourceBuffer = -1;    // global buffer index
+  int modelOutput = -1;     // index into models array
 };
 
 struct PassInputSpec {
@@ -59,7 +61,8 @@ public:
              const std::vector<int>& textureOutputPasses = {},
              bool appleLog = false,
              bool useDepth = false,
-             bool lidarYUV = false);
+             bool lidarYUV = false,
+             const std::vector<ModelSpec>& models = {});
 
   bool processFrame(CVPixelBufferRef pixelBuffer);
   bool processFrame(CVPixelBufferRef pixelBuffer, CVPixelBufferRef depthBuffer);
@@ -146,7 +149,8 @@ bool dawn_pipeline_setup_multipass(
   bool useCanvas, bool sync, bool appleLog, bool useDepth, bool lidarYUV,
   const void* resources, int resourceCount,
   const void* passInputs, int passInputCount,
-  const int* textureOutputPasses, int textureOutputPassCount);
+  const int* textureOutputPasses, int textureOutputPassCount,
+  const void* modelSpecs, int modelCount);
 
 bool dawn_pipeline_process_frame(DawnComputePipelineRef ref,
                                   CVPixelBufferRef pixelBuffer);

@@ -140,7 +140,8 @@
     useCanvas, sync, (bool)appleLog, (bool)useDepth, (bool)lidarYUV,
     resourceSpecs.data(), (int)resourceSpecs.size(),
     passInputSpecs.data(), (int)passInputSpecs.size(),
-    texOutPasses.data(), (int)texOutPasses.size()
+    texOutPasses.data(), (int)texOutPasses.size(),
+    nullptr, 0
   );
 }
 
