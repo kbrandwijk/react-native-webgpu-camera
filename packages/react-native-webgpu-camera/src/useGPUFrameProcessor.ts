@@ -94,6 +94,11 @@ function capturePipeline<B extends Record<string, any>, R extends Record<string,
     for (const [name, handle] of Object.entries(resources)) {
       if (isResourceHandle(handle)) {
         const rh = handle as ResourceHandle<any>;
+        // Skip model resources — they're handled by runModel(), not the resource upload path
+        if (rh.__resourceType === 'model') {
+          resourceHandles[name] = handle;
+          continue;
+        }
         const idx = capturedResources.length;
         // Store resource spec for native upload
         capturedResources.push({
