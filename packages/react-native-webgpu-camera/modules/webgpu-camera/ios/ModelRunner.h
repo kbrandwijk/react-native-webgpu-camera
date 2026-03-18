@@ -1,5 +1,7 @@
 #pragma once
 
+#ifdef __cplusplus
+
 #include <string>
 #include <vector>
 #include <mutex>
@@ -90,3 +92,5 @@ private:
 };
 
 }  // namespace dawn_pipeline
+
+#endif // __cplusplus
