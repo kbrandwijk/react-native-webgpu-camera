@@ -1050,42 +1050,50 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
 
   double tAfterImport = CACurrentMediaTime();
 
-  // ── Import depth IOSurface when available ──
-  wgpu::SharedTextureMemory depthSharedMemory;
+  // ── Upload depth data via CPU readback (Dawn doesn't map DepthFloat16 IOSurfaces) ──
   if (impl->useDepth && impl->currentDepthBuffer) {
-    IOSurfaceRef depthSurface = CVPixelBufferGetIOSurface(impl->currentDepthBuffer);
-    if (depthSurface) {
-      size_t depthW = CVPixelBufferGetWidth(impl->currentDepthBuffer);
-      size_t depthH = CVPixelBufferGetHeight(impl->currentDepthBuffer);
+    size_t depthW = CVPixelBufferGetWidth(impl->currentDepthBuffer);
+    size_t depthH = CVPixelBufferGetHeight(impl->currentDepthBuffer);
 
-      wgpu::SharedTextureMemoryIOSurfaceDescriptor depthIoDesc{};
-      depthIoDesc.ioSurface = depthSurface;
-      wgpu::SharedTextureMemoryDescriptor depthSharedDesc{};
-      depthSharedDesc.nextInChain = &depthIoDesc;
+    // Create persistent depth texture on first frame (or if dimensions change)
+    if (!impl->depthTexture ||
+        impl->depthTexture.GetWidth() != depthW ||
+        impl->depthTexture.GetHeight() != depthH) {
+      wgpu::TextureDescriptor depthTexDesc{};
+      depthTexDesc.size = {(uint32_t)depthW, (uint32_t)depthH, 1};
+      depthTexDesc.format = wgpu::TextureFormat::R16Float;
+      depthTexDesc.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst;
+      depthTexDesc.label = "CameraDepthUpload";
+      impl->depthTexture = device.CreateTexture(&depthTexDesc);
+      impl->depthView = impl->depthTexture.CreateView();
 
-      depthSharedMemory = device.ImportSharedTextureMemory(&depthSharedDesc);
-      if (depthSharedMemory) {
-        wgpu::TextureDescriptor depthTexDesc{};
-        depthTexDesc.size = {(uint32_t)depthW, (uint32_t)depthH, 1};
-        depthTexDesc.format = wgpu::TextureFormat::R16Float;
-        depthTexDesc.usage = wgpu::TextureUsage::TextureBinding;
-        depthTexDesc.label = "CameraDepth";
-
-        impl->depthTexture = depthSharedMemory.CreateTexture(&depthTexDesc);
-        if (impl->depthTexture) {
-          wgpu::SharedTextureMemoryBeginAccessDescriptor depthBeginDesc{};
-          depthBeginDesc.initialized = true;
-          depthSharedMemory.BeginAccess(impl->depthTexture, &depthBeginDesc);
-          impl->depthView = impl->depthTexture.CreateView();
-
-          static bool loggedDepth = false;
-          if (!loggedDepth) {
-            NSLog(@"[DawnPipeline] Depth texture imported: %zux%zu R16Float", depthW, depthH);
-            loggedDepth = true;
-          }
-        }
+      static bool loggedDepth = false;
+      if (!loggedDepth) {
+        NSLog(@"[DawnPipeline] Depth texture created (CPU upload): %zux%zu R16Float", depthW, depthH);
+        loggedDepth = true;
       }
     }
+
+    // CPU readback + upload (115KB at 320x180 — negligible)
+    CVPixelBufferLockBaseAddress(impl->currentDepthBuffer, kCVPixelBufferLock_ReadOnly);
+    const void* depthData = CVPixelBufferGetBaseAddress(impl->currentDepthBuffer);
+    size_t depthBpr = CVPixelBufferGetBytesPerRow(impl->currentDepthBuffer);
+
+    wgpu::ImageCopyTexture dst{};
+    dst.texture = impl->depthTexture;
+    dst.mipLevel = 0;
+    dst.origin = {0, 0, 0};
+    dst.aspect = wgpu::TextureAspect::All;
+
+    wgpu::TextureDataLayout layout{};
+    layout.offset = 0;
+    layout.bytesPerRow = (uint32_t)depthBpr;
+    layout.rowsPerImage = (uint32_t)depthH;
+
+    wgpu::Extent3D extent = {(uint32_t)depthW, (uint32_t)depthH, 1};
+    device.GetQueue().WriteTexture(&dst, depthData, depthBpr * depthH, &layout, &extent);
+
+    CVPixelBufferUnlockBaseAddress(impl->currentDepthBuffer, kCVPixelBufferLock_ReadOnly);
   }
 
   // ── Raw camera path: no compute, just wrap the BGRA texture as SkImage ──
@@ -1347,13 +1355,7 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   wgpu::SharedTextureMemoryEndAccessState endState{};
   sharedMemory.EndAccess(inputTexture, &endState);
 
-  // Cleanup depth IOSurface access
-  if (depthSharedMemory && impl->depthTexture) {
-    wgpu::SharedTextureMemoryEndAccessState depthEndState{};
-    depthSharedMemory.EndAccess(impl->depthTexture, &depthEndState);
-    impl->depthTexture = nullptr;
-    impl->depthView = nullptr;
-  }
+  // Clear per-frame depth buffer reference (texture persists for reuse)
   impl->currentDepthBuffer = nullptr;
 
   // ── Brief lock to publish results ──
