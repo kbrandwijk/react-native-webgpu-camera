@@ -15,7 +15,13 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
   let camera = textureLoad(inputTex, vec2i(id.xy), 0);
   let uv = (vec2f(id.xy) + 0.5) / vec2f(dims);
-  let d = textureSampleLevel(depthTex, depthSampler, uv, 0.0).r;
+  let raw = textureSampleLevel(depthTex, depthSampler, uv, 0.0).r;
+
+  // Normalize raw disparity to 0-1 using a saturate — depth-anything outputs
+  // large values so we use an adaptive scale: divide by a reasonable max.
+  // A fixed divisor works because the model's output range is fairly stable.
+  // Tweak this value if the colormap looks wrong.
+  let d = saturate(raw / 50.0);
 
   // Blue (near) -> Green (mid) -> Yellow (far) colormap
   var color: vec3f;
