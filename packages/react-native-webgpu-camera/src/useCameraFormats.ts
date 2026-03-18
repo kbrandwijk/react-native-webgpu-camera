@@ -15,6 +15,7 @@ function mapNativeFormat(raw: Record<string, any>): CameraFormat {
     fieldOfView: (raw.fieldOfView as number) ?? 0,
     isBinned: (raw.isBinned as boolean) ?? false,
     isMultiCamSupported: (raw.isMultiCamSupported as boolean) ?? false,
+    supportsDepth: (raw.supportsDepth as boolean) ?? false,
     nativeHandle: raw.nativeHandle as number,
   };
 }
