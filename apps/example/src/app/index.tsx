@@ -20,17 +20,24 @@ import { SOBEL_COLOR_WGSL } from '@/shaders/sobel-color.wgsl';
 import { HISTOGRAM_WGSL } from '@/shaders/histogram.wgsl';
 import { LUT_WGSL } from '@/shaders/lut.wgsl';
 import { DEPTH_COLORMAP_WGSL } from '@/shaders/depth-colormap.wgsl';
+import { DEPTH_MODEL_OVERLAY_WGSL } from '@/shaders/depth-model-overlay.wgsl';
 import DepthEstimation from '@/components/DepthEstimation';
 import OrtTest from '@/components/OrtTest';
+import { Paths, File as ExpoFile } from 'expo-file-system';
 
 type ShaderMode =
   | { name: string; wgsl: readonly string[]; type: 'simple' }
   | { name: string; type: 'histogram' }
   | { name: string; type: 'histogram-onframe' }
   | { name: string; type: 'applelog' }
-  | { name: string; type: 'depth' };
+  | { name: string; type: 'depth' }
+  | { name: string; type: 'depth-model' };
+
+const DEPTH_MODEL_URL = 'https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx';
+const DEPTH_MODEL_PATH = `${Paths.document.uri}/depth-anything-v2-small.onnx`;
 
 const SHADERS: ShaderMode[] = [
+  { name: 'Depth Model', type: 'depth-model' },
   { name: 'Depth', type: 'depth' },
     { name: 'None', wgsl: [], type: 'simple' },
   { name: 'Passthrough', wgsl: [PASSTHROUGH_WGSL], type: 'simple' },
@@ -336,12 +343,60 @@ function DepthPreview({ format, colorSpace }: { format?: CameraFormat; colorSpac
   );
 }
 
+function DepthModelPreview({ format, colorSpace, modelPath }: { format?: CameraFormat; colorSpace?: ColorSpace; modelPath: string }) {
+  const { width: screenW, height: screenH } = useWindowDimensions();
+
+  const camera = useCamera({
+    device: 'back',
+    format,
+    colorSpace,
+  });
+
+  const { currentFrame, fps, displayFps, metrics, error } = useGPUFrameProcessor(camera, {
+    resources: {
+      depth: GPUResource.model(modelPath, {
+        inputShape: [1, 3, 518, 518],
+      }),
+    },
+    pipeline: (frame, res: any) => {
+      'worklet';
+      const depthMap = frame.runModel(res.depth);
+      if (depthMap) {
+        frame.runShader(DEPTH_MODEL_OVERLAY_WGSL, { inputs: { depth: depthMap } });
+      }
+    },
+  });
+
+  useDerivedValue(() => {
+    const m = metrics.value;
+    if (fps.value > 0 && m) {
+      console.log(`[DepthModel] ${fps.value}fps (display=${displayFps.value}) | lock=${m.lockWait.toFixed(2)}ms import=${m.import.toFixed(2)}ms compute=${m.compute.toFixed(2)}ms total=${m.total.toFixed(2)}ms wall=${m.wall.toFixed(2)}ms`);
+    }
+  });
+
+  return (
+    <>
+      <Canvas style={StyleSheet.absoluteFill}>
+        <Fill color="black" />
+        <SkImage image={currentFrame} x={0} y={0} width={screenW} height={screenH} fit="cover" />
+      </Canvas>
+
+      <View style={styles.statusBar}>
+        <Text style={styles.statusText}>
+          {error ? `Error: ${error}` : camera.isReady ? `Depth Model ${camera.width}x${camera.height} @ ${camera.fps}fps` : 'Starting camera...'}
+        </Text>
+      </View>
+    </>
+  );
+}
+
 export default function CameraSpikeScreen() {
   const [isRunning, setIsRunning] = useState(false);
   const [shaderIndex, setShaderIndex] = useState(0);
   const [showDepth, setShowDepth] = useState(false);
   const [showOrt, setShowOrt] = useState(false);
   const [lutResource, setLutResource] = useState<ReturnType<typeof GPUResource.texture3D> | null>(null);
+  const [depthModelPath, setDepthModelPath] = useState<string | null>(null);
   const shader = SHADERS[shaderIndex];
 
   // Load bundled .cube LUT on mount — pass file URI, native side parses .cube
@@ -353,6 +408,21 @@ export default function CameraSpikeScreen() {
         width: 0, height: 0, depth: 0,
         format: 'rgba32float',
       }));
+    })();
+  }, []);
+
+  // Download depth model on mount
+  useEffect(() => {
+    (async () => {
+      const file = new ExpoFile(DEPTH_MODEL_PATH);
+      if (!file.exists) {
+        console.log('[DepthModel] Downloading depth model...');
+        const resp = await fetch(DEPTH_MODEL_URL);
+        const bytes = new Uint8Array(await resp.arrayBuffer());
+        file.write(bytes);
+        console.log('[DepthModel] Download complete');
+      }
+      setDepthModelPath(DEPTH_MODEL_PATH);
     })();
   }, []);
 
@@ -400,6 +470,14 @@ export default function CameraSpikeScreen() {
       {isRunning && shader.type === 'simple' && <CameraPreview key={`${shader.name}-${selectedColorSpace}`} shaderChain={shader.wgsl} format={selectedFormat} colorSpace={selectedColorSpace} />}
       {isRunning && shader.type === 'applelog' && <AppleLogPreview key={`${shader.name}-${selectedColorSpace}`} format={selectedFormat} colorSpace={selectedColorSpace} lutResource={lutResource} />}
       {isRunning && shader.type === 'depth' && <DepthPreview key={`${shader.name}-${selectedColorSpace}`} format={selectedFormat} colorSpace={selectedColorSpace} />}
+      {isRunning && shader.type === 'depth-model' && depthModelPath && <DepthModelPreview key={`${shader.name}-${selectedColorSpace}`} format={selectedFormat} colorSpace={selectedColorSpace} modelPath={depthModelPath} />}
+      {isRunning && shader.type === 'depth-model' && !depthModelPath && (
+        <View style={StyleSheet.absoluteFill}>
+          <View style={styles.statusBar}>
+            <Text style={styles.statusText}>Downloading depth model...</Text>
+          </View>
+        </View>
+      )}
 
       <View style={styles.controls}>
         {isRunning && (
