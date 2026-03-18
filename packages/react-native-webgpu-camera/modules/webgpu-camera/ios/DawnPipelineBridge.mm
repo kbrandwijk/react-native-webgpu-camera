@@ -151,6 +151,19 @@
   // Log first 5 frames with depth status (ObjC NSLog — not privacy-redacted)
   if (_frameCount <= 5) {
     NSLog(@"[DawnBridge] frame #%d, hasDepth=%d", _frameCount, depthBuffer != nil ? 1 : 0);
+    if (depthBuffer && _frameCount == 1) {
+      OSType depthFmt = CVPixelBufferGetPixelFormatType(depthBuffer);
+      size_t dw = CVPixelBufferGetWidth(depthBuffer);
+      size_t dh = CVPixelBufferGetHeight(depthBuffer);
+      size_t dPlanes = CVPixelBufferGetPlaneCount(depthBuffer);
+      size_t dBpr = CVPixelBufferGetBytesPerRowOfPlane(depthBuffer, 0);
+      IOSurfaceRef dSurface = CVPixelBufferGetIOSurface(depthBuffer);
+      NSLog(@"[DawnBridge] depth fmt=0x%08x (%c%c%c%c), %zux%zu, %zu planes, bpr=%zu, ioSurface=%s",
+            (unsigned)depthFmt,
+            (char)((depthFmt >> 24) & 0xFF), (char)((depthFmt >> 16) & 0xFF),
+            (char)((depthFmt >> 8) & 0xFF), (char)(depthFmt & 0xFF),
+            dw, dh, dPlanes, dBpr, dSurface ? "YES" : "NO");
+    }
   }
   static bool loggedFormat = false;
   if (!loggedFormat) {
