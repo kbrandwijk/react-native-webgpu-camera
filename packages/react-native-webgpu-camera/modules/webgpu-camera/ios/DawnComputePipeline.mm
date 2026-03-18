@@ -1079,13 +1079,13 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
     const void* depthData = CVPixelBufferGetBaseAddress(impl->currentDepthBuffer);
     size_t depthBpr = CVPixelBufferGetBytesPerRow(impl->currentDepthBuffer);
 
-    wgpu::ImageCopyTexture dst{};
+    wgpu::TexelCopyTextureInfo dst{};
     dst.texture = impl->depthTexture;
     dst.mipLevel = 0;
     dst.origin = {0, 0, 0};
     dst.aspect = wgpu::TextureAspect::All;
 
-    wgpu::TextureDataLayout layout{};
+    wgpu::TexelCopyBufferLayout layout{};
     layout.offset = 0;
     layout.bytesPerRow = (uint32_t)depthBpr;
     layout.rowsPerImage = (uint32_t)depthH;
