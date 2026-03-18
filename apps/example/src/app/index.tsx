@@ -30,7 +30,8 @@ type ShaderMode =
   | { name: string; type: 'depth' };
 
 const SHADERS: ShaderMode[] = [
-  { name: 'None', wgsl: [], type: 'simple' },
+  { name: 'Depth', type: 'depth' },
+    { name: 'None', wgsl: [], type: 'simple' },
   { name: 'Passthrough', wgsl: [PASSTHROUGH_WGSL], type: 'simple' },
   { name: 'Sobel', wgsl: [SOBEL_WGSL], type: 'simple' },
   { name: 'Sobel Color', wgsl: [SOBEL_COLOR_WGSL], type: 'simple' },
@@ -38,7 +39,7 @@ const SHADERS: ShaderMode[] = [
   { name: 'Histogram', type: 'histogram' },
   { name: 'Hist (burn)', type: 'histogram-onframe' },
   { name: 'LUT', type: 'applelog' },
-  { name: 'Depth', type: 'depth' },
+
 ];
 
 function CameraPreview({ shaderChain, format, colorSpace }: { shaderChain: readonly string[]; format?: CameraFormat; colorSpace?: ColorSpace }) {
