@@ -1328,8 +1328,18 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
 
   // Determine final output texture and create SkImage
   bool finalIsA = (impl->passes.size() % 2 != 0);
+  if (impl->frameCount < 3) {
+    NSLog(@"[DawnPipeline] finalIsA=%d, passes=%zu, texA=%p, texB=%p, dims=%dx%d",
+          finalIsA, impl->passes.size(),
+          (void*)(finalIsA ? &impl->texA : &impl->texB),
+          (void*)(!finalIsA ? &impl->texA : &impl->texB),
+          _width, _height);
+  }
   auto outputImage = ctx.MakeImageFromTexture(
     *(finalIsA ? &impl->texA : &impl->texB), _width, _height, wgpu::TextureFormat::RGBA16Float);
+  if (impl->frameCount < 3) {
+    NSLog(@"[DawnPipeline] MakeImageFromTexture: image=%s", outputImage ? "OK" : "nil");
+  }
 
   double tAfterMakeImage = CACurrentMediaTime();
 
