@@ -3,7 +3,7 @@ import { useSharedValue, useFrameCallback } from "react-native-reanimated";
 import type { SkImage } from "@shopify/react-native-skia";
 import WebGPUCameraModule from "../modules/webgpu-camera/src/WebGPUCameraModule";
 import { isResourceHandle, isTextureOutputToken } from './GPUResource';
-import type { ResourceHandle } from './GPUResource';
+import type { ResourceHandle, ModelResourceHandle } from './GPUResource';
 import type {
   CameraHandle,
   CameraStream,
@@ -34,6 +34,16 @@ interface CapturedInput {
   resourceHandle?: number;
   sourcePass?: number;
   sourceBuffer?: number;
+  modelOutput?: number;
+}
+
+/** A captured model inference pass */
+interface CapturedModel {
+  path: string;
+  inputShape?: number[];
+  normalization?: { mean: [number, number, number]; std: [number, number, number] };
+  sync: boolean;
+  pipelineIndex: number;
 }
 
 /** A resource spec to send to native for GPU upload */
@@ -67,10 +77,12 @@ function capturePipeline<B extends Record<string, any>, R extends Record<string,
   bufferMetas: BufferMeta[];
   hasCanvas: boolean;
   capturedResources: CapturedResource[];
+  capturedModels: CapturedModel[];
 } {
   const passes: CapturedPass[] = [];
   const bufferMetas: BufferMeta[] = [];
   const capturedResources: CapturedResource[] = [];
+  const capturedModels: CapturedModel[] = [];
   let hasCanvas = false;
 
   // Map resource handle identity → index into capturedResources
@@ -100,7 +112,7 @@ function capturePipeline<B extends Record<string, any>, R extends Record<string,
   }
 
   // Track pass-output handles: map handle → { passIndex, bufferIndex }
-  const outputHandleMap = new Map<any, { passIndex: number; bufferIndex: number; isTexture: boolean }>();
+  const outputHandleMap = new Map<any, { passIndex: number; bufferIndex: number; isTexture: boolean; modelIndex?: number }>();
 
   const captureFrame: ProcessorFrame = {
     runShader(
@@ -150,9 +162,25 @@ function capturePipeline<B extends Record<string, any>, R extends Record<string,
               nextBinding++;
             }
           } else if (outputHandleMap.has(handle)) {
-            // Buffer/texture output from a previous pass
+            // Buffer/texture output from a previous pass or model
             const src = outputHandleMap.get(handle)!;
-            if (src.isTexture) {
+            if (src.modelIndex !== undefined) {
+              // Model output — bind as texture + sampler
+              pass.inputs.push({
+                name,
+                bindingIndex: nextBinding,
+                type: 'texture2d',
+                modelOutput: src.modelIndex,
+              });
+              nextBinding++;
+              pass.inputs.push({
+                name: `${name}_sampler`,
+                bindingIndex: nextBinding,
+                type: 'sampler',
+                modelOutput: src.modelIndex,
+              });
+              nextBinding++;
+            } else if (src.isTexture) {
               pass.inputs.push({
                 name,
                 bindingIndex: nextBinding,
@@ -208,6 +236,23 @@ function capturePipeline<B extends Record<string, any>, R extends Record<string,
       passes.push(pass);
       return {} as any;
     },
+    runModel(modelHandle: ModelResourceHandle) {
+      const modelIndex = capturedModels.length;
+      const mrh = modelHandle as ModelResourceHandle;
+      capturedModels.push({
+        path: mrh.__fileUri ?? '',
+        inputShape: mrh.__modelOptions?.inputShape,
+        normalization: mrh.__modelOptions?.normalization,
+        sync: mrh.__modelOptions?.sync ?? false,
+        // pipelineIndex is the model's position in the overall pipeline execution order
+        // (same as passes.length — model occupies a "slot" like a shader pass)
+        pipelineIndex: passes.length,
+      });
+      // Return a handle that downstream runShader calls can reference
+      const handle = { __resourceType: 'texture2d', __handle: -1 } as any;
+      outputHandleMap.set(handle, { passIndex: -1, bufferIndex: -1, isTexture: false, modelIndex });
+      return handle as any;
+    },
     canvas: new Proxy({} as any, {
       get(_, prop) {
         if (typeof prop === "string" && prop.startsWith("draw")) {
@@ -235,7 +280,7 @@ function capturePipeline<B extends Record<string, any>, R extends Record<string,
     }
   }
 
-  return { passes, bufferMetas, hasCanvas, capturedResources };
+  return { passes, bufferMetas, hasCanvas, capturedResources, capturedModels };
 }
 
 /**
@@ -249,6 +294,7 @@ function buildNativeConfig(
   sync: boolean,
   capturedResources: CapturedResource[],
   appleLog: boolean,
+  capturedModels: CapturedModel[],
 ) {
   const shaders = passes.map((p) => p.wgsl);
   const buffers: [number, number, number][] = [];
@@ -288,6 +334,7 @@ function buildNativeConfig(
       resourceHandle?: number;
       sourcePass?: number;
       sourceBuffer?: number;
+      modelOutput?: number;
     }[];
   }[] = [];
 
@@ -301,10 +348,20 @@ function buildNativeConfig(
           resourceHandle: inp.resourceHandle,
           sourcePass: inp.sourcePass !== undefined ? inp.sourcePass + passOffset : undefined,
           sourceBuffer: inp.sourceBuffer,
+          modelOutput: inp.modelOutput,
         })),
       });
     }
   });
+
+  // Build models array for native — apply passOffset to pipelineIndex
+  const models = capturedModels.map((m) => ({
+    path: m.path,
+    inputShape: m.inputShape,
+    normalization: m.normalization,
+    sync: m.sync,
+    pipelineIndex: m.pipelineIndex + passOffset,
+  }));
 
   // Log binding assignments at setup (format: name→3(texture3d)+4(sampler))
   passes.forEach((pass, i) => {
@@ -324,7 +381,7 @@ function buildNativeConfig(
 
   const useDepth = capturedResources.some((r) => r.type === 'cameraDepth');
 
-  return { shaders, width, height, buffers, useCanvas, sync, appleLog, resources, passInputs, textureOutputPasses, useDepth };
+  return { shaders, width, height, buffers, useCanvas, sync, appleLog, resources, passInputs, textureOutputPasses, useDepth, models };
 }
 
 /**
@@ -421,7 +478,7 @@ export function useGPUFrameProcessor(
       ? (processorOrConfig as ProcessorConfig<any, any>).resources
       : undefined;
 
-    const { passes, bufferMetas, hasCanvas, capturedResources } = capturePipeline(
+    const { passes, bufferMetas, hasCanvas, capturedResources, capturedModels } = capturePipeline(
       pipelineFn as (frame: ProcessorFrame, resources: any) => any,
       resourcesConfig,
       camera.width,
@@ -450,6 +507,7 @@ export function useGPUFrameProcessor(
       sync,
       capturedResources,
       appleLog,
+      capturedModels,
     );
 
     console.log(`[WebGPUCamera] setupMultiPassPipeline: appleLog=${appleLog}, ${nativeConfig.shaders.length} shaders, ${nativeConfig.resources.length} resources, ${nativeConfig.passInputs.length} passInputs`);
@@ -459,6 +517,9 @@ export function useGPUFrameProcessor(
     }
     if (nativeConfig.passInputs.length > 0) {
       console.log(`[WebGPUCamera] passInputs:`, JSON.stringify(nativeConfig.passInputs.map(pi => ({ passIndex: pi.passIndex, bindings: pi.bindings.length }))));
+    }
+    if (nativeConfig.models.length > 0) {
+      console.log(`[WebGPUCamera] models:`, JSON.stringify(nativeConfig.models.map(m => ({ path: m.path, pipelineIndex: m.pipelineIndex, sync: m.sync }))));
     }
 
     let ok: boolean;
