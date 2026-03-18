@@ -147,6 +147,11 @@ public class WebGPUCameraModule: Module {
       }
     }
 
+    // --- Dawn pointers for ONNX Runtime WebGPU EP ---
+    Function("getDawnPointers") { () -> [String: String] in
+      return DawnPipelineBridge.getDawnPointers()
+    }
+
     // --- Dawn compute pipeline ---
 
     Function("setupMultiPassPipeline") { (config: [String: Any]) -> Bool in

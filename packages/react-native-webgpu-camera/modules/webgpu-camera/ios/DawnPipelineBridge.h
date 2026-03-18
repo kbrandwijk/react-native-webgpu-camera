@@ -24,4 +24,7 @@
 - (void)cleanup;
 - (void)installJSIBindings:(nonnull id)expoRuntime;
 
+/// Returns Dawn device/instance/proc-table pointers as decimal strings for ONNX Runtime WebGPU EP.
++ (nonnull NSDictionary<NSString *, NSString *> *)getDawnPointers;
+
 @end

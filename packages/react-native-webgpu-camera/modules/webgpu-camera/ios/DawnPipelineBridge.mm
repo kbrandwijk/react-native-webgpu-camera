@@ -1,6 +1,8 @@
 #import "DawnPipelineBridge.h"
 #include "DawnComputePipeline.h"
 #import <ExpoModulesJSI/EXJavaScriptRuntime.h>
+#include "RNDawnContext.h"
+#include <dawn/native/DawnNative.h>
 
 @implementation DawnPipelineBridge {
   DawnComputePipelineRef _pipeline;
@@ -205,6 +207,25 @@
   facebook::jsi::Runtime *jsiRuntime = [runtime get];
   if (!jsiRuntime) return;
   dawn_pipeline_install_jsi(_pipeline, jsiRuntime);
+}
+
++ (NSDictionary<NSString *, NSString *> *)getDawnPointers {
+  auto& ctx = RNSkia::DawnContext::getInstance();
+  auto device = ctx.getWGPUDevice();
+  auto instance = ctx.getWGPUInstance();
+
+  // Get the proc table — same one Skia set up at init
+  static const DawnProcTable* procs = nullptr;
+  if (!procs) {
+    static DawnProcTable p = dawn::native::GetProcs();
+    procs = &p;
+  }
+
+  return @{
+    @"device": [NSString stringWithFormat:@"%lu", (uintptr_t)device.Get()],
+    @"instance": [NSString stringWithFormat:@"%lu", (uintptr_t)instance.Get()],
+    @"dawnProcTable": [NSString stringWithFormat:@"%lu", (uintptr_t)procs],
+  };
 }
 
 @end

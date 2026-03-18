@@ -7,4 +7,19 @@ const config = getDefaultConfig(__dirname);
 // Register .cube as an asset extension so require() resolves LUT files
 config.resolver.assetExts.push('cube');
 
+// Stub out onnxruntime-web and onnxruntime-node for transformers.js
+// We use onnxruntime-react-native instead, registered via Symbol.for('onnxruntime')
+const path = require('path');
+const emptyModule = path.resolve(__dirname, 'src/utils/empty-module.js');
+const originalResolveRequest = config.resolver.resolveRequest;
+config.resolver.resolveRequest = (context, moduleName, platform) => {
+  if (moduleName === 'onnxruntime-web' || moduleName === 'onnxruntime-node') {
+    return { type: 'sourceFile', filePath: emptyModule };
+  }
+  if (originalResolveRequest) {
+    return originalResolveRequest(context, moduleName, platform);
+  }
+  return context.resolveRequest(context, moduleName, platform);
+};
+
 module.exports = config;
