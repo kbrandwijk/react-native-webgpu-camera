@@ -307,14 +307,9 @@ function DepthPreview({ format, colorSpace }: { format?: CameraFormat; colorSpac
     useDepth: true,
   });
 
-  const { currentFrame, error } = useGPUFrameProcessor(camera, {
-    resources: {
-      depth: GPUResource.cameraDepth(),
-    },
-    pipeline: (frame, res: any) => {
-      'worklet';
-      frame.runShader(DEPTH_COLORMAP_WGSL, { inputs: { depth: res.depth } });
-    },
+  const { currentFrame, error } = useGPUFrameProcessor(camera, (frame) => {
+    'worklet';
+    frame.runShader(DEPTH_COLORMAP_WGSL);
   });
 
   return (
