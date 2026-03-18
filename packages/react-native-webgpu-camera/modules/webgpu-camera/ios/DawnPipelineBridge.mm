@@ -4,6 +4,7 @@
 
 @implementation DawnPipelineBridge {
   DawnComputePipelineRef _pipeline;
+  int _frameCount;
 }
 
 - (instancetype)init {
@@ -146,6 +147,11 @@
 
 - (BOOL)processFrame:(CVPixelBufferRef)pixelBuffer depthBuffer:(CVPixelBufferRef)depthBuffer {
   if (!_pipeline) return NO;
+  _frameCount++;
+  // Log first 5 frames with depth status (ObjC NSLog — not privacy-redacted)
+  if (_frameCount <= 5) {
+    NSLog(@"[DawnBridge] frame #%d, hasDepth=%d", _frameCount, depthBuffer != nil ? 1 : 0);
+  }
   static bool loggedFormat = false;
   if (!loggedFormat) {
     OSType fmt = CVPixelBufferGetPixelFormatType(pixelBuffer);
