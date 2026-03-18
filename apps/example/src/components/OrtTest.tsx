@@ -9,8 +9,8 @@ const WebGPUCameraModule = requireNativeModule('WebGPUCamera') as {
   getDawnPointers(): { device: string; instance: string; dawnProcTable: string };
 };
 
-const MODEL_URL = 'https://media.githubusercontent.com/media/onnx/models/main/validated/vision/classification/mobilenet/model/mobilenetv2-12-int8.onnx';
-const MODEL_PATH = `${Paths.document.uri}/mobilenetv2-12-int8.onnx`;
+const MODEL_URL = 'https://media.githubusercontent.com/media/onnx/models/main/validated/vision/classification/mobilenet/model/mobilenetv2-12.onnx';
+const MODEL_PATH = `${Paths.document.uri}/mobilenetv2-12.onnx`;
 
 export default function OrtTest() {
   const [status, setStatus] = useState('Tap Run to start');
@@ -89,9 +89,17 @@ export default function OrtTest() {
       const t1 = performance.now();
       const feeds: Record<string, Tensor> = {};
       feeds[inputNames[0]] = inputTensor;
-      const output = await session.run(feeds);
+      console.log('[ORT] Calling session.run()...');
+      let output;
+      try {
+        output = await session.run(feeds);
+      } catch (e: any) {
+        console.error('[ORT] session.run() failed:', e.message, e.stack?.slice(0, 500));
+        throw e;
+      }
       const inferenceTime = performance.now() - t1;
       console.log('[ORT] Inference done in', inferenceTime.toFixed(0), 'ms');
+      console.log('[ORT] Output keys:', Object.keys(output));
 
       const outputTensor = output[outputNames[0]];
       const outputData = outputTensor.data as Float32Array;
@@ -111,8 +119,9 @@ export default function OrtTest() {
         top5.map((t, i) => `  ${i + 1}. class ${t.index}: ${t.score.toFixed(4)}`).join('\n')
       );
     } catch (e: any) {
+      console.error('[ORT] Error:', e.message, e.stack?.slice(0, 500));
       setStatus(`Error: ${e.message}`);
-      setResult(e.stack?.slice(0, 800) || null);
+      setResult(`${e.message}\n\n${e.stack?.slice(0, 800) || 'no stack'}`);
     } finally {
       setRunning(false);
     }
