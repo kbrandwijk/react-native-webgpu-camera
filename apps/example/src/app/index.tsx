@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import {
   View,
   Text,
@@ -352,12 +352,15 @@ function DepthModelPreview({ format, colorSpace, modelPath }: { format?: CameraF
     colorSpace,
   });
 
+  // Memoize resources — GPUResource.model() creates a new object each call,
+  // which would trigger useEffect re-runs and recreate the pipeline every render.
+  const depthResource = useMemo(
+    () => GPUResource.model(modelPath, { inputShape: [1, 3, 518, 518] }),
+    [modelPath],
+  );
+
   const { currentFrame, fps, displayFps, metrics, error } = useGPUFrameProcessor(camera, {
-    resources: {
-      depth: GPUResource.model(modelPath, {
-        inputShape: [1, 3, 518, 518],
-      }),
-    },
+    resources: { depth: depthResource },
     pipeline: (frame, res: any) => {
       'worklet';
       const depthMap = frame.runModel(res.depth);
