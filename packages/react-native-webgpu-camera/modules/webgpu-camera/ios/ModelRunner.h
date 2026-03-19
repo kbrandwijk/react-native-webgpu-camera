@@ -68,7 +68,8 @@ private:
   void* _ioBinding = nullptr;     // Ort::IoBinding*
   void* _gpuMemInfo = nullptr;    // Ort::MemoryInfo* for WebGPU_Buf
 
-  // Output element count (for staging buffer allocation)
+  // Pre-allocated output GPU buffer — bound to IO binding at setup, reused every frame
+  wgpu::Buffer _modelOutputBuffer;
   size_t _outputElements = 0;
 
   // Input/output names (cached from model metadata)
