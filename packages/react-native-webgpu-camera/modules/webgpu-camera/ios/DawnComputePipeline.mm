@@ -663,6 +663,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   }
 
   // ── Setup model runners ──
+  NSLog(@"[DawnPipeline] Setting up %zu model runner(s)", models.size());
   for (const auto& modelSpec : models) {
     auto runner = std::make_unique<ModelRunner>(_impl->device, _width, _height);
     if (!runner->setup(modelSpec)) {
