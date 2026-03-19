@@ -99,7 +99,7 @@ bool ModelRunner::setup(const ModelSpec& spec) {
     _session = new Ort::Session(env, spec.path.c_str(), sessionOptions);
     NSLog(@"[ModelRunner] ONNX session created: %s", spec.path.c_str());
   } catch (const Ort::Exception& e) {
-    NSLog(@"[ModelRunner] FAILED to create ONNX session: %s", e.what());
+    NSLog(@"[ModelRunner] FAILED to create ONNX session: %{public}s", e.what());
     return false;
   }
 
@@ -275,7 +275,7 @@ bool ModelRunner::setup(const ModelSpec& spec) {
     _ioBinding = binding;
     NSLog(@"[ModelRunner] IO binding created — zero-copy GPU path");
   } catch (const Ort::Exception& e) {
-    NSLog(@"[ModelRunner] IO binding setup FAILED: %s", e.what());
+    NSLog(@"[ModelRunner] IO binding setup FAILED: %{public}s", e.what());
     return false;
   }
 
@@ -484,7 +484,7 @@ void ModelRunner::runInference() {
     }
 
   } catch (const Ort::Exception& e) {
-    NSLog(@"[ModelRunner] Inference FAILED: %s", e.what());
+    NSLog(@"[ModelRunner] Inference FAILED: %{public}s", e.what());
   }
 }
 
