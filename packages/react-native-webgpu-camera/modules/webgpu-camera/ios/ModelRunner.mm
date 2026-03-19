@@ -277,15 +277,17 @@ bool ModelRunner::setup(const ModelSpec& spec) {
     auto* binding = new Ort::IoBinding(*session);
 
     // Bind input: resize shader output buffer
+    // Tensors must be heap-allocated — binding holds references, locals would dangle.
     size_t inputElements = 3 * _modelH * _modelW;
     int64_t inputShapeArr[] = {1, 3, (int64_t)_modelH, (int64_t)_modelW};
-    Ort::Value inputTensor = Ort::Value::CreateTensor(
+    auto* inputTensor = new Ort::Value(Ort::Value::CreateTensor(
       *gpuMem,
       (void*)_modelInputBuffer.Get(),
       inputElements * sizeof(float),
       inputShapeArr, 4,
-      ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
-    binding->BindInput(_inputNames[0].c_str(), inputTensor);
+      ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT));
+    binding->BindInput(_inputNames[0].c_str(), *inputTensor);
+    _boundInputTensor = inputTensor;
     NSLog(@"[ModelRunner] Input bound: %zu elements", inputElements);
 
     // Bind output: pre-allocated output buffer
@@ -296,13 +298,14 @@ bool ModelRunner::setup(const ModelSpec& spec) {
     for (auto d : outShape2) {
       outputShapeVec.push_back(d > 0 ? d : _outputH);  // replace dynamic dims
     }
-    Ort::Value outputTensor = Ort::Value::CreateTensor(
+    auto* outputTensor = new Ort::Value(Ort::Value::CreateTensor(
       *gpuMem,
       (void*)_modelOutputBuffer.Get(),
       _outputElements * sizeof(float),
       outputShapeVec.data(), outputShapeVec.size(),
-      ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
-    binding->BindOutput(_outputNames[0].c_str(), outputTensor);
+      ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT));
+    binding->BindOutput(_outputNames[0].c_str(), *outputTensor);
+    _boundOutputTensor = outputTensor;
     NSLog(@"[ModelRunner] Output bound: %zu elements", _outputElements);
 
     _ioBinding = binding;
@@ -564,6 +567,14 @@ void ModelRunner::shutdown() {
   if (_ioBinding) {
     delete static_cast<Ort::IoBinding*>(_ioBinding);
     _ioBinding = nullptr;
+  }
+  if (_boundInputTensor) {
+    delete static_cast<Ort::Value*>(_boundInputTensor);
+    _boundInputTensor = nullptr;
+  }
+  if (_boundOutputTensor) {
+    delete static_cast<Ort::Value*>(_boundOutputTensor);
+    _boundOutputTensor = nullptr;
   }
   if (_gpuMemInfo) {
     delete static_cast<Ort::MemoryInfo*>(_gpuMemInfo);

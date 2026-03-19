@@ -67,6 +67,8 @@ private:
   void* _session = nullptr;       // Ort::Session*
   void* _ioBinding = nullptr;     // Ort::IoBinding*
   void* _gpuMemInfo = nullptr;    // Ort::MemoryInfo* for WebGPU_Buf
+  void* _boundInputTensor = nullptr;   // Ort::Value* — must outlive binding
+  void* _boundOutputTensor = nullptr;  // Ort::Value* — must outlive binding
 
   // Pre-allocated output GPU buffer — bound to IO binding at setup, reused every frame
   wgpu::Buffer _modelOutputBuffer;
