@@ -353,7 +353,11 @@ void ModelRunner::runInference() {
   try {
     auto* gpuMem = static_cast<Ort::MemoryInfo*>(_gpuMemInfo);
 
-    // ── Bind input: GPU buffer from resize shader ──
+    // ── Clear and re-bind for this frame ──
+    binding->ClearBoundInputs();
+    binding->ClearBoundOutputs();
+
+    // Bind input: GPU buffer from resize shader
     size_t inputElements = 3 * _modelH * _modelW;
     int64_t inputShapeArr[] = {1, 3, (int64_t)_modelH, (int64_t)_modelW};
 
@@ -365,6 +369,9 @@ void ModelRunner::runInference() {
       ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
 
     binding->BindInput(_inputNames[0].c_str(), inputTensor);
+
+    // Re-bind output (ORT allocates a fresh GPU buffer each run)
+    binding->BindOutput(_outputNames[0].c_str(), *gpuMem);
 
     // ── Run inference — all GPU, no CPU data movement ──
     auto startTime = std::chrono::high_resolution_clock::now();
