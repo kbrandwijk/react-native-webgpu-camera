@@ -366,6 +366,9 @@ void ModelRunner::runInference() {
 
     binding->BindInput(_inputNames[0].c_str(), inputTensor);
 
+    // Re-bind output each frame — GetOutputValues() consumes the previous binding
+    binding->BindOutput(_outputNames[0].c_str(), *gpuMem);
+
     // ── Run inference — all GPU, no CPU data movement ──
     auto startTime = std::chrono::high_resolution_clock::now();
 
