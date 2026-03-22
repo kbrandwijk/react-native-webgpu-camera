@@ -80,6 +80,7 @@ public:
    *  When set, processFrame blits the final compute output to the canvas
    *  surface and presents, skipping MakeImageFromTexture entirely. */
   void setCanvasContextId(int contextId);
+  bool presentToCanvas(); // blit compute output to canvas surface (call from JS thread)
 
   /** Single-lock frame begin: returns image, buffers, canvas, fps, generation, metrics */
   struct FrameData {

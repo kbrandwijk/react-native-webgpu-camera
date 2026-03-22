@@ -550,7 +550,8 @@ export function useGPUFrameProcessor(
     const s = globalThis.__webgpuCamera_createStream();
     stream.value = s;
 
-    // Configure WebGPU canvas output if canvasRef is provided
+    // Configure WebGPU canvas IMMEDIATELY after stream creation,
+    // before the frame callback starts processing frames
     let canvasSetupAborted = false;
     if (canvasRef?.current) {
       const ref = canvasRef.current;
@@ -558,15 +559,13 @@ export function useGPUFrameProcessor(
       const ctx = ref.getContext("webgpu");
 
       if (ctx) {
-        // Use Skia's shared Dawn device — same GPU device as the compute pipeline
         const device = Skia.getDevice();
         const format = navigator.gpu.getPreferredCanvasFormat();
         ctx.configure({ device, format, alphaMode: "opaque" });
-        // Tell the native pipeline to present to this canvas
+        // Force surface initialization at full PixelRatio resolution
+        const surfaceTex = ctx.getCurrentTexture();
         s.setCanvasContextId(contextId);
         useCanvasOutput.value = true;
-        // Log the actual surface dimensions
-        const surfaceTex = ctx.getCurrentTexture();
         console.log(`[WebGPUCamera] Canvas output configured: contextId=${contextId}, format=${format}, surface=${surfaceTex.width}x${surfaceTex.height}`);
       }
     }
@@ -595,7 +594,8 @@ export function useGPUFrameProcessor(
     fps.value = frame.pipelineFps;
 
     // Track display FPS — count frames where generation changed (truly new frame)
-    if (frame.generation !== lastGen.value) {
+    const hasNewFrame = frame.generation !== lastGen.value;
+    if (hasNewFrame) {
       lastGen.value = frame.generation;
       displayFrameCount.value++;
       const now = performance.now();
@@ -622,11 +622,12 @@ export function useGPUFrameProcessor(
       buffers.value = readBuffers;
     }
 
-    // When using WebGPU canvas output, the native side handles present directly.
-    // No SkImage wrapping needed — skip the image path entirely.
+    // WebGPU canvas output: blit compute result to canvas surface
+    // This runs on the JS/UI thread, separate from the camera compute thread
     if (useCanvasOutput.value) {
-      // onFrame canvas overlay is not supported in canvas output mode (yet)
-      // The frame.image may be null when canvas output is active
+      if (hasNewFrame) {
+        s.presentToCanvas();
+      }
       frame.image?.dispose();
       return;
     }
