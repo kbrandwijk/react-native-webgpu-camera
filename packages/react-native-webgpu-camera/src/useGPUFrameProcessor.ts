@@ -560,13 +560,16 @@ export function useGPUFrameProcessor(
 
       if (ctx) {
         const device = Skia.getDevice();
-        const format = navigator.gpu.getPreferredCanvasFormat();
-        ctx.configure({ device, format, alphaMode: "opaque" });
-        // Force surface initialization at full PixelRatio resolution
-        const surfaceTex = ctx.getCurrentTexture();
+        ctx.configure({
+          device,
+          format: 'rgba16float' as GPUTextureFormat,
+          usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+          alphaMode: "opaque",
+        });
+        // setCanvasContextId will reconfigure the surface to match compute output dims
         s.setCanvasContextId(contextId);
         useCanvasOutput.value = true;
-        console.log(`[WebGPUCamera] Canvas output configured: contextId=${contextId}, format=${format}, surface=${surfaceTex.width}x${surfaceTex.height}`);
+        console.log(`[WebGPUCamera] Canvas output configured: contextId=${contextId}, compute=${camera.height}x${camera.width}`);
       }
     }
 
@@ -622,12 +625,9 @@ export function useGPUFrameProcessor(
       buffers.value = readBuffers;
     }
 
-    // WebGPU canvas output: blit compute result to canvas surface
-    // This runs on the JS/UI thread, separate from the camera compute thread
+    // WebGPU canvas output: compute thread copies directly to surface + presents.
+    // No JS-thread work needed — just skip the SkImage path.
     if (useCanvasOutput.value) {
-      if (hasNewFrame) {
-        s.presentToCanvas();
-      }
       frame.image?.dispose();
       return;
     }

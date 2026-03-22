@@ -19,6 +19,8 @@ function TabLayout() {
   );
 }
 
-export default __DEV__ && Reactotron.overlay
-  ? Reactotron.overlay(TabLayout)
-  : TabLayout;
+// export default __DEV__ && Reactotron.overlay
+//   ? Reactotron.overlay(TabLayout)
+//   : TabLayout;
+
+export default TabLayout
