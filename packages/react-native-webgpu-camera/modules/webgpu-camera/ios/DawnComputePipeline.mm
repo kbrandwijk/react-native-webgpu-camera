@@ -276,6 +276,8 @@ bool DawnComputePipeline::setup(
   // For now, always use the compute path with auto-inserted passthrough shader.
 
   // Create ping-pong textures (portrait dimensions — rotation done in pass 0)
+  // Always RGBA16Float — preserves HDR precision and matches all shader declarations.
+  // Surface is also RGBA16Float with sRGB colorspace for correct display.
   wgpu::TextureDescriptor texDesc{};
   texDesc.size = {(uint32_t)_width, (uint32_t)_height, 1};
   texDesc.format = wgpu::TextureFormat::RGBA16Float;

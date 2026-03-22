@@ -231,10 +231,23 @@ public class WebGPUCameraModule: Module {
     }
 
     Function("cleanupComputePipeline") {
+      // Stop camera FIRST and wait for it to finish — ensures no processFrame
+      // is in-flight when we destroy GPU resources
+      if let session = self.captureSession {
+        self.sessionQueue.sync {
+          session.stopRunning()
+        }
+      }
+      self.captureSession = nil
+      self.dataOutput = nil
+      self.frameDelegate = nil
+      self.depthDelegate = nil
+      self.depthOutput = nil
+
       self.dawnBridge?.cleanup()
       self.dawnBridge = nil
       self.computeSetup = false
-      print("[WebGPUCamera] Compute pipeline cleaned up")
+      print("[WebGPUCamera] Camera stopped + compute pipeline cleaned up")
     }
 
     Function("isComputeReady") { () -> Bool in

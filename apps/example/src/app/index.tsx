@@ -125,7 +125,14 @@ function CameraPreview({ shaderChain, format, colorSpace }: { shaderChain: reado
 
   return (
     <>
-      <WebGPUCanvas ref={canvasRef} style={StyleSheet.absoluteFill} />
+      <View style={{ flex: 1, backgroundColor: '#000', justifyContent: 'center', alignItems: 'center' }}>
+        <WebGPUCanvas ref={canvasRef} style={{
+          width: '100%',
+          aspectRatio: camera.height / camera.width, // portrait: w=cam.h, h=cam.w
+          borderWidth: 1,
+          borderColor: 'white',
+        }} />
+      </View>
 
       <View style={styles.statusBar}>
         <Text style={styles.statusText}>
