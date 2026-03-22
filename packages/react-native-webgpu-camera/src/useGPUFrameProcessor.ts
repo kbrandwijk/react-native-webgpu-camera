@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useSharedValue, useFrameCallback } from "react-native-reanimated";
+import { Skia } from "@shopify/react-native-skia";
 import type { SkImage } from "@shopify/react-native-skia";
 import WebGPUCameraModule from "../modules/webgpu-camera/src/WebGPUCameraModule";
 import { isResourceHandle, isTextureOutputToken } from './GPUResource';
@@ -467,12 +468,16 @@ export function useGPUFrameProcessor(
   const pipelineFn = isObjectForm
     ? (processorOrConfig as ProcessorConfig<any, any>).pipeline
     : (processorOrConfig as FrameProcessor);
+  const canvasRef = isObjectForm
+    ? (processorOrConfig as ProcessorConfig<any, any>).canvasRef
+    : undefined;
 
   // Buffer metadata shared with the worklet via shared values
   const bufferCount = useSharedValue(0);
   const bufferNames = useSharedValue<string[]>([]);
   const bufferCtorIndices = useSharedValue<number[]>([]);
   const hasOnFrame = useSharedValue(false);
+  const useCanvasOutput = useSharedValue(false);
 
   // Setup compute pipeline when camera is ready
   useEffect(() => {
@@ -542,12 +547,36 @@ export function useGPUFrameProcessor(
     setError(null);
 
     // Create stream host object — shared across Reanimated runtimes
-    stream.value = globalThis.__webgpuCamera_createStream();
+    const s = globalThis.__webgpuCamera_createStream();
+    stream.value = s;
+
+    // Configure WebGPU canvas output if canvasRef is provided
+    let canvasSetupAborted = false;
+    if (canvasRef?.current) {
+      const ref = canvasRef.current;
+      const contextId = ref.getContextId();
+      const ctx = ref.getContext("webgpu");
+
+      if (ctx) {
+        // Use Skia's shared Dawn device — same GPU device as the compute pipeline
+        const device = Skia.getDevice();
+        const format = navigator.gpu.getPreferredCanvasFormat();
+        ctx.configure({ device, format, alphaMode: "opaque" });
+        // Tell the native pipeline to present to this canvas
+        s.setCanvasContextId(contextId);
+        useCanvasOutput.value = true;
+        // Log the actual surface dimensions
+        const surfaceTex = ctx.getCurrentTexture();
+        console.log(`[WebGPUCamera] Canvas output configured: contextId=${contextId}, format=${format}, surface=${surfaceTex.width}x${surfaceTex.height}`);
+      }
+    }
 
     return () => {
+      canvasSetupAborted = true;
       currentFrame.value?.dispose();
       currentFrame.value = null;
       stream.value = null;
+      useCanvasOutput.value = false;
       WebGPUCameraModule.cleanupComputePipeline();
     };
   }, [camera.isReady, camera.width, camera.height, camera.fps, camera.colorSpace]);
@@ -591,6 +620,15 @@ export function useGPUFrameProcessor(
         readBuffers[names[i]] = buf != null ? wrapBuffer(buf, bpe[i]) : null;
       }
       buffers.value = readBuffers;
+    }
+
+    // When using WebGPU canvas output, the native side handles present directly.
+    // No SkImage wrapping needed — skip the image path entirely.
+    if (useCanvasOutput.value) {
+      // onFrame canvas overlay is not supported in canvas output mode (yet)
+      // The frame.image may be null when canvas output is active
+      frame.image?.dispose();
+      return;
     }
 
     // onFrame canvas path — always flush to produce the composited image

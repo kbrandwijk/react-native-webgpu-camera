@@ -32,8 +32,8 @@ packages/react-native-skia/.git
 packages/react-native-skia/apps
 packages/react-native-skia/externals
 
-# Skia package: tests, scripts, TS source (JS is in dist)
-packages/react-native-skia/packages/skia/scripts
+# Skia package: tests, TS source (JS is in dist)
+# Note: scripts/ must NOT be excluded — install-libs.js runs as postinstall
 packages/react-native-skia/packages/skia/__tests__
 
 # Exclude src/ except specs/ (codegen needs it for Turbo Module bindings)

@@ -11,16 +11,19 @@ Currently in Phase 0 spike validation.
   - `modules/webgpu-camera/` — local Expo module (Dawn compute pipeline in C++/ObjC++)
   - `modules/webgpu-camera/ios/` — native iOS code (DawnComputePipeline, CameraStreamHostObject, Swift module)
 - `packages/react-native-skia/` — git submodule of @shopify/react-native-skia (workspace-linked)
+- `packages/gpu-video-shaders/` — webgpu-video-shaders package (separate repo, gitignored)
 - `apps/example/` — Expo 55 spike validation app
+- `apps/web/` — Browser WebGPU demo app for webgpu-video-shaders (separate, gitignored)
 - `docs/superpowers/specs/` — design docs and setup notes
 
 ## Tech Stack
 
 - Bun workspaces monorepo
 - Expo 55 (RN 0.83, New Architecture only)
-- @shopify/react-native-skia with SK_GRAPHITE=1 (git submodule, Graphite bundles Dawn — provides `navigator.gpu` via its own JSI bridge, no separate react-native-wgpu needed)
+- @shopify/react-native-skia with Graphite (git submodule, Graphite bundles Dawn — provides `navigator.gpu`, `WebGPUCanvas`, and `Skia.getDevice()` via JSI)
 - react-native-reanimated >=4.2.1 (worklet threading)
 - Dawn (WebGPU) compute pipeline in C++/ObjC++ (no Rust — removed in favor of direct Dawn API)
+- webgpu-video-shaders — libplacebo video processing algorithms as WGSL shader generators
 
 ## First-Time Setup
 
@@ -36,34 +39,23 @@ bun install
 git submodule update --init --depth 1
 ```
 
-### 3. Install Skia Graphite prebuilt binaries
+### 3. Install Skia Graphite (choose one)
+
+**Option A: Prebuilt binaries (fast, ~2 min)**
 
 ```bash
 bun run install:skia-graphite
 ```
 
-This downloads prebuilt Graphite xcframeworks (iOS + macOS), Android libs, and checks out the matching Skia revision.
+Downloads prebuilt Graphite xcframeworks, Dawn/WebGPU headers, and creates the `.graphite` marker file. The updated script (PR #3757) handles Dawn headers correctly — no manual fix needed.
 
-### 4. Fix Dawn headers (workaround for upstream bug)
-
-The `install:skia-graphite` script has a bug where Dawn/WebGPU headers don't get copied due to a path mismatch in the archive extraction. Manual fix:
-
-```bash
-cd packages/react-native-skia/packages/skia
-curl -sL "https://github.com/Shopify/react-native-skia/releases/download/skia-graphite-m142/skia-graphite-headers-skia-graphite-m142.tar.gz" -o /tmp/headers.tar.gz
-tar xzf /tmp/headers.tar.gz --strip-components=3 -C . "packages/skia/cpp"
-cd -
-```
-
-Verify: `ls packages/react-native-skia/packages/skia/cpp/dawn/include/webgpu/webgpu_cpp.h` should exist.
-
-### Alternative: Build Skia from source
-
-Instead of steps 3-4, you can build Skia from source with Graphite (~20-30 min). This guarantees header/binary match and avoids the Dawn headers bug:
+**Option B: Build from source (~20-30 min)**
 
 ```bash
 bun run build:skia
 ```
+
+Guarantees header/binary match. Required if prebuilt binaries aren't available for your platform.
 
 ## Build Workflow
 
@@ -78,19 +70,9 @@ bun run build:skia
 bunx tsc
 ```
 
-## Key Files for Skia Graphite Integration
+## Key Files
 
-- `apps/example/eas.json` — sets `SK_GRAPHITE=1` env var for EAS builds
-- `packages/react-native-skia/packages/skia/react-native-skia.podspec` — includes `cpp/dawn/include` in `HEADER_SEARCH_PATHS`
-- `packages/react-native-skia/packages/skia/cpp/dawn/include/` — Dawn/WebGPU headers (must be populated, see setup step 4)
-- `packages/react-native-skia/packages/skia/libs/ios/` — prebuilt Skia Graphite xcframeworks
-- `.easignore` — excludes Android libs, tests, and source from EAS upload (~2 GB savings)
-
-## Known Issues / Workarounds
-
-- **Dawn headers bug**: `install-skia-graphite.ts` `copyDawnHeaders()` silently fails due to archive path mismatch. Manual tar extraction required (see setup step 4).
-- **macOS libs required**: Cannot exclude `libs/macos/` from `.easignore` — the Skia podspec `prepare_command` checks `hasIos && hasMacos` and falls back to npm packages if either is missing.
-- **Upstream issue**: [Shopify/react-native-skia#3750](https://github.com/Shopify/react-native-skia/issues/3750) — podspec prepare_command doesn't copy headers from graphite-headers package.
+- `.easignore` — excludes large files from EAS upload
 
 ## Conventions
 

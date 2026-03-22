@@ -23,6 +23,10 @@ export type {
   TypedArrayConstructor,
 } from './types';
 
+// Re-export WebGPU canvas types for convenience
+export type { WebGPUCanvasRef } from '@shopify/react-native-skia';
+export { WebGPUCanvas } from '@shopify/react-native-skia';
+
 // GPU Resources
 export { GPUResource } from './GPUResource';
 export type { ResourceHandle, ModelResourceHandle, ModelOptions } from './GPUResource';

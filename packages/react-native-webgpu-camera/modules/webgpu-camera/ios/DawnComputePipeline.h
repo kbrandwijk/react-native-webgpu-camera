@@ -76,6 +76,11 @@ public:
 
   void* getOutputSkImage();
 
+  /** Set a WebGPU canvas context ID for direct-to-screen output.
+   *  When set, processFrame blits the final compute output to the canvas
+   *  surface and presents, skipping MakeImageFromTexture entirely. */
+  void setCanvasContextId(int contextId);
+
   /** Single-lock frame begin: returns image, buffers, canvas, fps, generation, metrics */
   struct FrameData {
     void* image = nullptr;         // sk_sp<SkImage>*
@@ -124,6 +129,7 @@ private:
   int _height = 0;        // output (portrait) height
   int _inputWidth = 0;    // camera (landscape) width
   int _inputHeight = 0;   // camera (landscape) height
+  int _canvasContextId = -1;  // WebGPU canvas context ID for direct output (-1 = disabled)
   std::shared_ptr<std::atomic<bool>> _alive;
 };
 
@@ -168,6 +174,8 @@ void dawn_pipeline_flush_canvas(DawnComputePipelineRef ref);
 void* dawn_pipeline_get_output_image(DawnComputePipelineRef ref);
 
 void dawn_pipeline_cleanup(DawnComputePipelineRef ref);
+
+void dawn_pipeline_set_canvas_context_id(DawnComputePipelineRef ref, int contextId);
 
 void dawn_pipeline_install_jsi(DawnComputePipelineRef ref, void* jsiRuntime);
 

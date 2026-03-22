@@ -49,15 +49,9 @@ public class WebGPUCameraModule: Module {
     Function("getFormats") { (deviceId: String) -> [[String: Any]] in
         let position: AVCaptureDevice.Position = deviceId == "front" ? .front : .back
 
-        // Try LiDAR depth camera first (has both video + depth formats),
-        // fall back to wide angle
-        var camera: AVCaptureDevice?
-        if #available(iOS 15.4, *) {
-          camera = AVCaptureDevice.default(.builtInLiDARDepthCamera, for: .video, position: position)
-        }
-        if camera == nil {
-          camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position)
-        }
+        // Use wide angle camera (supports 120fps) as the primary device.
+        // LiDAR formats are only needed when depth is requested.
+        let camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position)
         guard let camera = camera else {
             return []
         }
@@ -268,18 +262,20 @@ public class WebGPUCameraModule: Module {
       let position: AVCaptureDevice.Position = deviceId == "front" ? .front : .back
       NSLog("[WebGPUCamera] startCapture: step 2 — getting camera device (position=\(position.rawValue))")
 
-      // Prefer LiDAR depth camera (supports both video + depth, same formats).
-      // Fall back to wide angle if LiDAR not available.
+      // Use wide angle camera (supports 120fps).
+      // Only use LiDAR when depth is explicitly requested.
       var camera: AVCaptureDevice?
-      if #available(iOS 15.4, *) {
-        camera = AVCaptureDevice.default(.builtInLiDARDepthCamera, for: .video, position: position)
-      }
-      if camera == nil {
-        camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position)
-        if self.useDepth {
+      if self.useDepth {
+        if #available(iOS 15.4, *) {
+          camera = AVCaptureDevice.default(.builtInLiDARDepthCamera, for: .video, position: position)
+        }
+        if camera == nil {
           NSLog("[WebGPUCamera] WARNING: LiDAR not available, depth will not work")
           self.useDepth = false
         }
+      }
+      if camera == nil {
+        camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position)
       }
       guard let camera = camera else {
         NSLog("[WebGPUCamera] No camera found for position: \(deviceId)")

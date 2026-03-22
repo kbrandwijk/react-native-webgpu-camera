@@ -1,7 +1,15 @@
 #include "DawnComputePipeline.h"
 
 #include "rnskia/RNDawnContext.h"
+#include "rnskia/RNDawnUtils.h"
 #include "rnskia/RNSkPlatformContext.h"
+#include "rnwgpu/SurfaceRegistry.h"
+
+#ifdef __APPLE__
+namespace dawn::native::metal {
+void WaitForCommandsToBeScheduled(WGPUDevice device);
+}
+#endif
 
 #include "include/core/SkImage.h"
 #include "include/core/SkSurface.h"
@@ -106,6 +114,12 @@ struct DawnComputePipeline::Impl {
 
   // Model runners (indexed by model spec order)
   std::vector<std::unique_ptr<ModelRunner>> models;
+
+  // Blit render pipeline for direct-to-canvas output
+  wgpu::RenderPipeline blitPipeline;
+  wgpu::Sampler blitSampler;
+  wgpu::Buffer blitDimsBuf;
+  uint32_t blitDimsW = 0, blitDimsH = 0; // cached surface dims
 
   // Per-pass custom input bindings (indexed by pass index)
   std::vector<std::vector<InputBinding>> passInputBindings;
@@ -818,6 +832,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 }
 
 bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
+  // Skip frames until canvas output is configured
+  if (_canvasContextId < 0) return false;
+
   // Always log first frame per impl (uses impl's frameCount which resets on setup)
   if (_impl && _impl->frameCount <= 2) {
     NSLog(@"[DawnPipeline] processFrame ENTER #%d: _impl=OK, pixelBuffer=%s, depth=%s, useDepth=%d",
@@ -1386,19 +1403,80 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
 
   double tAfterBuffers = CACurrentMediaTime();
 
-  // Determine final output texture and create SkImage
+  // Determine final output texture
   bool finalIsA = (impl->passes.size() % 2 != 0);
-  if (impl->frameCount < 3) {
-    NSLog(@"[DawnPipeline] finalIsA=%d, passes=%zu, texA=%p, texB=%p, dims=%dx%d",
-          finalIsA, impl->passes.size(),
-          (void*)(finalIsA ? &impl->texA : &impl->texB),
-          (void*)(!finalIsA ? &impl->texA : &impl->texB),
-          _width, _height);
-  }
-  auto outputImage = ctx.MakeImageFromTexture(
-    *(finalIsA ? &impl->texA : &impl->texB), _width, _height, wgpu::TextureFormat::RGBA16Float);
-  if (impl->frameCount < 3) {
-    NSLog(@"[DawnPipeline] MakeImageFromTexture: image=%s", outputImage ? "OK" : "nil");
+  wgpu::Texture& finalOutput = finalIsA ? impl->texA : impl->texB;
+
+  sk_sp<SkImage> outputImage;
+
+  // ── Canvas output path: blit to WebGPU canvas surface ──
+  // Uses a single command encoder + submit for the blit, relying on Dawn's
+  // queue ordering guarantee: the previously submitted compute commands will
+  // complete before this blit reads the output texture.
+  if (_canvasContextId >= 0 && impl->blitPipeline) {
+    auto& registry = rnwgpu::SurfaceRegistry::getInstance();
+    auto surfaceInfo = registry.getSurfaceInfo(_canvasContextId);
+
+    if (surfaceInfo) {
+      auto surfaceTex = surfaceInfo->getCurrentTexture();
+      if (surfaceTex) {
+        // Update destination dimensions uniform (cached, only recreate on resize)
+        uint32_t sw = surfaceTex.GetWidth(), sh = surfaceTex.GetHeight();
+        if (!impl->blitDimsBuf || sw != impl->blitDimsW || sh != impl->blitDimsH) {
+          float dims[2] = { (float)sw, (float)sh };
+          wgpu::BufferDescriptor bd{};
+          bd.size = 8; // vec2f = 8 bytes
+          bd.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
+          impl->blitDimsBuf = device.CreateBuffer(&bd);
+          device.GetQueue().WriteBuffer(impl->blitDimsBuf, 0, dims, 8);
+          impl->blitDimsW = sw;
+          impl->blitDimsH = sh;
+        }
+
+        // Create bind group for blit: source texture + sampler + dst dims
+        auto blitLayout = impl->blitPipeline.GetBindGroupLayout(0);
+        wgpu::BindGroupEntry blitEntries[3];
+        blitEntries[0].binding = 0;
+        blitEntries[0].textureView = finalOutput.CreateView();
+        blitEntries[1].binding = 1;
+        blitEntries[1].sampler = impl->blitSampler;
+        blitEntries[2].binding = 2;
+        blitEntries[2].buffer = impl->blitDimsBuf;
+        blitEntries[2].size = 8;
+
+        wgpu::BindGroupDescriptor blitBgDesc{};
+        blitBgDesc.layout = blitLayout;
+        blitBgDesc.entryCount = 3;
+        blitBgDesc.entries = blitEntries;
+        auto blitBindGroup = device.CreateBindGroup(&blitBgDesc);
+
+        // Render pass to blit compute output → surface texture
+        wgpu::RenderPassColorAttachment colorAttachment{};
+        colorAttachment.view = surfaceTex.CreateView();
+        colorAttachment.loadOp = wgpu::LoadOp::Clear;
+        colorAttachment.storeOp = wgpu::StoreOp::Store;
+
+        wgpu::RenderPassDescriptor rpDesc{};
+        rpDesc.colorAttachmentCount = 1;
+        rpDesc.colorAttachments = &colorAttachment;
+
+        auto blitEncoder = device.CreateCommandEncoder();
+        auto renderPass = blitEncoder.BeginRenderPass(&rpDesc);
+        renderPass.SetPipeline(impl->blitPipeline);
+        renderPass.SetBindGroup(0, blitBindGroup);
+        renderPass.Draw(3);
+        renderPass.End();
+
+        auto blitCommands = blitEncoder.Finish();
+        device.GetQueue().Submit(1, &blitCommands);
+        surfaceInfo->present();
+
+        if (impl->frameCount < 3) {
+          NSLog(@"[DawnPipeline] Canvas present OK: contextId=%d, surfaceTex=%ux%u",
+                _canvasContextId, surfaceTex.GetWidth(), surfaceTex.GetHeight());
+        }
+      }
+    }
   }
 
   double tAfterMakeImage = CACurrentMediaTime();
@@ -1413,8 +1491,10 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   // ── Brief lock to publish results ──
   {
     std::lock_guard<std::mutex> lock(_mutex);
-    impl->finalTex = finalIsA ? &impl->texA : &impl->texB;
-    impl->outputImage = std::move(outputImage);
+    impl->finalTex = &finalOutput;
+    if (outputImage) {
+      impl->outputImage = std::move(outputImage);
+    }
 
     // Per-step timing (ms)
     impl->t_lockWait = (tAfterLock - tWallStart) * 1000.0;
@@ -1617,6 +1697,102 @@ void* DawnComputePipeline::getOutputSkImage() {
   return &_impl->outputImage;
 }
 
+void DawnComputePipeline::setCanvasContextId(int contextId) {
+  std::lock_guard<std::mutex> lock(_mutex);
+  _canvasContextId = contextId;
+
+  if (contextId < 0 || !_impl) return;
+
+  // Create blit render pipeline for RGBA16Float → surface format conversion.
+  // Fullscreen triangle with UV interpolation — works for any src/dst size.
+  static const char* kBlitShaderWGSL = R"(
+struct VsOut {
+  @builtin(position) pos: vec4f,
+  @location(0) uv: vec2f,
+}
+
+@vertex
+fn vs(@builtin(vertex_index) idx: u32) -> VsOut {
+  // Fullscreen triangle: 3 vertices cover [-1,1] clip space
+  let uv = vec2f(f32((idx << 1u) & 2u), f32(idx & 2u));
+  var out: VsOut;
+  out.pos = vec4f(uv * 2.0 - 1.0, 0.0, 1.0);
+  // Flip Y: clip space Y goes up, UV Y goes down
+  out.uv = vec2f(uv.x, 1.0 - uv.y);
+  return out;
+}
+
+@group(0) @binding(0) var srcTex: texture_2d<f32>;
+@group(0) @binding(1) var srcSampler: sampler;
+@group(0) @binding(2) var<uniform> dstDims: vec2f;
+
+@fragment
+fn fs(in: VsOut) -> @location(0) vec4f {
+  // Aspect-ratio-correct "cover" crop
+  let srcDims = vec2f(textureDimensions(srcTex));
+  let srcAspect = srcDims.x / srcDims.y;
+  let dstAspect = dstDims.x / dstDims.y;
+
+  var uv = in.uv;
+  if (srcAspect > dstAspect) {
+    // Source wider than dest — crop sides
+    let scale = dstAspect / srcAspect;
+    uv.x = uv.x * scale + (1.0 - scale) * 0.5;
+  } else {
+    // Source taller than dest — crop top/bottom
+    let scale = srcAspect / dstAspect;
+    uv.y = uv.y * scale + (1.0 - scale) * 0.5;
+  }
+
+  return textureSample(srcTex, srcSampler, uv);
+}
+)";
+
+  wgpu::ShaderModuleWGSLDescriptor wgslDesc{};
+  wgslDesc.code = kBlitShaderWGSL;
+  wgpu::ShaderModuleDescriptor smDesc{};
+  smDesc.nextInChain = &wgslDesc;
+  auto shaderModule = _impl->device.CreateShaderModule(&smDesc);
+  if (!shaderModule) {
+    NSLog(@"[DawnPipeline] FAILED to create blit shader module");
+    return;
+  }
+
+  // Surface format matches Dawn preferred format (BGRA8Unorm on Apple, RGBA8Unorm on Android)
+  wgpu::TextureFormat surfaceFormat = DawnUtils::PreferredTextureFormat;
+
+  wgpu::ColorTargetState colorTarget{};
+  colorTarget.format = surfaceFormat;
+
+  wgpu::FragmentState fragmentState{};
+  fragmentState.module = shaderModule;
+  fragmentState.entryPoint = "fs";
+  fragmentState.targetCount = 1;
+  fragmentState.targets = &colorTarget;
+
+  wgpu::RenderPipelineDescriptor rpDesc{};
+  rpDesc.vertex.module = shaderModule;
+  rpDesc.vertex.entryPoint = "vs";
+  rpDesc.fragment = &fragmentState;
+  rpDesc.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
+
+  _impl->blitPipeline = _impl->device.CreateRenderPipeline(&rpDesc);
+  if (!_impl->blitPipeline) {
+    NSLog(@"[DawnPipeline] FAILED to create blit render pipeline");
+    return;
+  }
+
+  // Create sampler for blit (linear filtering for potential size mismatch)
+  wgpu::SamplerDescriptor sampDesc{};
+  sampDesc.magFilter = wgpu::FilterMode::Linear;
+  sampDesc.minFilter = wgpu::FilterMode::Linear;
+  sampDesc.addressModeU = wgpu::AddressMode::ClampToEdge;
+  sampDesc.addressModeV = wgpu::AddressMode::ClampToEdge;
+  _impl->blitSampler = _impl->device.CreateSampler(&sampDesc);
+
+  NSLog(@"[DawnPipeline] Canvas output configured: contextId=%d, blit pipeline created", contextId);
+}
+
 void DawnComputePipeline::cleanup() {
   std::lock_guard<std::mutex> lock(_mutex);
   cleanupLocked();
@@ -1643,8 +1819,14 @@ void DawnComputePipeline::cleanupLocked() {
     _impl->models.clear();
   }
 
+  _canvasContextId = -1;
   _impl->outputImage.reset();
   _impl->surface.reset();
+  _impl->blitPipeline = nullptr;
+  _impl->blitSampler = nullptr;
+  _impl->blitDimsBuf = nullptr;
+  _impl->blitDimsW = 0;
+  _impl->blitDimsH = 0;
   _impl->texA = nullptr;
   _impl->texB = nullptr;
   _impl->passes.clear();
@@ -1774,6 +1956,11 @@ void* dawn_pipeline_get_output_image(DawnComputePipelineRef ref) {
 void dawn_pipeline_cleanup(DawnComputePipelineRef ref) {
   auto* pipeline = static_cast<dawn_pipeline::DawnComputePipeline*>(ref);
   pipeline->cleanup();
+}
+
+void dawn_pipeline_set_canvas_context_id(DawnComputePipelineRef ref, int contextId) {
+  auto* pipeline = static_cast<dawn_pipeline::DawnComputePipeline*>(ref);
+  pipeline->setCanvasContextId(contextId);
 }
 
 // ========== CameraStreamHostObject ==========
@@ -2007,6 +2194,20 @@ public:
           obj.setProperty(rt, "total", _pipeline->metricTotal());
           obj.setProperty(rt, "wall", _pipeline->metricWall());
           return obj;
+        });
+    }
+
+    if (propName == "setCanvasContextId") {
+      return facebook::jsi::Function::createFromHostFunction(
+        runtime, name, 1,
+        [this](facebook::jsi::Runtime& rt,
+               const facebook::jsi::Value&,
+               const facebook::jsi::Value* args,
+               size_t count) -> facebook::jsi::Value {
+          if (!_alive->load() || count < 1) return facebook::jsi::Value::undefined();
+          int contextId = (int)args[0].asNumber();
+          _pipeline->setCanvasContextId(contextId);
+          return facebook::jsi::Value::undefined();
         });
     }
 

@@ -1,5 +1,7 @@
+import type React from 'react';
 import type { SharedValue } from 'react-native-reanimated';
 import type { SkImage, SkCanvas } from '@shopify/react-native-skia';
+import type { WebGPUCanvasRef } from '@shopify/react-native-skia';
 import type { ResourceHandle, ModelResourceHandle } from './GPUResource';
 
 // useCamera
@@ -78,6 +80,7 @@ export interface CameraStream {
   flushCanvas(): void;
   flushCanvasAndGetImage(): SkImage | null;
   beginFrame(): FrameSnapshot | null;
+  setCanvasContextId(contextId: number): void;
   pipelineFps(): number;
   generation(): number;
   metrics(): PipelineMetrics | null;
@@ -158,6 +161,12 @@ export interface ProcessorConfig<
     frame: RenderFrame,
     buffers: NullableBuffers<B>,
   ) => void;
+
+  /** Ref to a WebGPUCanvas for direct-to-screen output.
+   *  When provided, compute output is blit directly to the canvas surface
+   *  (no MakeImageFromTexture / SkImage intermediary). The returned
+   *  currentFrame will always be null. */
+  canvasRef?: React.RefObject<WebGPUCanvasRef | null>;
 }
 
 export type FrameProcessor = (frame: ProcessorFrame) => void;

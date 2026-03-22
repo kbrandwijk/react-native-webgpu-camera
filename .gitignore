@@ -24,3 +24,7 @@ Thumbs.db
 # Private docs (articles, content strategy)
 private-docs/
 *.ipa
+
+# Separate packages (own repos)
+packages/gpu-video-shaders/
+apps/web/

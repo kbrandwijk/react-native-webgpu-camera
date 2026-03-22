@@ -1,4 +1,5 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
+import { useRouter } from 'expo-router';
 import {
   View,
   Text,
@@ -9,7 +10,8 @@ import {
   Modal,
   FlatList,
 } from 'react-native';
-import { Canvas, Fill, Group, Image as SkImage, Skia, Picture, createPicture } from '@shopify/react-native-skia';
+import { Canvas, Fill, Group, Image as SkImage, Skia, Picture, createPicture, WebGPUCanvas } from '@shopify/react-native-skia';
+import type { WebGPUCanvasRef } from '@shopify/react-native-skia';
 import { useDerivedValue } from 'react-native-reanimated';
 import { Asset } from 'expo-asset';
 import { useCamera, useGPUFrameProcessor, useCameraFormats, GPUResource } from 'react-native-webgpu-camera';
@@ -21,6 +23,26 @@ import { HISTOGRAM_WGSL } from '@/shaders/histogram.wgsl';
 import { LUT_WGSL } from '@/shaders/lut.wgsl';
 import { DEPTH_COLORMAP_WGSL } from '@/shaders/depth-colormap.wgsl';
 import { DEPTH_MODEL_OVERLAY_WGSL } from '@/shaders/depth-model-overlay.wgsl';
+import { DEBAND_WGSL } from '@/shaders/deband.wgsl';
+import { TONEMAP_WGSL } from '@/shaders/tonemap.wgsl';
+import { HDR_PIPELINE_WGSL } from '@/shaders/hdr-pipeline.wgsl';
+import { SHARPEN_WGSL } from '@/shaders/sharpen.wgsl';
+import { BLUR_WGSL } from '@/shaders/blur.wgsl';
+import { CHROMATIC_WGSL } from '@/shaders/chromatic.wgsl';
+import { COLORBLIND_WGSL } from '@/shaders/colorblind.wgsl';
+import { CINEMA_WGSL } from '@/shaders/cinema.wgsl';
+import { PEAK_DETECT_WGSL as HDR_PEAK_WGSL, LUT_GEN_WGSL, LUT_APPLY_WGSL } from '@/shaders/hdr-lut-pipeline.wgsl';
+import { PROTANOPIA_WGSL } from '@/shaders/protanopia.wgsl';
+import { TRITANOPIA_WGSL } from '@/shaders/tritanopia.wgsl';
+import { MONOCHROME_WGSL } from '@/shaders/monochrome.wgsl';
+import { DITHER_1BIT_WGSL } from '@/shaders/dither-1bit.wgsl';
+import { DITHER_3BIT_WGSL } from '@/shaders/dither-3bit.wgsl';
+import { TONEMAP_REINHARD_WGSL } from '@/shaders/tonemap-reinhard.wgsl';
+import { TONEMAP_BT2390_WGSL } from '@/shaders/tonemap-bt2390.wgsl';
+import { GAMUT_WARN_WGSL } from '@/shaders/gamut-warn.wgsl';
+import { VIGNETTE_HEAVY_WGSL } from '@/shaders/vignette-heavy.wgsl';
+import { BARREL_WGSL } from '@/shaders/barrel.wgsl';
+import { NOIR_WGSL } from '@/shaders/noir.wgsl';
 import DepthEstimation from '@/components/DepthEstimation';
 import OrtTest from '@/components/OrtTest';
 import { Paths, File as ExpoFile } from 'expo-file-system';
@@ -31,7 +53,8 @@ type ShaderMode =
   | { name: string; type: 'histogram-onframe' }
   | { name: string; type: 'applelog' }
   | { name: string; type: 'depth' }
-  | { name: string; type: 'depth-model' };
+  | { name: string; type: 'depth-model' }
+  | { name: string; type: 'hdr-lut' };
 
 const DEPTH_MODEL_URL = 'https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx';
 const DEPTH_MODEL_PATH = `${Paths.document.uri}/depth-anything-v2-small.onnx`;
@@ -47,11 +70,30 @@ const SHADERS: ShaderMode[] = [
   { name: 'Histogram', type: 'histogram' },
   { name: 'Hist (burn)', type: 'histogram-onframe' },
   { name: 'LUT', type: 'applelog' },
-
+  { name: 'Deband', wgsl: [DEBAND_WGSL], type: 'simple' },
+  { name: 'Tonemap', wgsl: [TONEMAP_WGSL], type: 'simple' },
+  { name: 'HDR Pipeline', wgsl: [HDR_PIPELINE_WGSL], type: 'simple' },
+  { name: 'Sharpen', wgsl: [SHARPEN_WGSL], type: 'simple' },
+  { name: 'Blur', wgsl: [BLUR_WGSL], type: 'simple' },
+  { name: 'Chromatic', wgsl: [CHROMATIC_WGSL], type: 'simple' },
+  { name: 'Colorblind', wgsl: [COLORBLIND_WGSL], type: 'simple' },
+  { name: 'Cinema', wgsl: [CINEMA_WGSL], type: 'simple' },
+  { name: 'Noir', wgsl: [NOIR_WGSL], type: 'simple' },
+  { name: 'HDR LUT', type: 'hdr-lut' },
+  { name: 'TM Reinhard', wgsl: [TONEMAP_REINHARD_WGSL], type: 'simple' },
+  { name: 'TM BT.2390', wgsl: [TONEMAP_BT2390_WGSL], type: 'simple' },
+  { name: 'Gamut Warn', wgsl: [GAMUT_WARN_WGSL], type: 'simple' },
+  { name: 'Protanopia', wgsl: [PROTANOPIA_WGSL], type: 'simple' },
+  { name: 'Tritanopia', wgsl: [TRITANOPIA_WGSL], type: 'simple' },
+  { name: 'Monochrome', wgsl: [MONOCHROME_WGSL], type: 'simple' },
+  { name: 'Dither 1-bit', wgsl: [DITHER_1BIT_WGSL], type: 'simple' },
+  { name: 'Dither 3-bit', wgsl: [DITHER_3BIT_WGSL], type: 'simple' },
+  { name: 'Vignette', wgsl: [VIGNETTE_HEAVY_WGSL], type: 'simple' },
+  { name: 'Barrel', wgsl: [BARREL_WGSL], type: 'simple' },
 ];
 
 function CameraPreview({ shaderChain, format, colorSpace }: { shaderChain: readonly string[]; format?: CameraFormat; colorSpace?: ColorSpace }) {
-  const { width: screenW, height: screenH } = useWindowDimensions();
+  const canvasRef = useRef<WebGPUCanvasRef>(null);
 
   const camera = useCamera({
     device: 'back',
@@ -59,16 +101,19 @@ function CameraPreview({ shaderChain, format, colorSpace }: { shaderChain: reado
     colorSpace,
   });
 
-  const { currentFrame, fps, displayFps, metrics, error } = useGPUFrameProcessor(camera, (frame) => {
-    'worklet';
-    for (const wgsl of shaderChain) {
-      // Only request debug buffer for passthrough shader (has @binding(2) debug array)
-      if (wgsl === shaderChain[0] && shaderChain.length === 1 && wgsl.includes('debug')) {
-        frame.runShader(wgsl, { output: Float32Array, count: 20 });
-      } else {
-        frame.runShader(wgsl);
+  const { fps, displayFps, metrics, error } = useGPUFrameProcessor(camera, {
+    canvasRef,
+    pipeline: (frame) => {
+      'worklet';
+      for (const wgsl of shaderChain) {
+        // Only request debug buffer for passthrough shader (has @binding(2) debug array)
+        if (wgsl === shaderChain[0] && shaderChain.length === 1 && wgsl.includes('debug')) {
+          frame.runShader(wgsl, { output: Float32Array, count: 20 });
+        } else {
+          frame.runShader(wgsl);
+        }
       }
-    }
+    },
   });
 
   useDerivedValue(() => {
@@ -80,10 +125,7 @@ function CameraPreview({ shaderChain, format, colorSpace }: { shaderChain: reado
 
   return (
     <>
-      <Canvas style={StyleSheet.absoluteFill}>
-        <Fill color="black" />
-        <SkImage image={currentFrame} x={0} y={0} width={screenW} height={screenH} fit="cover" />
-      </Canvas>
+      <WebGPUCanvas ref={canvasRef} style={StyleSheet.absoluteFill} />
 
       <View style={styles.statusBar}>
         <Text style={styles.statusText}>
@@ -393,7 +435,70 @@ function DepthModelPreview({ format, colorSpace, modelPath }: { format?: CameraF
   );
 }
 
+function HdrLutPreview({ format, colorSpace }: { format?: CameraFormat; colorSpace?: ColorSpace }) {
+  const { width: screenW, height: screenH } = useWindowDimensions();
+
+  const camera = useCamera({
+    device: 'back',
+    format,
+    colorSpace,
+  });
+
+  // 3-pass GPU pipeline (matching libplacebo architecture):
+  //   Pass 1: Peak detection — measures scene luminance stats
+  //   Pass 2: LUT generation — reads peak stats, generates/caches tone map LUT
+  //   Pass 3: LUT application — reads LUT, applies tone mapping per-pixel in IPT space
+  const { currentFrame, buffers, fps, displayFps, metrics, error } = useGPUFrameProcessor(camera, {
+    sync: false,
+    pipeline: (frame) => {
+      'worklet';
+      // Pass 1: peak detection (passthrough + measures luminance)
+      const peakStats = frame.runShader(HDR_PEAK_WGSL, { output: Uint32Array, count: 66 });
+      // Pass 2: LUT gen (reads peak stats, generates/caches LUT)
+      const lutBuffer = frame.runShader(LUT_GEN_WGSL, {
+        output: Float32Array,
+        count: 257,
+        inputs: { peakData: peakStats },
+      });
+      // Pass 3: LUT apply (RGB→IPT→tone map→IPT⁻¹→RGB, all in one pass)
+      frame.runShader(LUT_APPLY_WGSL, { inputs: { lut: lutBuffer } });
+      return { peakStats, lutBuffer };
+    },
+  });
+
+  const lastPeakRef = { current: 0 };
+  useDerivedValue(() => {
+    const m = metrics.value;
+    const peak = buffers.value.peakStats as Uint32Array | null;
+    const lut = buffers.value.lutBuffer as Float32Array | null;
+    if (fps.value > 0 && m) {
+      const peakMax = peak ? peak[0] : 0;
+      const peakPQ = peakMax / 65535;
+      const cachedPeak = lut ? lut[256] : 0;
+      const regenerated = Math.abs(cachedPeak - lastPeakRef.current) > 0.0001;
+      lastPeakRef.current = cachedPeak;
+      console.log(`[HDR LUT] ${fps.value}fps | peak=${peakPQ.toFixed(4)} PQ (${peakMax}) cached=${cachedPeak.toFixed(4)} ${regenerated ? 'REGEN' : 'cached'} | compute=${m.compute.toFixed(2)}ms total=${m.total.toFixed(2)}ms`);
+    }
+  });
+
+  return (
+    <>
+      <Canvas style={StyleSheet.absoluteFill}>
+        <Fill color="black" />
+        <SkImage image={currentFrame} x={0} y={0} width={screenW} height={screenH} fit="cover" />
+      </Canvas>
+
+      <View style={styles.statusBar}>
+        <Text style={styles.statusText}>
+          {error ? `Error: ${error}` : camera.isReady ? `HDR LUT (BT.2390) ${camera.width}x${camera.height} @ ${camera.fps}fps` : 'Starting camera...'}
+        </Text>
+      </View>
+    </>
+  );
+}
+
 export default function CameraSpikeScreen() {
+  const router = useRouter();
   const [isRunning, setIsRunning] = useState(false);
   const [shaderIndex, setShaderIndex] = useState(0);
   const [showDepth, setShowDepth] = useState(false);
@@ -441,7 +546,7 @@ export default function CameraSpikeScreen() {
   useEffect(() => {
     if (formatEntries.length === 0) return;
     const best =
-      formatEntries.find(e => e.colorSpace === 'sRGB' && e.format.supportsDepth && e.format.width >= 1920 && e.format.maxFps >= 60) ??
+      formatEntries.find(e => e.colorSpace === 'sRGB' && e.format.width >= 1920 && e.format.maxFps >= 120) ??
       formatEntries.find(e => e.colorSpace === 'sRGB' && e.format.width >= 1920 && e.format.maxFps >= 60) ??
       formatEntries.find(e => e.colorSpace === 'sRGB') ??
       formatEntries[0];
@@ -452,6 +557,7 @@ export default function CameraSpikeScreen() {
   const selectedColorSpace = selected?.colorSpace ?? 'sRGB';
 
   const [showFormatPicker, setShowFormatPicker] = useState(false);
+  const [showShaderPicker, setShowShaderPicker] = useState(false);
 
   if (showDepth) {
     return <DepthEstimation onBack={() => setShowDepth(false)} />;
@@ -472,6 +578,7 @@ export default function CameraSpikeScreen() {
       {isRunning && shader.type === 'histogram-onframe' && <HistogramOnFramePreview key={`${shader.name}-${selectedColorSpace}`} format={selectedFormat} colorSpace={selectedColorSpace} />}
       {isRunning && shader.type === 'simple' && <CameraPreview key={`${shader.name}-${selectedColorSpace}`} shaderChain={shader.wgsl} format={selectedFormat} colorSpace={selectedColorSpace} />}
       {isRunning && shader.type === 'applelog' && <AppleLogPreview key={`${shader.name}-${selectedColorSpace}`} format={selectedFormat} colorSpace={selectedColorSpace} lutResource={lutResource} />}
+      {isRunning && shader.type === 'hdr-lut' && <HdrLutPreview key={`${shader.name}-${selectedColorSpace}`} format={selectedFormat} colorSpace={selectedColorSpace} />}
       {isRunning && shader.type === 'depth' && <DepthPreview key={`${shader.name}-${selectedColorSpace}`} format={selectedFormat} colorSpace={selectedColorSpace} />}
       {isRunning && shader.type === 'depth-model' && depthModelPath && <DepthModelPreview key={`${shader.name}-${selectedColorSpace}`} format={selectedFormat} colorSpace={selectedColorSpace} modelPath={depthModelPath} />}
       {isRunning && shader.type === 'depth-model' && !depthModelPath && (
@@ -483,14 +590,12 @@ export default function CameraSpikeScreen() {
       )}
 
       <View style={styles.controls}>
-        {isRunning && (
-          <Pressable
-            style={styles.button}
-            onPress={() => setShaderIndex((i) => (i + 1) % SHADERS.length)}
-          >
-            <Text style={styles.buttonText}>{shader.name} ({shaderIndex + 1}/{SHADERS.length})</Text>
-          </Pressable>
-        )}
+        <Pressable
+          style={styles.button}
+          onPress={() => setShowShaderPicker(true)}
+        >
+          <Text style={styles.buttonText}>{shader.name}</Text>
+        </Pressable>
 
         {!isRunning && (
           <Pressable
@@ -515,6 +620,12 @@ export default function CameraSpikeScreen() {
             </Pressable>
             <Pressable style={styles.button} onPress={() => setShowOrt(true)}>
               <Text style={styles.buttonText}>ORT Test</Text>
+            </Pressable>
+            <Pressable style={styles.button} onPress={() => router.push('/skia-video' as any)}>
+              <Text style={styles.buttonText}>Skia Video</Text>
+            </Pressable>
+            <Pressable style={styles.button} onPress={() => router.push('/webgpu-test' as any)}>
+              <Text style={styles.buttonText}>WebGPU Test</Text>
             </Pressable>
           </>
         )}
@@ -545,6 +656,37 @@ export default function CameraSpikeScreen() {
               }}
             />
             <Pressable style={styles.modalClose} onPress={() => setShowFormatPicker(false)}>
+              <Text style={styles.buttonText}>Close</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={showShaderPicker} transparent animationType="slide">
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <Text style={styles.modalTitle}>Shader</Text>
+            <FlatList
+              data={SHADERS}
+              keyExtractor={(s, i) => `${i}-${s.name}`}
+              renderItem={({ item: s, index: i }) => {
+                const isSelected = i === shaderIndex;
+                return (
+                  <Pressable
+                    style={[styles.formatRow, isSelected && styles.formatRowSelected]}
+                    onPress={() => { setShaderIndex(i); setShowShaderPicker(false); }}
+                  >
+                    <Text style={[styles.formatText, isSelected && styles.formatTextSelected]}>
+                      {s.name}
+                    </Text>
+                    <Text style={[styles.formatDetail, isSelected && styles.formatTextSelected]}>
+                      {s.type}
+                    </Text>
+                  </Pressable>
+                );
+              }}
+            />
+            <Pressable style={styles.modalClose} onPress={() => setShowShaderPicker(false)}>
               <Text style={styles.buttonText}>Close</Text>
             </Pressable>
           </View>
