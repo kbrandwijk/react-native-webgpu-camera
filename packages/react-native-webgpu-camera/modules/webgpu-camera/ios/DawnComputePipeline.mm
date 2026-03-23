@@ -1443,6 +1443,8 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
 
   tAfterBindGroup = CACurrentMediaTime();
 
+  double tAfterCompute = CACurrentMediaTime();
+
   // Copy final compute output
   bool finalIsA = (impl->passes.size() % 2 != 0);
   wgpu::Texture& finalOutput = finalIsA ? impl->texA : impl->texB;
@@ -1502,8 +1504,6 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   // Single submit: compute + camera copy + overlay blend
   auto commands = encoder.Finish();
   device.GetQueue().Submit(1, &commands);
-
-  double tAfterCompute = CACurrentMediaTime();
 
   // Present
   if (_canvasContextId >= 0) {
