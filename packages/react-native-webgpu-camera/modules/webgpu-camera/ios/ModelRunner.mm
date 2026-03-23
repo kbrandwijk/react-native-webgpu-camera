@@ -263,6 +263,13 @@ bool ModelRunner::setup(const ModelSpec& spec) {
     outBufDesc.label = "ModelOutputBuffer";
     _ortBuffer = _ortDevice.CreateBuffer(&outBufDesc);
 
+    // Staging buffer on ORT device — pre-allocated, reused every frame
+    wgpu::BufferDescriptor stagingDesc{};
+    stagingDesc.size = outputBytes;
+    stagingDesc.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
+    stagingDesc.label = "OrtOutputStaging";
+    _stagingBuffer = _ortDevice.CreateBuffer(&stagingDesc);
+
     // Read buffer on PRIMARY device — shader binds this
     wgpu::BufferDescriptor readDesc{};
     readDesc.size = outputBytes;
@@ -270,7 +277,7 @@ bool ModelRunner::setup(const ModelSpec& spec) {
     readDesc.label = "ModelReadBuffer";
     _readBuffer = _device.CreateBuffer(&readDesc);
 
-    NSLog(@"[ModelRunner] Output buffers: %u bytes (triple-buffered)", outputBytes);
+    NSLog(@"[ModelRunner] Output buffers: %u bytes (dual-device, pre-allocated staging)", outputBytes);
 
     NSLog(@"[ModelRunner] Output: %dx%d (%u elements, buffer=f32)",
           _outputW, _outputH, (uint32_t)_outputElements);
@@ -467,37 +474,26 @@ void ModelRunner::runInference() {
     {
       uint32_t bytes = (uint32_t)(_outputElements * sizeof(float));
 
-      // Staging buffer bridge: ORT device → primary device
-      // MapAsync waits for ORT GPU completion (~11ms real GPU time)
-      // then copies 1MB to primary device's _readBuffer
-      wgpu::BufferDescriptor stagingDesc{};
-      stagingDesc.size = bytes;
-      stagingDesc.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
-      stagingDesc.label = "OrtOutputStaging";
-      auto stagingBuf = _ortDevice.CreateBuffer(&stagingDesc);
-
+      // Copy ORT output → pre-allocated staging buffer → map → WriteBuffer
       auto encoder = _ortDevice.CreateCommandEncoder();
-      encoder.CopyBufferToBuffer(_ortBuffer, 0, stagingBuf, 0, bytes);
+      encoder.CopyBufferToBuffer(_ortBuffer, 0, _stagingBuffer, 0, bytes);
       auto commands = encoder.Finish();
       _ortDevice.GetQueue().Submit(1, &commands);
 
-      // Use WaitAny with the instance — handles completion callbacks from both devices
       auto instance = RNSkia::DawnContext::getInstance().getWGPUInstance();
       bool mapOk = false;
-      auto future = stagingBuf.MapAsync(
+      auto future = _stagingBuffer.MapAsync(
         wgpu::MapMode::Read, 0, bytes,
         wgpu::CallbackMode::WaitAnyOnly,
         [&mapOk](wgpu::MapAsyncStatus status, wgpu::StringView) {
           mapOk = (status == wgpu::MapAsyncStatus::Success);
         }
       );
-      // Tick the ORT device to ensure GPU work is flushed
-      _ortDevice.Tick();
       instance.WaitAny(future, UINT64_MAX);
       if (mapOk) {
-        const void* mapped = stagingBuf.GetConstMappedRange(0, bytes);
+        const void* mapped = _stagingBuffer.GetConstMappedRange(0, bytes);
         _device.GetQueue().WriteBuffer(_readBuffer, 0, mapped, bytes);
-        stagingBuf.Unmap();
+        _stagingBuffer.Unmap();
       }
     }
     auto tBridge1 = std::chrono::high_resolution_clock::now();
@@ -665,6 +661,7 @@ void ModelRunner::shutdown() {
   _paramBuffer = nullptr;
   _resizeSampler = nullptr;
   _ortBuffer = nullptr;
+  _stagingBuffer = nullptr;
   _ortDevice = nullptr;
 
   // Release IOSurface ref

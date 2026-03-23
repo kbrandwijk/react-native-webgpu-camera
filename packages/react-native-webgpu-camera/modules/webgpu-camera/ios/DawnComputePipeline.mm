@@ -1346,7 +1346,18 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
         return false;
       }
     } else if (pass.hasDynamicInputs) {
-      // Passes with dynamic inputs (e.g. depth): rebuild bind group every frame
+      // Passes with dynamic inputs (e.g. depth, model output): rebuild bind group every frame.
+      // Skip entirely if model output isn't ready yet — avoids bind group entry count mismatch.
+      bool skipPass = false;
+      for (const auto& ib : impl->passInputBindings[i]) {
+        if (ib.modelOutput >= 0 && (size_t)ib.modelOutput < impl->models.size()
+            && !impl->models[ib.modelOutput]->hasResult()) {
+          skipPass = true;
+          break;
+        }
+      }
+      if (skipPass) continue;
+
       bool readFromA = (i % 2 != 0);
       wgpu::Texture& readTex = readFromA ? impl->texA : impl->texB;
       wgpu::Texture& writeTex = readFromA ? impl->texB : impl->texA;

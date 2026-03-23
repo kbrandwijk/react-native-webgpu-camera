@@ -78,8 +78,10 @@ private:
   void* _boundInputTensor = nullptr;   // Ort::Value* — must outlive binding
   void* _boundOutputTensor = nullptr;  // Ort::Value* — must outlive binding
 
-  // ORT output buffer on _ortDevice — mapped for CPU read via BufferMapExtendedUsages
+  // ORT output buffer on _ortDevice
   wgpu::Buffer _ortBuffer;
+  // Staging buffer on _ortDevice — for MapAsync readback
+  wgpu::Buffer _stagingBuffer;
   // Read buffer on _device (primary) — shader binds this, never contends with ORT
   wgpu::Buffer _readBuffer;
   size_t _outputElements = 0;
