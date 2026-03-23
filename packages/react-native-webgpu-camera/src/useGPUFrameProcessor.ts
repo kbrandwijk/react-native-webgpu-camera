@@ -45,6 +45,7 @@ interface CapturedModel {
   normalization?: { mean: [number, number, number]; std: [number, number, number] };
   sync: boolean;
   pipelineIndex: number;
+  bufferOutput?: { count: number };
 }
 
 /** A resource spec to send to native for GPU upload */
@@ -235,7 +236,7 @@ function capturePipeline<B extends Record<string, any>, R extends Record<string,
       passes.push(pass);
       return {} as any;
     },
-    runModel(modelHandle: ModelResourceHandle) {
+    runModel(modelHandle: ModelResourceHandle, options?: { output?: any; count?: number }) {
       const modelIndex = capturedModels.length;
       const mrh = modelHandle as ModelResourceHandle;
       capturedModels.push({
@@ -243,11 +244,22 @@ function capturePipeline<B extends Record<string, any>, R extends Record<string,
         inputShape: mrh.__modelOptions?.inputShape,
         normalization: mrh.__modelOptions?.normalization,
         sync: mrh.__modelOptions?.sync ?? false,
-        // pipelineIndex is the model's position in the overall pipeline execution order
-        // (same as passes.length — model occupies a "slot" like a shader pass)
         pipelineIndex: passes.length,
+        // If buffer output requested, store the element count for native side
+        bufferOutput: options?.output ? { count: options.count ?? 0 } : undefined,
       });
-      // Return a handle that downstream runShader calls can reference
+
+      if (options?.output && options.count) {
+        // Buffer output mode — register as a buffer for onFrame delivery
+        const ctor = options.output as TypedArrayConstructor;
+        const bufIdx = bufferMetas.length;
+        bufferMetas.push({ name: `__model_${modelIndex}`, ctor });
+        const handle = {} as any;
+        outputHandleMap.set(handle, { passIndex: -1, bufferIndex: bufIdx, isTexture: false, modelIndex });
+        return handle as any;
+      }
+
+      // Texture/shader input mode (existing path)
       const handle = { __resourceType: 'texture2d', __handle: -1 } as any;
       outputHandleMap.set(handle, { passIndex: -1, bufferIndex: -1, isTexture: false, modelIndex });
       return handle as any;
@@ -360,6 +372,7 @@ function buildNativeConfig(
     normalization: m.normalization,
     sync: m.sync,
     pipelineIndex: m.pipelineIndex + passOffset,
+    bufferOutputCount: m.bufferOutput?.count ?? 0,
   }));
 
   // Log binding assignments at setup (format: name→3(texture3d)+4(sampler))
@@ -619,13 +632,13 @@ export function useGPUFrameProcessor(
     }
 
     // WebGPU canvas output: compute thread copies directly to surface + presents.
-    // No JS-thread work needed — just skip the SkImage path.
-    if (useCanvasOutput.value) {
+    // Canvas output without onFrame — no JS-thread work needed.
+    if (useCanvasOutput.value && !hasOnFrame.value) {
       frame.image?.dispose();
       return;
     }
 
-    // onFrame canvas path — always flush to produce the composited image
+    // onFrame canvas path
     if (hasOnFrame.value && onFrameFn && frame.canvas) {
       // Canvas is portrait-oriented (rotation done in GPU pass 0)
       const renderFrame = {
@@ -635,6 +648,9 @@ export function useGPUFrameProcessor(
       };
       onFrameFn(renderFrame, (buffers.value ?? {}) as any);
 
+      // TODO: optimize WebGPUCanvas + onFrame path to avoid SkImage intermediary
+      // For now, always use flushCanvasAndGetImage path for onFrame
+      // SkImage path: flush canvas draws into composited image
       const composited = s.flushCanvasAndGetImage();
       if (composited) {
         currentFrame.value?.dispose();

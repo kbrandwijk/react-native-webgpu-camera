@@ -173,6 +173,7 @@ public class WebGPUCameraModule: Module {
           "path": m["path"] as? String ?? "",
           "sync": m["sync"] as? Bool ?? false,
           "pipelineIndex": m["pipelineIndex"] as? Int ?? -1,
+          "bufferOutputCount": m["bufferOutputCount"] as? Int ?? 0,
         ]
         if let inputShape = m["inputShape"] {
           spec["inputShape"] = inputShape

@@ -54,12 +54,17 @@ type ShaderMode =
   | { name: string; type: 'applelog' }
   | { name: string; type: 'depth' }
   | { name: string; type: 'depth-model' }
+  | { name: string; type: 'yolo' }
   | { name: string; type: 'hdr-lut' };
 
 const DEPTH_MODEL_URL = 'https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model_q4.onnx';
 const DEPTH_MODEL_PATH = `${Paths.document.uri}/depth-anything-v2-small-q4.onnx`;
 
+const YOLO_MODEL_URL = 'https://huggingface.co/SpotLab/YOLOv8Detection/resolve/3005c6751fb19cdeb6b10c066185908faf66a097/yolov8n.onnx';
+const YOLO_MODEL_PATH = `${Paths.document.uri}/yolov8n.onnx`;
+
 const SHADERS: ShaderMode[] = [
+  { name: 'YOLO', type: 'yolo' },
   { name: 'Depth Model', type: 'depth-model' },
   { name: 'Depth', type: 'depth' },
     { name: 'None', wgsl: [], type: 'simple' },
@@ -447,6 +452,186 @@ function DepthModelPreview({ format, colorSpace, modelPath }: { format?: CameraF
   );
 }
 
+// COCO class names (80 classes)
+const COCO_CLASSES = [
+  'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat',
+  'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat',
+  'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'backpack',
+  'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball',
+  'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket',
+  'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple',
+  'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair',
+  'couch', 'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse',
+  'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink', 'refrigerator',
+  'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush',
+];
+
+// Colors for different classes
+const BOX_COLORS = [
+  '#FF3B30', '#FF9500', '#FFCC00', '#34C759', '#00C7BE',
+  '#30B0C7', '#007AFF', '#5856D6', '#AF52DE', '#FF2D55',
+];
+
+function YoloPreview({ format, colorSpace, modelPath }: { format?: CameraFormat; colorSpace?: ColorSpace; modelPath: string }) {
+  const { width: screenW, height: screenH } = useWindowDimensions();
+
+  const camera = useCamera({
+    device: 'back',
+    format,
+    colorSpace,
+  });
+
+  const yoloResource = useMemo(
+    () => GPUResource.model(modelPath, { inputShape: [1, 3, 640, 640] }),
+    [modelPath],
+  );
+
+  const { currentFrame, fps, displayFps, metrics, error } = useGPUFrameProcessor(camera, {
+    resources: { yolo: yoloResource },
+    pipeline: (frame, res: any) => {
+      'worklet';
+      const detections = frame.runModel(res.yolo, { output: Float32Array, count: 84 * 8400 });
+      return { detections };
+    },
+    onFrame: (() => {
+      // Pre-create Skia objects outside worklet (captured by closure)
+      const boxPaint = Skia.Paint();
+      boxPaint.setStyle(1); // Stroke
+      boxPaint.setStrokeWidth(3);
+
+      const bgPaint = Skia.Paint();
+
+      const textPaint = Skia.Paint();
+      textPaint.setColor(Skia.Color('white'));
+
+      const fontMgr = Skia.FontMgr.System();
+      const typeface = fontMgr.matchFamilyStyle('Helvetica', { weight: 700, width: 5, slant: 0 });
+      const font = Skia.Font(typeface, 28);
+
+      // Pre-create color objects
+      const colors = BOX_COLORS.map(c => Skia.Color(c));
+
+      return (frame: any, { detections }: any) => {
+        'worklet';
+        if (!detections) return;
+
+        const NUM_DETECTIONS = 8400;
+        const NUM_CLASSES = 80;
+        const CONF_THRESHOLD = 0.25;
+
+        // Find detections above threshold
+        // Reuse arrays to avoid GC pressure
+        let count = 0;
+        const MAX_KEPT = 20;
+        const cxs = new Float32Array(MAX_KEPT);
+        const cys = new Float32Array(MAX_KEPT);
+        const ws = new Float32Array(MAX_KEPT);
+        const hs = new Float32Array(MAX_KEPT);
+        const classIds = new Int32Array(MAX_KEPT);
+        const scores = new Float32Array(MAX_KEPT);
+
+        for (let i = 0; i < NUM_DETECTIONS && count < MAX_KEPT; i++) {
+          let maxScore = 0;
+          let maxClass = 0;
+          for (let c = 0; c < NUM_CLASSES; c++) {
+            const s = detections[(4 + c) * NUM_DETECTIONS + i];
+            if (s > maxScore) { maxScore = s; maxClass = c; }
+          }
+          if (maxScore < CONF_THRESHOLD) continue;
+
+          // Insert sorted by score (simple insertion)
+          let pos = count;
+          while (pos > 0 && maxScore > scores[pos - 1]) {
+            if (pos < MAX_KEPT) {
+              cxs[pos] = cxs[pos-1]; cys[pos] = cys[pos-1];
+              ws[pos] = ws[pos-1]; hs[pos] = hs[pos-1];
+              classIds[pos] = classIds[pos-1]; scores[pos] = scores[pos-1];
+            }
+            pos--;
+          }
+          if (pos < MAX_KEPT) {
+            cxs[pos] = detections[0 * NUM_DETECTIONS + i];
+            cys[pos] = detections[1 * NUM_DETECTIONS + i];
+            ws[pos] = detections[2 * NUM_DETECTIONS + i];
+            hs[pos] = detections[3 * NUM_DETECTIONS + i];
+            classIds[pos] = maxClass;
+            scores[pos] = maxScore;
+            if (count < MAX_KEPT) count++;
+          }
+        }
+
+        // Simple NMS
+        const keep = new Uint8Array(count);
+        keep.fill(1);
+        for (let i = 0; i < count; i++) {
+          if (!keep[i]) continue;
+          for (let j = i + 1; j < count; j++) {
+            if (!keep[j]) continue;
+            const x1 = Math.max(cxs[i] - ws[i]/2, cxs[j] - ws[j]/2);
+            const y1 = Math.max(cys[i] - hs[i]/2, cys[j] - hs[j]/2);
+            const x2 = Math.min(cxs[i] + ws[i]/2, cxs[j] + ws[j]/2);
+            const y2 = Math.min(cys[i] + hs[i]/2, cys[j] + hs[j]/2);
+            const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+            const union_ = ws[i]*hs[i] + ws[j]*hs[j] - inter;
+            if (inter / union_ > 0.5) keep[j] = 0;
+          }
+        }
+
+        // Draw bounding boxes
+
+        // Model output is normalized 0-1, scale directly to frame dimensions
+        const scaleX = frame.width;
+        const scaleY = frame.height;
+
+        for (let i = 0; i < count; i++) {
+          if (!keep[i]) continue;
+
+          const x = (cxs[i] - ws[i] / 2) * scaleX;
+          const y = (cys[i] - hs[i] / 2) * scaleY;
+          const w = ws[i] * scaleX;
+          const h = hs[i] * scaleY;
+          const color = colors[classIds[i] % colors.length];
+
+          boxPaint.setColor(color);
+          bgPaint.setColor(color);
+
+          frame.canvas.drawRect(Skia.XYWHRect(x, y, w, h), boxPaint);
+
+          // Label background + text
+          const label = `${COCO_CLASSES[classIds[i]]} ${(scores[i] * 100).toFixed(0)}%`;
+          const labelW = label.length * 16;
+          const labelH = 36;
+          bgPaint.setColor(color);
+          frame.canvas.drawRect(Skia.XYWHRect(x, y - labelH, labelW, labelH), bgPaint);
+          frame.canvas.drawText(label, x + 4, y - 8, textPaint, font);
+        }
+      };
+    })(),
+  });
+
+  useDerivedValue(() => {
+    const m = metrics.value;
+    if (fps.value > 0 && m) {
+      console.log(`[YOLO] ${fps.value}fps (display=${displayFps.value}) | compute=${m.compute.toFixed(2)}ms total=${m.total.toFixed(2)}ms`);
+    }
+  });
+
+  return (
+    <>
+      <Canvas style={StyleSheet.absoluteFill}>
+        <Fill color="black" />
+        <SkImage image={currentFrame} x={0} y={0} width={screenW} height={screenH} fit="cover" />
+      </Canvas>
+
+      <View style={styles.statusBar}>
+        <Text style={styles.statusText}>
+          {error ? `Error: ${error}` : camera.isReady ? `YOLO ${camera.width}x${camera.height} @ ${camera.fps}fps` : 'Starting camera...'}
+        </Text>
+      </View>
+    </>
+  );
+}
+
 function HdrLutPreview({ format, colorSpace }: { format?: CameraFormat; colorSpace?: ColorSpace }) {
   const { width: screenW, height: screenH } = useWindowDimensions();
 
@@ -517,6 +702,7 @@ export default function CameraSpikeScreen() {
   const [showOrt, setShowOrt] = useState(false);
   const [lutResource, setLutResource] = useState<ReturnType<typeof GPUResource.texture3D> | null>(null);
   const [depthModelPath, setDepthModelPath] = useState<string | null>(null);
+  const [yoloModelPath, setYoloModelPath] = useState<string | null>(null);
   const shader = SHADERS[shaderIndex];
 
   // Load bundled .cube LUT on mount — pass file URI, native side parses .cube
@@ -531,18 +717,26 @@ export default function CameraSpikeScreen() {
     })();
   }, []);
 
-  // Download depth model on mount
+  // Download models on mount
   useEffect(() => {
     (async () => {
-      const file = new ExpoFile(DEPTH_MODEL_PATH);
-      if (!file.exists) {
-        console.log('[DepthModel] Downloading depth model...');
+      const depthFile = new ExpoFile(DEPTH_MODEL_PATH);
+      if (!depthFile.exists) {
+        console.log('[Model] Downloading depth model...');
         const resp = await fetch(DEPTH_MODEL_URL);
-        const bytes = new Uint8Array(await resp.arrayBuffer());
-        file.write(bytes);
-        console.log('[DepthModel] Download complete');
+        depthFile.write(new Uint8Array(await resp.arrayBuffer()));
+        console.log('[Model] Depth model download complete');
       }
       setDepthModelPath(DEPTH_MODEL_PATH);
+
+      const yoloFile = new ExpoFile(YOLO_MODEL_PATH);
+      if (!yoloFile.exists) {
+        console.log('[Model] Downloading YOLO model...');
+        const resp = await fetch(YOLO_MODEL_URL);
+        yoloFile.write(new Uint8Array(await resp.arrayBuffer()));
+        console.log('[Model] YOLO model download complete');
+      }
+      setYoloModelPath(YOLO_MODEL_PATH);
     })();
   }, []);
 
@@ -597,6 +791,14 @@ export default function CameraSpikeScreen() {
         <View style={StyleSheet.absoluteFill}>
           <View style={styles.statusBar}>
             <Text style={styles.statusText}>Downloading depth model...</Text>
+          </View>
+        </View>
+      )}
+      {isRunning && shader.type === 'yolo' && yoloModelPath && <YoloPreview key={`${shader.name}-${selectedColorSpace}`} format={selectedFormat} colorSpace={selectedColorSpace} modelPath={yoloModelPath} />}
+      {isRunning && shader.type === 'yolo' && !yoloModelPath && (
+        <View style={StyleSheet.absoluteFill}>
+          <View style={styles.statusBar}>
+            <Text style={styles.statusText}>Downloading YOLO model...</Text>
           </View>
         </View>
       )}

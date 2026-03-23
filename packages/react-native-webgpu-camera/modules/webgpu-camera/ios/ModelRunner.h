@@ -20,6 +20,7 @@ struct ModelSpec {
   float normStd[3] = {0.229f, 0.224f, 0.225f};
   bool sync = false;
   int pipelineIndex = -1;  // position in pass chain
+  int bufferOutputCount = 0;  // >0: expose output as buffer for JS readback
 };
 
 class ModelRunner {
@@ -47,6 +48,13 @@ public:
 
   /** Check if a result is available. */
   bool hasResult() const { return _hasResult.load(); }
+
+  /** Get CPU-side copy of last model output (for JS readback). Thread-safe. */
+  const void* getOutputData() const {
+    std::lock_guard<std::mutex> lock(_outputMutex);
+    return _cpuOutputData.empty() ? nullptr : _cpuOutputData.data();
+  }
+  size_t getOutputByteSize() const { return _outputElements * sizeof(float); }
 
   void shutdown();
 
@@ -85,6 +93,8 @@ private:
   // Read buffer on _device (primary) — shader binds this, never contends with ORT
   wgpu::Buffer _readBuffer;
   size_t _outputElements = 0;
+  // CPU copy of last model output — for JS readback in onFrame
+  std::vector<uint8_t> _cpuOutputData;
 
   // Input/output names (cached from model metadata)
   std::vector<std::string> _inputNames;

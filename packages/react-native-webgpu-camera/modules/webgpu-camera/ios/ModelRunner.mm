@@ -474,15 +474,21 @@ void ModelRunner::runInference() {
     {
       uint32_t bytes = (uint32_t)(_outputElements * sizeof(float));
 
-      // Copy ORT output → pre-allocated staging buffer → map → WriteBuffer
+      // Create fresh staging buffer per frame (avoids map/unmap lifecycle issues)
+      wgpu::BufferDescriptor stagingDesc{};
+      stagingDesc.size = bytes;
+      stagingDesc.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
+      stagingDesc.label = "OrtOutputStaging";
+      auto stagingBuf = _ortDevice.CreateBuffer(&stagingDesc);
+
       auto encoder = _ortDevice.CreateCommandEncoder();
-      encoder.CopyBufferToBuffer(_ortBuffer, 0, _stagingBuffer, 0, bytes);
+      encoder.CopyBufferToBuffer(_ortBuffer, 0, stagingBuf, 0, bytes);
       auto commands = encoder.Finish();
       _ortDevice.GetQueue().Submit(1, &commands);
 
       auto instance = RNSkia::DawnContext::getInstance().getWGPUInstance();
       bool mapOk = false;
-      auto future = _stagingBuffer.MapAsync(
+      auto future = stagingBuf.MapAsync(
         wgpu::MapMode::Read, 0, bytes,
         wgpu::CallbackMode::WaitAnyOnly,
         [&mapOk](wgpu::MapAsyncStatus status, wgpu::StringView) {
@@ -491,9 +497,15 @@ void ModelRunner::runInference() {
       );
       instance.WaitAny(future, UINT64_MAX);
       if (mapOk) {
-        const void* mapped = _stagingBuffer.GetConstMappedRange(0, bytes);
+        const void* mapped = stagingBuf.GetConstMappedRange(0, bytes);
         _device.GetQueue().WriteBuffer(_readBuffer, 0, mapped, bytes);
-        _stagingBuffer.Unmap();
+        // Keep a CPU copy for JS readback (onFrame)
+        {
+          std::lock_guard<std::mutex> lock(_outputMutex);
+          _cpuOutputData.resize(bytes);
+          memcpy(_cpuOutputData.data(), mapped, bytes);
+        }
+        stagingBuf.Unmap();
       }
     }
     auto tBridge1 = std::chrono::high_resolution_clock::now();

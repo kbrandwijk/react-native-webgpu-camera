@@ -167,6 +167,7 @@
 
     spec.sync = [ms[@"sync"] boolValue];
     spec.pipelineIndex = [ms[@"pipelineIndex"] intValue];
+    spec.bufferOutputCount = ms[@"bufferOutputCount"] ? [ms[@"bufferOutputCount"] intValue] : 0;
 
     modelSpecsCpp.push_back(spec);
   }

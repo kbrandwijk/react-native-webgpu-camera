@@ -114,9 +114,13 @@ export interface ProcessorFrame {
     options: { output: { readonly __outputType: 'texture2d' }; inputs?: Record<string, any> },
   ): ResourceHandle<'texture2d'>;
 
-  /** Run an ONNX model on the current frame. Returns a texture handle with the model output.
-   *  Async by default — returns the latest available result (null if not ready yet). */
+  /** Run an ONNX model on the current frame. Returns a handle for use as shader input. */
   runModel(model: ModelResourceHandle): ResourceHandle<'texture2d'> | null;
+  /** Run an ONNX model with buffer output — returns a handle resolved per-frame in onFrame. */
+  runModel<T extends TypedArrayConstructor>(
+    model: ModelResourceHandle,
+    options: { output: T; count: number },
+  ): BufferHandle<InstanceType<T>>;
 
   /** Skia canvas targeting the current pass's output texture */
   canvas: SkCanvas;

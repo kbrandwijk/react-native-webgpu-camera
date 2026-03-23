@@ -709,6 +709,14 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     NSLog(@"[DawnPipeline] Setup %zu model runners OK", models.size());
   }
 
+  // Track model buffer output counts (delivered via beginFrame, not via _impl->buffers)
+  for (size_t mi = 0; mi < models.size(); mi++) {
+    if (models[mi].bufferOutputCount > 0) {
+      NSLog(@"[DawnPipeline] Model %zu buffer output: %d floats (via CPU copy in beginFrame)",
+            mi, models[mi].bufferOutputCount);
+    }
+  }
+
   // Store per-pass custom input bindings
   NSLog(@"[DawnPipeline] Storing %zu passInput specs across %zu passes\n",
          passInputs.size(), _impl->passes.size());
@@ -1254,7 +1262,12 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
 
   // Process pending async callbacks from previous frame (e.g. MapAsync).
   // AllowProcessEvents callbacks fire during ProcessEvents(), not Tick().
-  if (!impl->syncMode && !impl->buffers.empty()) {
+  // Only needed for shader buffer readbacks, not model output entries (passIndex == -1).
+  bool hasShaderBuffers = false;
+  for (const auto& sb : impl->buffers) {
+    if (sb.passIndex >= 0) { hasShaderBuffers = true; break; }
+  }
+  if (!impl->syncMode && hasShaderBuffers) {
     ctx.getWGPUInstance().ProcessEvents();
   }
 
@@ -1470,10 +1483,14 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   double tAfterCompute = CACurrentMediaTime();
 
   // Copy output buffers to staging in a separate submission
-  if (!impl->buffers.empty()) {
+  if (hasShaderBuffers) {
     auto copyEncoder = device.CreateCommandEncoder();
 
     for (auto& sb : impl->buffers) {
+      // Skip model output buffer entries — they don't have GPU/staging buffers
+      // (data comes from ModelRunner's CPU copy instead)
+      if (sb.passIndex < 0) continue;
+
       int stagingIdx = sb.frameIndex % 2;
 
       if (sb.mapped[stagingIdx]) {
@@ -1490,6 +1507,7 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
 
     // Map staging buffers for readback
     for (auto& sb : impl->buffers) {
+      if (sb.passIndex < 0) continue;  // skip model output entries
       int stagingIdx = sb.frameIndex % 2;
 
       if (impl->syncMode) {
@@ -1661,16 +1679,35 @@ DawnComputePipeline::FrameData DawnComputePipeline::beginFrame() {
     fd.image = &_impl->outputImage;
   }
 
-  // Buffers
-  fd.bufferCount = std::min((int)_impl->buffers.size(), 8);
+  // Shader output buffers
+  int shaderBufCount = (int)_impl->buffers.size();
+  // Model output buffers — appended after shader buffers
+  int modelBufCount = 0;
+  for (auto& model : _impl->models) {
+    if (model->getOutputByteSize() > 0) modelBufCount++;
+  }
+  fd.bufferCount = std::min(shaderBufCount + modelBufCount, 8);
+
   for (int bi = 0; bi < fd.bufferCount; bi++) {
-    auto& sb = _impl->buffers[bi];
-    fd.bufferByteSizes[bi] = sb.byteSize;
     fd.bufferData[bi] = nullptr;
-    for (int si = 0; si < 2; si++) {
-      if (sb.mapped[si] && sb.mappedData[si]) {
-        fd.bufferData[bi] = sb.mappedData[si];
-        break;
+    fd.bufferByteSizes[bi] = 0;
+
+    if (bi < shaderBufCount) {
+      // Shader output buffer — data from ping-pong staging
+      auto& sb = _impl->buffers[bi];
+      fd.bufferByteSizes[bi] = sb.byteSize;
+      for (int si = 0; si < 2; si++) {
+        if (sb.mapped[si] && sb.mappedData[si]) {
+          fd.bufferData[bi] = sb.mappedData[si];
+          break;
+        }
+      }
+    } else {
+      // Model output buffer — data from ModelRunner's CPU copy
+      int modelIdx = bi - shaderBufCount;
+      if (modelIdx < (int)_impl->models.size() && _impl->models[modelIdx]->hasResult()) {
+        fd.bufferData[bi] = _impl->models[modelIdx]->getOutputData();
+        fd.bufferByteSizes[bi] = (int)_impl->models[modelIdx]->getOutputByteSize();
       }
     }
   }
@@ -1912,6 +1949,7 @@ void DawnComputePipeline::cleanupLocked() {
   if (!_impl) return;
 
   for (auto& sb : _impl->buffers) {
+    if (sb.passIndex < 0) continue;  // skip model output entries
     for (int j = 0; j < 2; j++) {
       if (sb.mapped[j]) {
         sb.staging[j].Unmap();
