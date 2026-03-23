@@ -535,13 +535,6 @@ function YoloPreview({ format, colorSpace, modelPath }: { format?: CameraFormat;
 
         // Parse NMS model output: [300, 6] = [x1, y1, x2, y2, confidence, classId]
         if (detections && detections !== cachedBoxes.lastData) {
-          // Debug: log detections with highest confidence
-          let bestConf = 0;
-          let bestIdx = 0;
-          for (let d = 0; d < 300; d++) {
-            if (detections[d*6+4] > bestConf) { bestConf = detections[d*6+4]; bestIdx = d; }
-          }
-          console.log(`[YOLO] best det[${bestIdx}]: x1=${detections[bestIdx*6+0].toFixed(1)} y1=${detections[bestIdx*6+1].toFixed(1)} x2=${detections[bestIdx*6+2].toFixed(1)} y2=${detections[bestIdx*6+3].toFixed(1)} conf=${bestConf.toFixed(3)} cls=${detections[bestIdx*6+5].toFixed(0)}`);
           cachedBoxes.lastData = detections;
           cachedBoxes.count = 0;
           const CONF_THRESHOLD = 0.25;
