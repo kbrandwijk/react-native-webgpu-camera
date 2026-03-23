@@ -60,7 +60,7 @@ type ShaderMode =
 const DEPTH_MODEL_URL = 'https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model_q4.onnx';
 const DEPTH_MODEL_PATH = `${Paths.document.uri}/depth-anything-v2-small-q4.onnx`;
 
-const YOLO_MODEL_PATH = `${Paths.document.uri}/yolov8n.onnx`;
+const YOLO_MODEL_PATH = `${Paths.document.uri}/yolov8s2.onnx`;
 
 const SHADERS: ShaderMode[] = [
   { name: 'YOLO', type: 'yolo' },
@@ -481,7 +481,7 @@ function YoloPreview({ format, colorSpace, modelPath }: { format?: CameraFormat;
   });
 
   const yoloResource = useMemo(
-    () => GPUResource.model(modelPath, { inputShape: [1, 3, 640, 640] }),
+    () => GPUResource.model(modelPath, { inputShape: [1, 3, 1280, 736] }),  // NCHW: H=1280, W=736 (portrait)
     [modelPath],
   );
 
@@ -535,6 +535,7 @@ function YoloPreview({ format, colorSpace, modelPath }: { format?: CameraFormat;
 
         // Parse NMS model output: [300, 6] = [x1, y1, x2, y2, confidence, classId]
         if (detections && detections !== cachedBoxes.lastData) {
+          console.log(`[YOLO] frame=${frame.width}x${frame.height}`);
           cachedBoxes.lastData = detections;
           cachedBoxes.count = 0;
           const CONF_THRESHOLD = 0.25;
@@ -544,16 +545,29 @@ function YoloPreview({ format, colorSpace, modelPath }: { format?: CameraFormat;
             if (conf < CONF_THRESHOLD) continue;
 
             const k = cachedBoxes.count;
+            // Model output in letterboxed pixel space (model is portrait).
+            // Model W=736 (narrow), H=1280 (tall). Source portrait: 1080×1920.
+            // Letterbox: scale=min(736/1080, 1280/1920)=0.667, scaled=720×1280, padX=8, padY=0
+            const MODEL_W = 736;
+            const MODEL_H = 1280;
+            const srcW = 1080;  // portrait width
+            const srcH = 1920;  // portrait height
+            const lbScale = Math.min(MODEL_W / srcW, MODEL_H / srcH);
+            const scaledW = srcW * lbScale;
+            const scaledH = srcH * lbScale;
+            const padX = (MODEL_W - scaledW) * 0.5;
+            const padY = (MODEL_H - scaledH) * 0.5;
+
             const x1raw = detections[i * 6 + 0];
             const y1raw = detections[i * 6 + 1];
             const x2raw = detections[i * 6 + 2];
             const y2raw = detections[i * 6 + 3];
-            // Coords in pixel space (0-640) or normalized (0-1) — handle both
-            const scale = (x2raw > 2) ? 640 : 1;
-            cachedBoxes.x1s[k] = x1raw / scale;
-            cachedBoxes.y1s[k] = y1raw / scale;
-            cachedBoxes.x2s[k] = x2raw / scale;
-            cachedBoxes.y2s[k] = y2raw / scale;
+
+            // Unpad and normalize to 0-1 (already portrait — no rotation needed)
+            cachedBoxes.x1s[k] = (x1raw - padX) / scaledW;
+            cachedBoxes.y1s[k] = (y1raw - padY) / scaledH;
+            cachedBoxes.x2s[k] = (x2raw - padX) / scaledW;
+            cachedBoxes.y2s[k] = (y2raw - padY) / scaledH;
             cachedBoxes.scores[k] = conf;
             cachedBoxes.classIds[k] = Math.round(detections[i * 6 + 5]);
             cachedBoxes.count++;
@@ -712,7 +726,7 @@ export default function CameraSpikeScreen() {
       // Always overwrite — model format changed (NMS baked in)
       {
         console.log('[Model] Loading YOLO model from assets...');
-        const [asset] = await Asset.loadAsync(require('../../assets/yolov8n.onnx'));
+        const [asset] = await Asset.loadAsync(require('../../assets/yolov8s2.onnx'));
         if (asset.localUri) {
           // Read asset as ArrayBuffer via fetch, write as Uint8Array
           const resp = await fetch(asset.localUri);

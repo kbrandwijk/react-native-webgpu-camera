@@ -16,9 +16,12 @@ namespace dawn_pipeline {
 struct ResizeParams {
   uint32_t modelW;
   uint32_t modelH;
+  uint32_t inputW;   // raw IOSurface width (landscape)
+  uint32_t inputH;   // raw IOSurface height (landscape)
   float meanR, meanG, meanB;
   float stdR, stdG, stdB;
-  // 8 x 4 bytes = 32 bytes — already 16-byte aligned
+  float padValue;    // letterbox pad color (0.447 = 114/255 for YOLO)
+  // 12 x 4 bytes = 48 bytes — 16-byte aligned
 };
 
 // ── Resize + normalize compute shader ──
@@ -33,8 +36,11 @@ static const char* kResizeNormalizeWGSL = R"(
 struct Params {
   modelW: u32,
   modelH: u32,
+  inputW: u32,
+  inputH: u32,
   meanR: f32, meanG: f32, meanB: f32,
   stdR: f32, stdG: f32, stdB: f32,
+  padValue: f32,
 }
 @group(0) @binding(3) var<uniform> params: Params;
 
@@ -42,14 +48,43 @@ struct Params {
 fn main(@builtin(global_invocation_id) id: vec3u) {
   if (id.x >= params.modelW || id.y >= params.modelH) { return; }
 
-  // Rotate 90° CW: landscape IOSurface → portrait model input
-  let normUV = (vec2f(id.xy) + 0.5) / vec2f(f32(params.modelW), f32(params.modelH));
-  let uv = vec2f(normUV.y, 1.0 - normUV.x);
-  let pixel = textureSampleLevel(inputTex, inputSampler, uv, 0.0);
+  // Letterbox: fit rotated source into model input, preserving aspect ratio.
+  // Raw IOSurface is landscape (inputW × inputH). After 90° CW rotation → portrait.
+  // Portrait dims: width = inputH (1080), height = inputW (1920).
+  let srcW = f32(params.inputH);  // portrait width = landscape height
+  let srcH = f32(params.inputW);  // portrait height = landscape width
+  let dstW = f32(params.modelW);
+  let dstH = f32(params.modelH);
 
-  let r = (pixel.r - params.meanR) / params.stdR;
-  let g = (pixel.g - params.meanG) / params.stdG;
-  let b = (pixel.b - params.meanB) / params.stdB;
+  // Scale to fit, preserving aspect ratio
+  let scale = min(dstW / srcW, dstH / srcH);
+  let scaledW = srcW * scale;
+  let scaledH = srcH * scale;
+  let padX = (dstW - scaledW) * 0.5;
+  let padY = (dstH - scaledH) * 0.5;
+
+  let px = f32(id.x);
+  let py = f32(id.y);
+
+  var r: f32; var g: f32; var b: f32;
+
+  if (px < padX || px >= padX + scaledW || py < padY || py >= padY + scaledH) {
+    // Pad region
+    r = (params.padValue - params.meanR) / params.stdR;
+    g = (params.padValue - params.meanG) / params.stdG;
+    b = (params.padValue - params.meanB) / params.stdB;
+  } else {
+    // Map to source UV with 90° CW rotation (same as pass 0)
+    // pass 0: output(x,y) ← input(y, H-1-x)
+    // In UV: uv = (srcY, 1 - srcX)
+    let srcX = (px - padX) / scaledW;
+    let srcY = (py - padY) / scaledH;
+    let uv = vec2f(srcY, 1.0 - srcX);
+    let pixel = textureSampleLevel(inputTex, inputSampler, uv, 0.0);
+    r = (pixel.r - params.meanR) / params.stdR;
+    g = (pixel.g - params.meanG) / params.stdG;
+    b = (pixel.b - params.meanB) / params.stdB;
+  }
 
   let idx = id.y * params.modelW + id.x;
   let planeSize = params.modelW * params.modelH;
@@ -235,12 +270,15 @@ bool ModelRunner::setup(const ModelSpec& spec) {
     ResizeParams params{};
     params.modelW = (uint32_t)_modelW;
     params.modelH = (uint32_t)_modelH;
+    params.inputW = (uint32_t)_cameraW;  // landscape IOSurface width
+    params.inputH = (uint32_t)_cameraH;  // landscape IOSurface height
     params.meanR = spec.normMean[0];
     params.meanG = spec.normMean[1];
     params.meanB = spec.normMean[2];
     params.stdR = spec.normStd[0];
     params.stdG = spec.normStd[1];
     params.stdB = spec.normStd[2];
+    params.padValue = 114.0f / 255.0f;  // YOLO standard letterbox pad color
 
     wgpu::BufferDescriptor paramBufDesc{};
     paramBufDesc.size = sizeof(ResizeParams);
