@@ -648,8 +648,8 @@ export function useGPUFrameProcessor(
       };
       onFrameFn(renderFrame, (buffers.value ?? {}) as any);
 
-      // TODO: optimize WebGPUCanvas + onFrame path to avoid SkImage intermediary
-      // For now, always use flushCanvasAndGetImage path for onFrame
+      // With WebGPUCanvas: processFrame presents at full fps.
+      // onFrame draws are composited via flushCanvasAndGetImage → overlayImage.
       // SkImage path: flush canvas draws into composited image
       const composited = s.flushCanvasAndGetImage();
       if (composited) {

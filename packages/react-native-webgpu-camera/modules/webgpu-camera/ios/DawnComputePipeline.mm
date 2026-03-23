@@ -62,6 +62,7 @@ struct DawnComputePipeline::Impl {
   std::vector<StagingBuffer> buffers;
   bool syncMode = false;
   bool useCanvas = false;
+  bool onFramePresent = false;  // true when onFrame + canvas: JS thread handles present
   bool appleLog = false;
   bool rawCamera = false;  // true when 0 shaders, no canvas, no buffers
   wgpu::Texture canvasTex;  // separate texture for Skia draws — not touched by compute
@@ -1435,13 +1436,13 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   bool finalIsA = (impl->passes.size() % 2 != 0);
   wgpu::Texture& finalOutput = finalIsA ? impl->texA : impl->texB;
 
+  // Copy final compute output to canvas surface
   if (_canvasContextId >= 0) {
     auto& registry = rnwgpu::SurfaceRegistry::getInstance();
     auto surfaceInfo = registry.getSurfaceInfo(_canvasContextId);
     if (surfaceInfo) {
       auto surfaceTex = surfaceInfo->getCurrentTexture();
       if (surfaceTex) {
-        // Direct texture copy — same format, no render pass needed
         wgpu::TexelCopyTextureInfo src{};
         src.texture = finalOutput;
         wgpu::TexelCopyTextureInfo dst{};
@@ -1889,24 +1890,62 @@ fn fs(in: VsOut) -> @location(0) vec4f {
   NSLog(@"[DawnPipeline] Canvas output configured: contextId=%d, blit pipeline + bind group cached", contextId);
 }
 
-bool DawnComputePipeline::presentToCanvas() {
-  // Called from JS thread (useFrameCallback) to blit presentTex → canvas surface.
-  // All GPU objects are cached — zero per-frame allocations.
-  // Only the command encoder + surface texture view are per-frame (unavoidable).
+bool DawnComputePipeline::presentToCanvas(bool withCanvasDraws) {
+  // Called from JS thread to blit to the WebGPU canvas surface.
+  // When withCanvasDraws=true, composites Skia draws onto the compute output first.
 
-  // Brief lock to grab stable references
   wgpu::Device device;
   wgpu::RenderPipeline blitPipeline;
   wgpu::BindGroup blitBindGroup;
   int canvasId;
   {
     std::lock_guard<std::mutex> lock(_mutex);
-    if (!_impl || _canvasContextId < 0 || !_impl->blitPipeline ||
-        !_impl->presentTexReady || !_impl->blitBindGroup) return false;
+    if (!_impl || _canvasContextId < 0 || !_impl->blitPipeline) return false;
+    // presentTexReady check only needed for non-canvas-draw path
+    if (!withCanvasDraws && (!_impl->presentTexReady || !_impl->blitBindGroup)) return false;
     device = _impl->device;
     blitPipeline = _impl->blitPipeline;
-    blitBindGroup = _impl->blitBindGroup;
     canvasId = _canvasContextId;
+
+    static int ptcLog = 0;
+    if (ptcLog++ < 5) {
+      NSLog(@"[DawnPipeline] presentToCanvas withDraws=%d surface=%d finalTex=%d canvasTex=%d",
+            withCanvasDraws, !!_impl->surface, !!_impl->finalTex, !!_impl->canvasTex);
+    }
+    if (withCanvasDraws && _impl->surface && _impl->finalTex && _impl->canvasTex) {
+      auto& ctx = RNSkia::DawnContext::getInstance();
+
+      // Copy compute output → canvasTex
+      auto copyEncoder = _impl->device.CreateCommandEncoder();
+      wgpu::TexelCopyTextureInfo src{};
+      src.texture = *_impl->finalTex;
+      wgpu::TexelCopyTextureInfo dst{};
+      dst.texture = _impl->canvasTex;
+      wgpu::Extent3D extent = {(uint32_t)_width, (uint32_t)_height, 1};
+      copyEncoder.CopyTextureToTexture(&src, &dst, &extent);
+      auto copyCmd = copyEncoder.Finish();
+      _impl->device.GetQueue().Submit(1, &copyCmd);
+
+      // Flush Skia draws onto canvasTex
+      auto recording = _impl->surface->recorder()->snap();
+      if (recording) {
+        ctx.submitRecording(recording.get(), skgpu::graphite::SyncToCpu::kNo);
+      }
+
+      // Blit from finalTex directly (skip canvasTex for now to test)
+      wgpu::BindGroupEntry entries[2] = {};
+      entries[0].binding = 0;
+      entries[0].textureView = (*_impl->finalTex).CreateView();
+      entries[1].binding = 1;
+      entries[1].sampler = _impl->blitSampler;
+      wgpu::BindGroupDescriptor bgDesc{};
+      bgDesc.layout = _impl->blitPipeline.GetBindGroupLayout(0);
+      bgDesc.entryCount = 2;
+      bgDesc.entries = entries;
+      blitBindGroup = _impl->device.CreateBindGroup(&bgDesc);
+    } else {
+      blitBindGroup = _impl->blitBindGroup;
+    }
   }
 
   auto& registry = rnwgpu::SurfaceRegistry::getInstance();
@@ -1916,7 +1955,6 @@ bool DawnComputePipeline::presentToCanvas() {
   auto surfaceTex = surfaceInfo->getCurrentTexture();
   if (!surfaceTex) return false;
 
-  // Only per-frame objects: command encoder + surface texture view (unavoidable)
   wgpu::RenderPassColorAttachment colorAttachment{};
   colorAttachment.view = surfaceTex.CreateView();
   colorAttachment.loadOp = wgpu::LoadOp::Clear;
@@ -2367,13 +2405,14 @@ public:
 
     if (propName == "presentToCanvas") {
       return facebook::jsi::Function::createFromHostFunction(
-        runtime, name, 0,
+        runtime, name, 1,
         [this](facebook::jsi::Runtime& rt,
                const facebook::jsi::Value&,
-               const facebook::jsi::Value*,
-               size_t) -> facebook::jsi::Value {
+               const facebook::jsi::Value* args,
+               size_t count) -> facebook::jsi::Value {
           if (!_alive->load()) return facebook::jsi::Value(false);
-          return facebook::jsi::Value(_pipeline->presentToCanvas());
+          bool withCanvasDraws = (count > 0 && args[0].isBool()) ? args[0].getBool() : false;
+          return facebook::jsi::Value(_pipeline->presentToCanvas(withCanvasDraws));
         });
     }
 
