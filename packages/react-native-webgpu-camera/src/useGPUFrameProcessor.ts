@@ -631,16 +631,33 @@ export function useGPUFrameProcessor(
       buffers.value = readBuffers;
     }
 
-    // WebGPU canvas output: compute thread copies directly to surface + presents.
-    // Canvas output without onFrame — no JS-thread work needed.
-    if (useCanvasOutput.value && !hasOnFrame.value) {
-      frame.image?.dispose();
+    // WebGPU canvas: processFrame presents at full fps.
+    // Only composite overlay when new buffer data arrives (model output changed).
+    if (useCanvasOutput.value) {
+      if (hasOnFrame.value && onFrameFn && frame.canvas) {
+        // Check if any buffer has new data this frame
+        let hasNewBufferData = false;
+        const count = bufferCount.value;
+        if (count > 0 && frame.buffers) {
+          for (let i = 0; i < count; i++) {
+            if (frame.buffers[i] != null) { hasNewBufferData = true; break; }
+          }
+        }
+        if (hasNewBufferData) {
+          const renderFrame = {
+            canvas: frame.canvas,
+            width: camera.height,
+            height: camera.width,
+          };
+          onFrameFn(renderFrame, (buffers.value ?? {}) as any);
+          s.presentToCanvas(true);
+        }
+      }
       return;
     }
 
-    // onFrame canvas path
+    // SkImage path (no canvasRef): onFrame composites into currentFrame
     if (hasOnFrame.value && onFrameFn && frame.canvas) {
-      // Canvas is portrait-oriented (rotation done in GPU pass 0)
       const renderFrame = {
         canvas: frame.canvas,
         width: camera.height,
@@ -648,9 +665,6 @@ export function useGPUFrameProcessor(
       };
       onFrameFn(renderFrame, (buffers.value ?? {}) as any);
 
-      // With WebGPUCanvas: processFrame presents at full fps.
-      // onFrame draws are composited via flushCanvasAndGetImage → overlayImage.
-      // SkImage path: flush canvas draws into composited image
       const composited = s.flushCanvasAndGetImage();
       if (composited) {
         currentFrame.value?.dispose();

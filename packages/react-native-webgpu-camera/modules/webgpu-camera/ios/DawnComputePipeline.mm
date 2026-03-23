@@ -62,10 +62,13 @@ struct DawnComputePipeline::Impl {
   std::vector<StagingBuffer> buffers;
   bool syncMode = false;
   bool useCanvas = false;
-  bool onFramePresent = false;  // true when onFrame + canvas: JS thread handles present
+  std::atomic<bool> overlayReady{false};  // set by onFrame, read by processFrame
   bool appleLog = false;
   bool rawCamera = false;  // true when 0 shaders, no canvas, no buffers
-  wgpu::Texture canvasTex;  // separate texture for Skia draws — not touched by compute
+  wgpu::Texture canvasTex;  // Skia draws target — onFrame writes here
+  wgpu::Texture overlayTexA; // double-buffered overlay: processFrame reads front
+  wgpu::Texture overlayTexB;
+  std::atomic<int> overlayFront{0}; // 0=A is front, 1=B is front
   // Dedicated present texture — compute copies final output here as last step
   // in its command buffer. Blit reads from it on JS thread. No race because
   // the copy is complete before submit returns, and the next frame's copy
@@ -126,6 +129,7 @@ struct DawnComputePipeline::Impl {
   wgpu::RenderPipeline blitPipeline;
   wgpu::Sampler blitSampler;
   wgpu::BindGroup blitBindGroup;   // cached — presentTex doesn't change
+  wgpu::RenderPipeline overlayBlitPipeline; // same as blit but with alpha blending
   wgpu::TextureView blitSourceView; // cached view of presentTex
 
   // Per-pass custom input bindings (indexed by pass index)
@@ -845,6 +849,13 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     canvasTexDesc.label = "CanvasTex";
     _impl->canvasTex = _impl->device.CreateTexture(&canvasTexDesc);
 
+    // Double-buffered overlay textures for flicker-free compositing
+    canvasTexDesc.label = "OverlayA";
+    _impl->overlayTexA = _impl->device.CreateTexture(&canvasTexDesc);
+    canvasTexDesc.label = "OverlayB";
+    _impl->overlayTexB = _impl->device.CreateTexture(&canvasTexDesc);
+    _impl->overlayFront.store(0);
+
     auto backendTex = skgpu::graphite::BackendTextures::MakeDawn(
       _impl->canvasTex.Get());
     _impl->surface = SkSurfaces::WrapBackendTexture(
@@ -859,7 +870,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     wgpu::TextureDescriptor ptDesc{};
     ptDesc.size = {(uint32_t)_width, (uint32_t)_height, 1};
     ptDesc.format = wgpu::TextureFormat::RGBA16Float;
-    ptDesc.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst;
+    ptDesc.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::CopySrc;
     ptDesc.label = "PresentTex";
     _impl->presentTex = _impl->device.CreateTexture(&ptDesc);
     _impl->presentTexReady = false;
@@ -1432,17 +1443,17 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
 
   tAfterBindGroup = CACurrentMediaTime();
 
-  // Copy final compute output directly to canvas surface (same format: RGBA16Float)
+  // Copy final compute output
   bool finalIsA = (impl->passes.size() % 2 != 0);
   wgpu::Texture& finalOutput = finalIsA ? impl->texA : impl->texB;
 
-  // Copy final compute output to canvas surface
   if (_canvasContextId >= 0) {
     auto& registry = rnwgpu::SurfaceRegistry::getInstance();
     auto surfaceInfo = registry.getSurfaceInfo(_canvasContextId);
     if (surfaceInfo) {
       auto surfaceTex = surfaceInfo->getCurrentTexture();
       if (surfaceTex) {
+        // Always copy camera frame to surface
         wgpu::TexelCopyTextureInfo src{};
         src.texture = finalOutput;
         wgpu::TexelCopyTextureInfo dst{};
@@ -1457,15 +1468,52 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
     }
   }
 
-  // Submit compute + copy as one command buffer
+  // Submit compute + camera copy
   auto commands = encoder.Finish();
   device.GetQueue().Submit(1, &commands);
 
-  // Present the surface
+  // Alpha-blend overlay (canvasTex) on top of camera frame, then present
   if (_canvasContextId >= 0) {
     auto& registry = rnwgpu::SurfaceRegistry::getInstance();
     auto surfaceInfo = registry.getSurfaceInfo(_canvasContextId);
     if (surfaceInfo) {
+      // Alpha-blend overlay (front buffer) on top of camera frame
+      if (impl->overlayReady.load() && impl->overlayBlitPipeline) {
+        int front = impl->overlayFront.load();
+        wgpu::Texture& frontTex = (front == 0) ? impl->overlayTexA : impl->overlayTexB;
+        auto surfaceTex = surfaceInfo->getCurrentTexture();
+        if (surfaceTex) {
+          wgpu::BindGroupEntry entries[2] = {};
+          entries[0].binding = 0;
+          entries[0].textureView = frontTex.CreateView();
+          entries[1].binding = 1;
+          entries[1].sampler = impl->blitSampler;
+          wgpu::BindGroupDescriptor bgDesc{};
+          bgDesc.layout = impl->overlayBlitPipeline.GetBindGroupLayout(0);
+          bgDesc.entryCount = 2;
+          bgDesc.entries = entries;
+          auto overlayBindGroup = device.CreateBindGroup(&bgDesc);
+
+          wgpu::RenderPassColorAttachment colorAttach{};
+          colorAttach.view = surfaceTex.CreateView();
+          colorAttach.loadOp = wgpu::LoadOp::Load; // keep camera frame
+          colorAttach.storeOp = wgpu::StoreOp::Store;
+          wgpu::RenderPassDescriptor rpDesc{};
+          rpDesc.colorAttachmentCount = 1;
+          rpDesc.colorAttachments = &colorAttach;
+
+          auto blendEncoder = device.CreateCommandEncoder();
+          auto renderPass = blendEncoder.BeginRenderPass(&rpDesc);
+          renderPass.SetPipeline(impl->overlayBlitPipeline);
+          renderPass.SetBindGroup(0, overlayBindGroup);
+          renderPass.Draw(3);
+          renderPass.End();
+
+          auto blendCmd = blendEncoder.Finish();
+          device.GetQueue().Submit(1, &blendCmd);
+        }
+      }
+
       surfaceInfo->present();
     }
   }
@@ -1838,8 +1886,8 @@ fn fs(in: VsOut) -> @location(0) vec4f {
     return;
   }
 
-  // Surface format matches Dawn preferred format (BGRA8Unorm on Apple, RGBA8Unorm on Android)
-  wgpu::TextureFormat surfaceFormat = DawnUtils::PreferredTextureFormat;
+  // Canvas surface is configured as RGBA16Float (for HDR/linear color pipeline)
+  wgpu::TextureFormat surfaceFormat = wgpu::TextureFormat::RGBA16Float;
 
   wgpu::ColorTargetState colorTarget{};
   colorTarget.format = surfaceFormat;
@@ -1860,6 +1908,35 @@ fn fs(in: VsOut) -> @location(0) vec4f {
   if (!_impl->blitPipeline) {
     NSLog(@"[DawnPipeline] FAILED to create blit render pipeline");
     return;
+  }
+
+  // Create overlay blit pipeline — same shader but with alpha blending
+  {
+    wgpu::BlendState blendState{};
+    blendState.color.srcFactor = wgpu::BlendFactor::SrcAlpha;
+    blendState.color.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
+    blendState.color.operation = wgpu::BlendOperation::Add;
+    blendState.alpha.srcFactor = wgpu::BlendFactor::One;
+    blendState.alpha.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
+    blendState.alpha.operation = wgpu::BlendOperation::Add;
+
+    wgpu::ColorTargetState overlayTarget{};
+    overlayTarget.format = surfaceFormat;
+    overlayTarget.blend = &blendState;
+
+    wgpu::FragmentState overlayFrag{};
+    overlayFrag.module = shaderModule;
+    overlayFrag.entryPoint = "fs";
+    overlayFrag.targetCount = 1;
+    overlayFrag.targets = &overlayTarget;
+
+    wgpu::RenderPipelineDescriptor overlayRpDesc{};
+    overlayRpDesc.vertex.module = shaderModule;
+    overlayRpDesc.vertex.entryPoint = "vs";
+    overlayRpDesc.fragment = &overlayFrag;
+    overlayRpDesc.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
+
+    _impl->overlayBlitPipeline = _impl->device.CreateRenderPipeline(&overlayRpDesc);
   }
 
   // Create sampler for blit (linear filtering for potential size mismatch)
@@ -1891,89 +1968,75 @@ fn fs(in: VsOut) -> @location(0) vec4f {
 }
 
 bool DawnComputePipeline::presentToCanvas(bool withCanvasDraws) {
-  // Called from JS thread to blit to the WebGPU canvas surface.
-  // When withCanvasDraws=true, composites Skia draws onto the compute output first.
+  // Called from JS thread to update overlay texture.
+  // Grabs references under lock, then does GPU work without holding the lock.
 
   wgpu::Device device;
-  wgpu::RenderPipeline blitPipeline;
-  wgpu::BindGroup blitBindGroup;
-  int canvasId;
+  wgpu::Texture presentTex;
+  wgpu::Texture canvasTex;
+  sk_sp<SkSurface> surface;
+  bool hasOverlayData = false;
+
   {
     std::lock_guard<std::mutex> lock(_mutex);
-    if (!_impl || _canvasContextId < 0 || !_impl->blitPipeline) return false;
-    // presentTexReady check only needed for non-canvas-draw path
-    if (!withCanvasDraws && (!_impl->presentTexReady || !_impl->blitBindGroup)) return false;
-    device = _impl->device;
-    blitPipeline = _impl->blitPipeline;
-    canvasId = _canvasContextId;
-
-    static int ptcLog = 0;
-    if (ptcLog++ < 5) {
-      NSLog(@"[DawnPipeline] presentToCanvas withDraws=%d surface=%d finalTex=%d canvasTex=%d",
-            withCanvasDraws, !!_impl->surface, !!_impl->finalTex, !!_impl->canvasTex);
-    }
-    if (withCanvasDraws && _impl->surface && _impl->finalTex && _impl->canvasTex) {
-      auto& ctx = RNSkia::DawnContext::getInstance();
-
-      // Copy compute output → canvasTex
-      auto copyEncoder = _impl->device.CreateCommandEncoder();
-      wgpu::TexelCopyTextureInfo src{};
-      src.texture = *_impl->finalTex;
-      wgpu::TexelCopyTextureInfo dst{};
-      dst.texture = _impl->canvasTex;
-      wgpu::Extent3D extent = {(uint32_t)_width, (uint32_t)_height, 1};
-      copyEncoder.CopyTextureToTexture(&src, &dst, &extent);
-      auto copyCmd = copyEncoder.Finish();
-      _impl->device.GetQueue().Submit(1, &copyCmd);
-
-      // Flush Skia draws onto canvasTex
-      auto recording = _impl->surface->recorder()->snap();
-      if (recording) {
-        ctx.submitRecording(recording.get(), skgpu::graphite::SyncToCpu::kNo);
-      }
-
-      // Blit from finalTex directly (skip canvasTex for now to test)
-      wgpu::BindGroupEntry entries[2] = {};
-      entries[0].binding = 0;
-      entries[0].textureView = (*_impl->finalTex).CreateView();
-      entries[1].binding = 1;
-      entries[1].sampler = _impl->blitSampler;
-      wgpu::BindGroupDescriptor bgDesc{};
-      bgDesc.layout = _impl->blitPipeline.GetBindGroupLayout(0);
-      bgDesc.entryCount = 2;
-      bgDesc.entries = entries;
-      blitBindGroup = _impl->device.CreateBindGroup(&bgDesc);
-    } else {
-      blitBindGroup = _impl->blitBindGroup;
+    if (!_impl || _canvasContextId < 0) return false;
+    if (withCanvasDraws && _impl->surface && _impl->presentTex && _impl->canvasTex) {
+      device = _impl->device;
+      presentTex = _impl->presentTex;
+      canvasTex = _impl->canvasTex;
+      surface = _impl->surface;
+      hasOverlayData = true;
     }
   }
+  // Lock released — processFrame can run freely
 
-  auto& registry = rnwgpu::SurfaceRegistry::getInstance();
-  auto surfaceInfo = registry.getSurfaceInfo(canvasId);
-  if (!surfaceInfo) return false;
+  if (hasOverlayData) {
+    auto& ctx = RNSkia::DawnContext::getInstance();
 
-  auto surfaceTex = surfaceInfo->getCurrentTexture();
-  if (!surfaceTex) return false;
+    // Determine back buffer (the one processFrame is NOT reading)
+    int front = _impl->overlayFront.load();
+    wgpu::Texture& backTex = (front == 0) ? _impl->overlayTexB : _impl->overlayTexA;
 
-  wgpu::RenderPassColorAttachment colorAttachment{};
-  colorAttachment.view = surfaceTex.CreateView();
-  colorAttachment.loadOp = wgpu::LoadOp::Clear;
-  colorAttachment.storeOp = wgpu::StoreOp::Store;
+    // Copy canvasTex (Skia draws) → back overlay buffer
+    // First clear back buffer to transparent
+    auto clearEncoder = device.CreateCommandEncoder();
+    wgpu::RenderPassColorAttachment clearAttach{};
+    clearAttach.view = backTex.CreateView();
+    clearAttach.loadOp = wgpu::LoadOp::Clear;
+    clearAttach.storeOp = wgpu::StoreOp::Store;
+    clearAttach.clearValue = {0, 0, 0, 0};
+    wgpu::RenderPassDescriptor clearRpDesc{};
+    clearRpDesc.colorAttachmentCount = 1;
+    clearRpDesc.colorAttachments = &clearAttach;
+    auto clearPass = clearEncoder.BeginRenderPass(&clearRpDesc);
+    clearPass.End();
+    auto clearCmd = clearEncoder.Finish();
+    device.GetQueue().Submit(1, &clearCmd);
 
-  wgpu::RenderPassDescriptor rpDesc{};
-  rpDesc.colorAttachmentCount = 1;
-  rpDesc.colorAttachments = &colorAttachment;
+    // Flush Skia draws onto canvasTex
+    auto recording = surface->recorder()->snap();
+    if (recording) {
+      ctx.submitRecording(recording.get(), skgpu::graphite::SyncToCpu::kNo);
+    }
 
-  auto encoder = device.CreateCommandEncoder();
-  auto renderPass = encoder.BeginRenderPass(&rpDesc);
-  renderPass.SetPipeline(blitPipeline);
-  renderPass.SetBindGroup(0, blitBindGroup);
-  renderPass.Draw(3);
-  renderPass.End();
+    // Copy canvasTex (with Skia draws) → back overlay buffer
+    auto copyEncoder = device.CreateCommandEncoder();
+    wgpu::TexelCopyTextureInfo src{};
+    src.texture = canvasTex;
+    wgpu::TexelCopyTextureInfo dst{};
+    dst.texture = backTex;
+    wgpu::Extent3D extent = {(uint32_t)_width, (uint32_t)_height, 1};
+    copyEncoder.CopyTextureToTexture(&src, &dst, &extent);
+    auto copyCmd = copyEncoder.Finish();
+    device.GetQueue().Submit(1, &copyCmd);
 
-  auto commands = encoder.Finish();
-  device.GetQueue().Submit(1, &commands);
-  surfaceInfo->present();
+    // Swap front/back — processFrame will pick up the new overlay next frame
+    _impl->overlayFront.store(front == 0 ? 1 : 0);
+    _impl->overlayReady.store(true);
+    return true;
+  }
+
+  return false;
 
   return true;
 }
@@ -2009,6 +2072,9 @@ void DawnComputePipeline::cleanupLocked() {
   _impl->outputImage.reset();
   _impl->surface.reset();
   _impl->blitPipeline = nullptr;
+  _impl->overlayBlitPipeline = nullptr;
+  _impl->overlayTexA = nullptr;
+  _impl->overlayTexB = nullptr;
   _impl->blitSampler = nullptr;
   _impl->blitBindGroup = nullptr;
   _impl->blitSourceView = nullptr;

@@ -473,7 +473,7 @@ const BOX_COLORS = [
 ];
 
 function YoloPreview({ format, colorSpace, modelPath }: { format?: CameraFormat; colorSpace?: ColorSpace; modelPath: string }) {
-  const { width: screenW, height: screenH } = useWindowDimensions();
+  const canvasRef = useRef<WebGPUCanvasRef>(null);
 
   const camera = useCamera({
     device: 'back',
@@ -486,7 +486,8 @@ function YoloPreview({ format, colorSpace, modelPath }: { format?: CameraFormat;
     [modelPath],
   );
 
-  const { currentFrame, fps, displayFps, metrics, error } = useGPUFrameProcessor(camera, {
+  const { fps, displayFps, metrics, error } = useGPUFrameProcessor(camera, {
+    canvasRef,
     resources: { yolo: yoloResource },
     pipeline: (frame, res: any) => {
       'worklet';
@@ -511,98 +512,123 @@ function YoloPreview({ format, colorSpace, modelPath }: { format?: CameraFormat;
       // Pre-create color objects
       const colors = BOX_COLORS.map(c => Skia.Color(c));
 
+      // Cached detection results — only recompute when new data arrives
+      const MAX_KEPT = 20;
+      const cachedBoxes = {
+        count: 0,
+        xs: new Float32Array(MAX_KEPT),
+        ys: new Float32Array(MAX_KEPT),
+        ws: new Float32Array(MAX_KEPT),
+        hs: new Float32Array(MAX_KEPT),
+        classIds: new Int32Array(MAX_KEPT),
+        scores: new Float32Array(MAX_KEPT),
+        lastData: null as any,
+      };
+
+      const clearColor = Skia.Color('transparent');
+
       return (frame: any, { detections }: any) => {
         'worklet';
-        if (!detections) return;
 
-        const NUM_DETECTIONS = 8400;
-        const NUM_CLASSES = 80;
-        const CONF_THRESHOLD = 0.25;
+        // Clear canvas to transparent — overlay is alpha-blended over camera
+        frame.canvas.clear(clearColor);
 
-        // Find detections above threshold
-        // Reuse arrays to avoid GC pressure
-        let count = 0;
-        const MAX_KEPT = 20;
-        const cxs = new Float32Array(MAX_KEPT);
-        const cys = new Float32Array(MAX_KEPT);
-        const ws = new Float32Array(MAX_KEPT);
-        const hs = new Float32Array(MAX_KEPT);
-        const classIds = new Int32Array(MAX_KEPT);
-        const scores = new Float32Array(MAX_KEPT);
+        // Recompute NMS only when detection data changes
+        if (detections && detections !== cachedBoxes.lastData) {
+          cachedBoxes.lastData = detections;
+          cachedBoxes.count = 0;
 
-        for (let i = 0; i < NUM_DETECTIONS && count < MAX_KEPT; i++) {
-          let maxScore = 0;
-          let maxClass = 0;
-          for (let c = 0; c < NUM_CLASSES; c++) {
-            const s = detections[(4 + c) * NUM_DETECTIONS + i];
-            if (s > maxScore) { maxScore = s; maxClass = c; }
-          }
-          if (maxScore < CONF_THRESHOLD) continue;
+          const NUM_DETECTIONS = 8400;
+          const NUM_CLASSES = 80;
+          const CONF_THRESHOLD = 0.25;
+          let count = 0;
+          const cxs = new Float32Array(MAX_KEPT);
+          const cys = new Float32Array(MAX_KEPT);
+          const ws = new Float32Array(MAX_KEPT);
+          const hs = new Float32Array(MAX_KEPT);
+          const clsIds = new Int32Array(MAX_KEPT);
+          const scrs = new Float32Array(MAX_KEPT);
 
-          // Insert sorted by score (simple insertion)
-          let pos = count;
-          while (pos > 0 && maxScore > scores[pos - 1]) {
-            if (pos < MAX_KEPT) {
-              cxs[pos] = cxs[pos-1]; cys[pos] = cys[pos-1];
-              ws[pos] = ws[pos-1]; hs[pos] = hs[pos-1];
-              classIds[pos] = classIds[pos-1]; scores[pos] = scores[pos-1];
+          for (let i = 0; i < NUM_DETECTIONS && count < MAX_KEPT; i++) {
+            let maxScore = 0;
+            let maxClass = 0;
+            for (let c = 0; c < NUM_CLASSES; c++) {
+              const s = detections[(4 + c) * NUM_DETECTIONS + i];
+              if (s > maxScore) { maxScore = s; maxClass = c; }
             }
-            pos--;
+            if (maxScore < CONF_THRESHOLD) continue;
+
+            let pos = count;
+            while (pos > 0 && maxScore > scrs[pos - 1]) {
+              if (pos < MAX_KEPT) {
+                cxs[pos] = cxs[pos-1]; cys[pos] = cys[pos-1];
+                ws[pos] = ws[pos-1]; hs[pos] = hs[pos-1];
+                clsIds[pos] = clsIds[pos-1]; scrs[pos] = scrs[pos-1];
+              }
+              pos--;
+            }
+            if (pos < MAX_KEPT) {
+              cxs[pos] = detections[0 * NUM_DETECTIONS + i];
+              cys[pos] = detections[1 * NUM_DETECTIONS + i];
+              ws[pos] = detections[2 * NUM_DETECTIONS + i];
+              hs[pos] = detections[3 * NUM_DETECTIONS + i];
+              clsIds[pos] = maxClass;
+              scrs[pos] = maxScore;
+              if (count < MAX_KEPT) count++;
+            }
           }
-          if (pos < MAX_KEPT) {
-            cxs[pos] = detections[0 * NUM_DETECTIONS + i];
-            cys[pos] = detections[1 * NUM_DETECTIONS + i];
-            ws[pos] = detections[2 * NUM_DETECTIONS + i];
-            hs[pos] = detections[3 * NUM_DETECTIONS + i];
-            classIds[pos] = maxClass;
-            scores[pos] = maxScore;
-            if (count < MAX_KEPT) count++;
+
+          // Simple NMS
+          const keep = new Uint8Array(count);
+          keep.fill(1);
+          for (let i = 0; i < count; i++) {
+            if (!keep[i]) continue;
+            for (let j = i + 1; j < count; j++) {
+              if (!keep[j]) continue;
+              const x1 = Math.max(cxs[i] - ws[i]/2, cxs[j] - ws[j]/2);
+              const y1 = Math.max(cys[i] - hs[i]/2, cys[j] - hs[j]/2);
+              const x2 = Math.min(cxs[i] + ws[i]/2, cxs[j] + ws[j]/2);
+              const y2 = Math.min(cys[i] + hs[i]/2, cys[j] + hs[j]/2);
+              const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+              const union_ = ws[i]*hs[i] + ws[j]*hs[j] - inter;
+              if (inter / union_ > 0.5) keep[j] = 0;
+            }
           }
+
+          // Store kept boxes in cache (pre-scaled to normalized coords)
+          let kept = 0;
+          for (let i = 0; i < count; i++) {
+            if (!keep[i]) continue;
+            cachedBoxes.xs[kept] = cxs[i] - ws[i] / 2;
+            cachedBoxes.ys[kept] = cys[i] - hs[i] / 2;
+            cachedBoxes.ws[kept] = ws[i];
+            cachedBoxes.hs[kept] = hs[i];
+            cachedBoxes.classIds[kept] = clsIds[i];
+            cachedBoxes.scores[kept] = scrs[i];
+            kept++;
+          }
+          cachedBoxes.count = kept;
         }
 
-        // Simple NMS
-        const keep = new Uint8Array(count);
-        keep.fill(1);
-        for (let i = 0; i < count; i++) {
-          if (!keep[i]) continue;
-          for (let j = i + 1; j < count; j++) {
-            if (!keep[j]) continue;
-            const x1 = Math.max(cxs[i] - ws[i]/2, cxs[j] - ws[j]/2);
-            const y1 = Math.max(cys[i] - hs[i]/2, cys[j] - hs[j]/2);
-            const x2 = Math.min(cxs[i] + ws[i]/2, cxs[j] + ws[j]/2);
-            const y2 = Math.min(cys[i] + hs[i]/2, cys[j] + hs[j]/2);
-            const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
-            const union_ = ws[i]*hs[i] + ws[j]*hs[j] - inter;
-            if (inter / union_ > 0.5) keep[j] = 0;
-          }
-        }
+        // Always draw cached boxes (fast — just Skia draw calls)
+        if (cachedBoxes.count === 0) return;
 
-        // Draw bounding boxes
-
-        // Model output is normalized 0-1, scale directly to frame dimensions
         const scaleX = frame.width;
         const scaleY = frame.height;
 
-        for (let i = 0; i < count; i++) {
-          if (!keep[i]) continue;
-
-          const x = (cxs[i] - ws[i] / 2) * scaleX;
-          const y = (cys[i] - hs[i] / 2) * scaleY;
-          const w = ws[i] * scaleX;
-          const h = hs[i] * scaleY;
-          const color = colors[classIds[i] % colors.length];
+        for (let i = 0; i < cachedBoxes.count; i++) {
+          const x = cachedBoxes.xs[i] * scaleX;
+          const y = cachedBoxes.ys[i] * scaleY;
+          const w = cachedBoxes.ws[i] * scaleX;
+          const h = cachedBoxes.hs[i] * scaleY;
+          const color = colors[cachedBoxes.classIds[i] % colors.length];
 
           boxPaint.setColor(color);
-          bgPaint.setColor(color);
-
           frame.canvas.drawRect(Skia.XYWHRect(x, y, w, h), boxPaint);
 
-          // Label background + text
-          const label = `${COCO_CLASSES[classIds[i]]} ${(scores[i] * 100).toFixed(0)}%`;
-          const labelW = label.length * 16;
-          const labelH = 36;
+          const label = `${COCO_CLASSES[cachedBoxes.classIds[i]]} ${(cachedBoxes.scores[i] * 100).toFixed(0)}%`;
           bgPaint.setColor(color);
-          frame.canvas.drawRect(Skia.XYWHRect(x, y - labelH, labelW, labelH), bgPaint);
+          frame.canvas.drawRect(Skia.XYWHRect(x, y - 36, label.length * 16, 36), bgPaint);
           frame.canvas.drawText(label, x + 4, y - 8, textPaint, font);
         }
       };
@@ -618,10 +644,12 @@ function YoloPreview({ format, colorSpace, modelPath }: { format?: CameraFormat;
 
   return (
     <>
-      <Canvas style={StyleSheet.absoluteFill}>
-        <Fill color="black" />
-        <SkImage image={currentFrame} x={0} y={0} width={screenW} height={screenH} fit="cover" />
-      </Canvas>
+      <View style={{ flex: 1, backgroundColor: '#000', justifyContent: 'center', alignItems: 'center' }}>
+        <WebGPUCanvas ref={canvasRef} style={{
+          width: '100%',
+          aspectRatio: camera.height / camera.width,
+        }} />
+      </View>
 
       <View style={styles.statusBar}>
         <Text style={styles.statusText}>
