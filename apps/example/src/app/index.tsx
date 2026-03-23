@@ -60,7 +60,7 @@ type ShaderMode =
 const DEPTH_MODEL_URL = 'https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model_q4.onnx';
 const DEPTH_MODEL_PATH = `${Paths.document.uri}/depth-anything-v2-small-q4.onnx`;
 
-const YOLO_MODEL_PATH = `${Paths.document.uri}/yolov8s2.onnx`;
+const YOLO_MODEL_PATH = `${Paths.document.uri}/yolov8n_rect.onnx`;
 
 const SHADERS: ShaderMode[] = [
   { name: 'YOLO', type: 'yolo' },
@@ -728,7 +728,7 @@ export default function CameraSpikeScreen() {
       // Always overwrite — model format changed (NMS baked in)
       {
         console.log('[Model] Loading YOLO model from assets...');
-        const [asset] = await Asset.loadAsync(require('../../assets/yolov8s2.onnx'));
+        const [asset] = await Asset.loadAsync(require('../../assets/yolov8n_rect.onnx'));
         if (asset.localUri) {
           // Read asset as ArrayBuffer via fetch, write as Uint8Array
           const resp = await fetch(asset.localUri);
