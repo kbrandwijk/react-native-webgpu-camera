@@ -60,7 +60,6 @@ type ShaderMode =
 const DEPTH_MODEL_URL = 'https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model_q4.onnx';
 const DEPTH_MODEL_PATH = `${Paths.document.uri}/depth-anything-v2-small-q4.onnx`;
 
-const YOLO_MODEL_URL = 'https://huggingface.co/SpotLab/YOLOv8Detection/resolve/3005c6751fb19cdeb6b10c066185908faf66a097/yolov8n.onnx';
 const YOLO_MODEL_PATH = `${Paths.document.uri}/yolov8n.onnx`;
 
 const SHADERS: ShaderMode[] = [
@@ -491,7 +490,8 @@ function YoloPreview({ format, colorSpace, modelPath }: { format?: CameraFormat;
     resources: { yolo: yoloResource },
     pipeline: (frame, res: any) => {
       'worklet';
-      const detections = frame.runModel(res.yolo, { output: Float32Array, count: 84 * 8400 });
+      // NMS model output: [1, 300, 6] = 1800 floats (x1,y1,x2,y2,conf,classId)
+      const detections = frame.runModel(res.yolo, { output: Float32Array, count: 300 * 6 });
       return { detections };
     },
     onFrame: (() => {
@@ -512,16 +512,16 @@ function YoloPreview({ format, colorSpace, modelPath }: { format?: CameraFormat;
       // Pre-create color objects
       const colors = BOX_COLORS.map(c => Skia.Color(c));
 
-      // Cached detection results — only recompute when new data arrives
-      const MAX_KEPT = 20;
+      // Cached boxes — only update when new model data arrives
+      const MAX_BOXES = 20;
       const cachedBoxes = {
         count: 0,
-        xs: new Float32Array(MAX_KEPT),
-        ys: new Float32Array(MAX_KEPT),
-        ws: new Float32Array(MAX_KEPT),
-        hs: new Float32Array(MAX_KEPT),
-        classIds: new Int32Array(MAX_KEPT),
-        scores: new Float32Array(MAX_KEPT),
+        x1s: new Float32Array(MAX_BOXES),
+        y1s: new Float32Array(MAX_BOXES),
+        x2s: new Float32Array(MAX_BOXES),
+        y2s: new Float32Array(MAX_BOXES),
+        classIds: new Int32Array(MAX_BOXES),
+        scores: new Float32Array(MAX_BOXES),
         lastData: null as any,
       };
 
@@ -530,103 +530,61 @@ function YoloPreview({ format, colorSpace, modelPath }: { format?: CameraFormat;
       return (frame: any, { detections }: any) => {
         'worklet';
 
-        // Clear canvas to transparent — overlay is alpha-blended over camera
+        // Clear canvas to transparent
         frame.canvas.clear(clearColor);
 
-        // Recompute NMS only when detection data changes
+        // Parse NMS model output: [300, 6] = [x1, y1, x2, y2, confidence, classId]
         if (detections && detections !== cachedBoxes.lastData) {
+          // Debug: log detections with highest confidence
+          let bestConf = 0;
+          let bestIdx = 0;
+          for (let d = 0; d < 300; d++) {
+            if (detections[d*6+4] > bestConf) { bestConf = detections[d*6+4]; bestIdx = d; }
+          }
+          console.log(`[YOLO] best det[${bestIdx}]: x1=${detections[bestIdx*6+0].toFixed(1)} y1=${detections[bestIdx*6+1].toFixed(1)} x2=${detections[bestIdx*6+2].toFixed(1)} y2=${detections[bestIdx*6+3].toFixed(1)} conf=${bestConf.toFixed(3)} cls=${detections[bestIdx*6+5].toFixed(0)}`);
           cachedBoxes.lastData = detections;
           cachedBoxes.count = 0;
-
-          const NUM_DETECTIONS = 8400;
-          const NUM_CLASSES = 80;
           const CONF_THRESHOLD = 0.25;
-          let count = 0;
-          const cxs = new Float32Array(MAX_KEPT);
-          const cys = new Float32Array(MAX_KEPT);
-          const ws = new Float32Array(MAX_KEPT);
-          const hs = new Float32Array(MAX_KEPT);
-          const clsIds = new Int32Array(MAX_KEPT);
-          const scrs = new Float32Array(MAX_KEPT);
 
-          for (let i = 0; i < NUM_DETECTIONS && count < MAX_KEPT; i++) {
-            let maxScore = 0;
-            let maxClass = 0;
-            for (let c = 0; c < NUM_CLASSES; c++) {
-              const s = detections[(4 + c) * NUM_DETECTIONS + i];
-              if (s > maxScore) { maxScore = s; maxClass = c; }
-            }
-            if (maxScore < CONF_THRESHOLD) continue;
+          for (let i = 0; i < 300 && cachedBoxes.count < MAX_BOXES; i++) {
+            const conf = detections[i * 6 + 4];
+            if (conf < CONF_THRESHOLD) continue;
 
-            let pos = count;
-            while (pos > 0 && maxScore > scrs[pos - 1]) {
-              if (pos < MAX_KEPT) {
-                cxs[pos] = cxs[pos-1]; cys[pos] = cys[pos-1];
-                ws[pos] = ws[pos-1]; hs[pos] = hs[pos-1];
-                clsIds[pos] = clsIds[pos-1]; scrs[pos] = scrs[pos-1];
-              }
-              pos--;
-            }
-            if (pos < MAX_KEPT) {
-              cxs[pos] = detections[0 * NUM_DETECTIONS + i];
-              cys[pos] = detections[1 * NUM_DETECTIONS + i];
-              ws[pos] = detections[2 * NUM_DETECTIONS + i];
-              hs[pos] = detections[3 * NUM_DETECTIONS + i];
-              clsIds[pos] = maxClass;
-              scrs[pos] = maxScore;
-              if (count < MAX_KEPT) count++;
-            }
+            const k = cachedBoxes.count;
+            const x1raw = detections[i * 6 + 0];
+            const y1raw = detections[i * 6 + 1];
+            const x2raw = detections[i * 6 + 2];
+            const y2raw = detections[i * 6 + 3];
+            // Coords in pixel space (0-640) or normalized (0-1) — handle both
+            const scale = (x2raw > 2) ? 640 : 1;
+            cachedBoxes.x1s[k] = x1raw / scale;
+            cachedBoxes.y1s[k] = y1raw / scale;
+            cachedBoxes.x2s[k] = x2raw / scale;
+            cachedBoxes.y2s[k] = y2raw / scale;
+            cachedBoxes.scores[k] = conf;
+            cachedBoxes.classIds[k] = Math.round(detections[i * 6 + 5]);
+            cachedBoxes.count++;
           }
-
-          // Simple NMS
-          const keep = new Uint8Array(count);
-          keep.fill(1);
-          for (let i = 0; i < count; i++) {
-            if (!keep[i]) continue;
-            for (let j = i + 1; j < count; j++) {
-              if (!keep[j]) continue;
-              const x1 = Math.max(cxs[i] - ws[i]/2, cxs[j] - ws[j]/2);
-              const y1 = Math.max(cys[i] - hs[i]/2, cys[j] - hs[j]/2);
-              const x2 = Math.min(cxs[i] + ws[i]/2, cxs[j] + ws[j]/2);
-              const y2 = Math.min(cys[i] + hs[i]/2, cys[j] + hs[j]/2);
-              const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
-              const union_ = ws[i]*hs[i] + ws[j]*hs[j] - inter;
-              if (inter / union_ > 0.5) keep[j] = 0;
-            }
-          }
-
-          // Store kept boxes in cache (pre-scaled to normalized coords)
-          let kept = 0;
-          for (let i = 0; i < count; i++) {
-            if (!keep[i]) continue;
-            cachedBoxes.xs[kept] = cxs[i] - ws[i] / 2;
-            cachedBoxes.ys[kept] = cys[i] - hs[i] / 2;
-            cachedBoxes.ws[kept] = ws[i];
-            cachedBoxes.hs[kept] = hs[i];
-            cachedBoxes.classIds[kept] = clsIds[i];
-            cachedBoxes.scores[kept] = scrs[i];
-            kept++;
-          }
-          cachedBoxes.count = kept;
         }
 
-        // Always draw cached boxes (fast — just Skia draw calls)
+        // Draw cached boxes
         if (cachedBoxes.count === 0) return;
 
         const scaleX = frame.width;
         const scaleY = frame.height;
 
         for (let i = 0; i < cachedBoxes.count; i++) {
-          const x = cachedBoxes.xs[i] * scaleX;
-          const y = cachedBoxes.ys[i] * scaleY;
-          const w = cachedBoxes.ws[i] * scaleX;
-          const h = cachedBoxes.hs[i] * scaleY;
-          const color = colors[cachedBoxes.classIds[i] % colors.length];
+          const x = cachedBoxes.x1s[i] * scaleX;
+          const y = cachedBoxes.y1s[i] * scaleY;
+          const w = (cachedBoxes.x2s[i] - cachedBoxes.x1s[i]) * scaleX;
+          const h = (cachedBoxes.y2s[i] - cachedBoxes.y1s[i]) * scaleY;
+          const classId = cachedBoxes.classIds[i];
+          const color = colors[classId % colors.length];
 
           boxPaint.setColor(color);
           frame.canvas.drawRect(Skia.XYWHRect(x, y, w, h), boxPaint);
 
-          const label = `${COCO_CLASSES[cachedBoxes.classIds[i]]} ${(cachedBoxes.scores[i] * 100).toFixed(0)}%`;
+          const label = `${COCO_CLASSES[classId]} ${(cachedBoxes.scores[i] * 100).toFixed(0)}%`;
           bgPaint.setColor(color);
           frame.canvas.drawRect(Skia.XYWHRect(x, y - 36, label.length * 16, 36), bgPaint);
           frame.canvas.drawText(label, x + 4, y - 8, textPaint, font);
@@ -758,11 +716,17 @@ export default function CameraSpikeScreen() {
       setDepthModelPath(DEPTH_MODEL_PATH);
 
       const yoloFile = new ExpoFile(YOLO_MODEL_PATH);
-      if (!yoloFile.exists) {
-        console.log('[Model] Downloading YOLO model...');
-        const resp = await fetch(YOLO_MODEL_URL);
-        yoloFile.write(new Uint8Array(await resp.arrayBuffer()));
-        console.log('[Model] YOLO model download complete');
+      // Always overwrite — model format changed (NMS baked in)
+      {
+        console.log('[Model] Loading YOLO model from assets...');
+        const [asset] = await Asset.loadAsync(require('../../assets/yolov8n.onnx'));
+        if (asset.localUri) {
+          // Read asset as ArrayBuffer via fetch, write as Uint8Array
+          const resp = await fetch(asset.localUri);
+          const buf = await resp.arrayBuffer();
+          yoloFile.write(new Uint8Array(buf));
+          console.log('[Model] YOLO model copied to Documents');
+        }
       }
       setYoloModelPath(YOLO_MODEL_PATH);
     })();

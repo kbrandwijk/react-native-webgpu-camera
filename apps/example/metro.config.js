@@ -4,8 +4,9 @@ const { getDefaultConfig } = require('expo/metro-config');
 /** @type {import('expo/metro-config').MetroConfig} */
 const config = getDefaultConfig(__dirname);
 
-// Register .cube as an asset extension so require() resolves LUT files
+// Register asset extensions
 config.resolver.assetExts.push('cube');
+config.resolver.assetExts.push('onnx');
 
 // Stub out onnxruntime-web and onnxruntime-node for transformers.js
 // We use onnxruntime-react-native instead, registered via Symbol.for('onnxruntime')
