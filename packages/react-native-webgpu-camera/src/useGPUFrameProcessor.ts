@@ -631,27 +631,18 @@ export function useGPUFrameProcessor(
       buffers.value = readBuffers;
     }
 
-    // WebGPU canvas: processFrame presents at full fps.
-    // Only composite overlay when new buffer data arrives (model output changed).
+    // WebGPU canvas: processFrame composites overlay at full fps.
+    // onFrame just records Skia draws (no Dawn API calls from JS thread).
     if (useCanvasOutput.value) {
       if (hasOnFrame.value && onFrameFn && frame.canvas) {
-        // Check if any buffer has new data this frame
-        let hasNewBufferData = false;
-        const count = bufferCount.value;
-        if (count > 0 && frame.buffers) {
-          for (let i = 0; i < count; i++) {
-            if (frame.buffers[i] != null) { hasNewBufferData = true; break; }
-          }
-        }
-        if (hasNewBufferData) {
-          const renderFrame = {
-            canvas: frame.canvas,
-            width: camera.height,
-            height: camera.width,
-          };
-          onFrameFn(renderFrame, (buffers.value ?? {}) as any);
-          s.presentToCanvas(true);
-        }
+        const renderFrame = {
+          canvas: frame.canvas,
+          width: camera.height,
+          height: camera.width,
+        };
+        onFrameFn(renderFrame, (buffers.value ?? {}) as any);
+        // Signal that new Skia draws are pending — processFrame will flush them
+        s.setOverlayDirty();
       }
       return;
     }

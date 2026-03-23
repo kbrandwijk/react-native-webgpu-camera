@@ -80,7 +80,8 @@ public:
    *  When set, processFrame blits the final compute output to the canvas
    *  surface and presents, skipping MakeImageFromTexture entirely. */
   void setCanvasContextId(int contextId);
-  bool presentToCanvas(bool withCanvasDraws = false); // blit to canvas surface, optionally with Skia draws
+  bool presentToCanvas(bool withCanvasDraws = false);
+  void setOverlayDirty();
 
   /** Single-lock frame begin: returns image, buffers, canvas, fps, generation, metrics */
   struct FrameData {

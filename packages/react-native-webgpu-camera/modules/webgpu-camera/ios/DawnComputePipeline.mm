@@ -62,7 +62,10 @@ struct DawnComputePipeline::Impl {
   std::vector<StagingBuffer> buffers;
   bool syncMode = false;
   bool useCanvas = false;
-  std::atomic<bool> overlayReady{false};  // set by onFrame, read by processFrame
+  std::atomic<bool> overlayReady{false};  // true once first overlay has been composited
+  std::atomic<bool> overlayDirty{false};  // set by JS onFrame, consumed by processFrame
+  std::unique_ptr<skgpu::graphite::Recording> pendingRecording; // snapped on JS thread, submitted on camera thread
+  std::mutex recordingMutex;
   bool appleLog = false;
   bool rawCamera = false;  // true when 0 shaders, no canvas, no buffers
   wgpu::Texture canvasTex;  // Skia draws target — onFrame writes here
@@ -1283,6 +1286,53 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
     ctx.getWGPUInstance().ProcessEvents();
   }
 
+  // Flush pending Skia overlay draws (from JS onFrame) on the camera thread.
+  // This avoids cross-thread Dawn mutex contention.
+  if (impl->overlayDirty.exchange(false) && impl->surface && impl->canvasTex) {
+    int front = impl->overlayFront.load();
+    wgpu::Texture& backTex = (front == 0) ? impl->overlayTexB : impl->overlayTexA;
+
+    // Clear back overlay to transparent
+    auto clearEnc = device.CreateCommandEncoder();
+    wgpu::RenderPassColorAttachment clearAttach{};
+    clearAttach.view = backTex.CreateView();
+    clearAttach.loadOp = wgpu::LoadOp::Clear;
+    clearAttach.storeOp = wgpu::StoreOp::Store;
+    clearAttach.clearValue = {0, 0, 0, 0};
+    wgpu::RenderPassDescriptor clearRpDesc{};
+    clearRpDesc.colorAttachmentCount = 1;
+    clearRpDesc.colorAttachments = &clearAttach;
+    auto clearPass = clearEnc.BeginRenderPass(&clearRpDesc);
+    clearPass.End();
+    auto clearCmd = clearEnc.Finish();
+    device.GetQueue().Submit(1, &clearCmd);
+
+    // Submit the Skia recording that was snapped on the JS thread
+    std::unique_ptr<skgpu::graphite::Recording> recording;
+    {
+      std::lock_guard<std::mutex> lock(impl->recordingMutex);
+      recording = std::move(impl->pendingRecording);
+    }
+    if (recording) {
+      ctx.submitRecording(recording.get(), skgpu::graphite::SyncToCpu::kNo);
+    }
+
+    // Copy canvasTex → back overlay
+    auto copyEnc = device.CreateCommandEncoder();
+    wgpu::TexelCopyTextureInfo copySrc{};
+    copySrc.texture = impl->canvasTex;
+    wgpu::TexelCopyTextureInfo copyDst{};
+    copyDst.texture = backTex;
+    wgpu::Extent3D copyExtent = {(uint32_t)_width, (uint32_t)_height, 1};
+    copyEnc.CopyTextureToTexture(&copySrc, &copyDst, &copyExtent);
+    auto copyCmds = copyEnc.Finish();
+    device.GetQueue().Submit(1, &copyCmds);
+
+    // Swap front/back
+    impl->overlayFront.store(front == 0 ? 1 : 0);
+    impl->overlayReady.store(true);
+  }
+
   static int pfLog = 0;
   if (pfLog < 20 && !impl->models.empty()) {
     NSLog(@"[DawnPipeline] processFrame compute path entered (frame %d)", pfLog);
@@ -1960,6 +2010,17 @@ fn fs(in: VsOut) -> @location(0) vec4f {
   NSLog(@"[DawnPipeline] Canvas output configured: contextId=%d, blit pipeline + bind group cached", contextId);
 }
 
+void DawnComputePipeline::setOverlayDirty() {
+  if (!_impl || !_impl->surface) return;
+  // Snap the Skia recording on the JS thread (where the draws were recorded)
+  auto recording = _impl->surface->recorder()->snap();
+  if (recording) {
+    std::lock_guard<std::mutex> lock(_impl->recordingMutex);
+    _impl->pendingRecording = std::move(recording);
+    _impl->overlayDirty.store(true);
+  }
+}
+
 bool DawnComputePipeline::presentToCanvas(bool withCanvasDraws) {
   // Called from JS thread to update overlay texture.
   // Grabs references under lock, then does GPU work without holding the lock.
@@ -2472,6 +2533,19 @@ public:
           if (!_alive->load()) return facebook::jsi::Value(false);
           bool withCanvasDraws = (count > 0 && args[0].isBool()) ? args[0].getBool() : false;
           return facebook::jsi::Value(_pipeline->presentToCanvas(withCanvasDraws));
+        });
+    }
+
+    if (propName == "setOverlayDirty") {
+      return facebook::jsi::Function::createFromHostFunction(
+        runtime, name, 0,
+        [this](facebook::jsi::Runtime&,
+               const facebook::jsi::Value&,
+               const facebook::jsi::Value*,
+               size_t) -> facebook::jsi::Value {
+          if (!_alive->load()) return facebook::jsi::Value::undefined();
+          _pipeline->setOverlayDirty();
+          return facebook::jsi::Value::undefined();
         });
     }
 

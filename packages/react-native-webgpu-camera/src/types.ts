@@ -81,7 +81,8 @@ export interface CameraStream {
   flushCanvasAndGetImage(): SkImage | null;
   beginFrame(): FrameSnapshot | null;
   setCanvasContextId(contextId: number): void;
-  presentToCanvas(): boolean;
+  presentToCanvas(withCanvasDraws?: boolean): boolean;
+  setOverlayDirty(): void;
   pipelineFps(): number;
   generation(): number;
   metrics(): PipelineMetrics | null;
