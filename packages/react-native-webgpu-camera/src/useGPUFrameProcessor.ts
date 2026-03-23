@@ -171,18 +171,11 @@ function capturePipeline<B extends Record<string, any>, R extends Record<string,
             // Buffer/texture output from a previous pass or model
             const src = outputHandleMap.get(handle)!;
             if (src.modelIndex !== undefined) {
-              // Model output — bind as texture + sampler
+              // Model output — bind as storage buffer (zero-copy from ORT)
               pass.inputs.push({
                 name,
                 bindingIndex: nextBinding,
-                type: 'texture2d',
-                modelOutput: src.modelIndex,
-              });
-              nextBinding++;
-              pass.inputs.push({
-                name: `${name}_sampler`,
-                bindingIndex: nextBinding,
-                type: 'sampler',
+                type: 'storageBufferRead',
                 modelOutput: src.modelIndex,
               });
               nextBinding++;

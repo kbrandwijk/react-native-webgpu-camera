@@ -4,6 +4,7 @@
 #include <dawn/native/DawnNative.h>
 
 #import <Foundation/Foundation.h>
+#import <IOSurface/IOSurfaceRef.h>
 
 #include <chrono>
 #include <cstring>
@@ -41,7 +42,9 @@ struct Params {
 fn main(@builtin(global_invocation_id) id: vec3u) {
   if (id.x >= params.modelW || id.y >= params.modelH) { return; }
 
-  let uv = (vec2f(id.xy) + 0.5) / vec2f(f32(params.modelW), f32(params.modelH));
+  // Rotate 90° CW: landscape IOSurface → portrait model input
+  let normUV = (vec2f(id.xy) + 0.5) / vec2f(f32(params.modelW), f32(params.modelH));
+  let uv = vec2f(normUV.y, 1.0 - normUV.x);
   let pixel = textureSampleLevel(inputTex, inputSampler, uv, 0.0);
 
   let r = (pixel.r - params.meanR) / params.stdR;
@@ -62,18 +65,27 @@ ModelRunner::ModelRunner(wgpu::Device device, int cameraWidth, int cameraHeight)
     : _device(device), _cameraW(cameraWidth), _cameraH(cameraHeight) {}
 
 ModelRunner::~ModelRunner() {
+  NSLog(@"[ModelRunner] ~ModelRunner() destructor called");
   shutdown();
 }
 
 // ── Setup ──
 
 bool ModelRunner::setup(const ModelSpec& spec) {
+  static int setupCount = 0;
+  NSLog(@"[ModelRunner] setup() call #%d for model: %s", ++setupCount, spec.path.c_str());
   _spec = spec;
 
-  // ── 1. Get Dawn pointers for ONNX Runtime WebGPU EP ──
+  // ── 1. Create secondary Dawn device for ORT (own queue + mutex) ──
   auto& ctx = RNSkia::DawnContext::getInstance();
-  auto device = ctx.getWGPUDevice();
   auto instance = ctx.getWGPUInstance();
+
+  _ortDevice = ctx.createSecondaryDevice();
+  if (!_ortDevice) {
+    NSLog(@"[ModelRunner] FAILED to create secondary Dawn device");
+    return false;
+  }
+  NSLog(@"[ModelRunner] Secondary Dawn device created (separate queue)");
 
   static const DawnProcTable* procs = nullptr;
   if (!procs) {
@@ -81,25 +93,26 @@ bool ModelRunner::setup(const ModelSpec& spec) {
     procs = &p;
   }
 
-  // ── 2. Create ONNX Runtime session with WebGPU EP ──
-  // Ort::Env must be static — it must outlive all sessions
+  // ── 2. Create ONNX Runtime session with WebGPU EP on secondary device ──
   static Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "ModelRunner");
 
   try {
     Ort::SessionOptions sessionOptions;
+    sessionOptions.SetGraphOptimizationLevel(ORT_ENABLE_ALL);
 
-    // Configure WebGPU EP with shared Dawn device
+    // ORT uses the secondary device — its own queue, won't block camera pipeline
     std::unordered_map<std::string, std::string> epOptions;
-    epOptions["deviceId"] = "1";  // non-zero signals external Dawn device
-    epOptions["webgpuDevice"] = std::to_string((uintptr_t)device.Get());
+    epOptions["deviceId"] = "1";
+    epOptions["webgpuDevice"] = std::to_string((uintptr_t)_ortDevice.Get());
     epOptions["webgpuInstance"] = std::to_string((uintptr_t)instance.Get());
     epOptions["dawnProcTable"] = std::to_string((uintptr_t)procs);
+    epOptions["validationMode"] = "disabled";
     sessionOptions.AppendExecutionProvider("WebGPU", epOptions);
 
     _session = new Ort::Session(env, spec.path.c_str(), sessionOptions);
-    NSLog(@"[ModelRunner] ONNX session created: %s", spec.path.c_str());
+    NSLog(@"[ModelRunner] ONNX session created on secondary device: %s", spec.path.c_str());
   } catch (const Ort::Exception& e) {
-    NSLog(@"[ModelRunner] FAILED to create ONNX session: %{public}s", e.what());
+    fprintf(stderr, "[ModelRunner] FAILED to create ONNX session: %s\n", e.what());
     return false;
   }
 
@@ -169,7 +182,7 @@ bool ModelRunner::setup(const ModelSpec& spec) {
     wgpu::ShaderModuleDescriptor smDesc{};
     smDesc.nextInChain = &wgslDesc;
 
-    auto shaderModule = _device.CreateShaderModule(&smDesc);
+    auto shaderModule = _ortDevice.CreateShaderModule(&smDesc);
     if (!shaderModule) {
       NSLog(@"[ModelRunner] FAILED to create resize shader module");
       return false;
@@ -180,7 +193,7 @@ bool ModelRunner::setup(const ModelSpec& spec) {
     cpDesc.compute.entryPoint = "main";
     cpDesc.label = "ModelResizeNormalize";
 
-    _resizePipeline = _device.CreateComputePipeline(&cpDesc);
+    _resizePipeline = _ortDevice.CreateComputePipeline(&cpDesc);
     if (!_resizePipeline) {
       NSLog(@"[ModelRunner] FAILED to create resize compute pipeline");
       return false;
@@ -190,7 +203,7 @@ bool ModelRunner::setup(const ModelSpec& spec) {
     NSLog(@"[ModelRunner] Resize shader compiled OK");
   }
 
-  // ── 6. Create linear sampler for bilinear resize ──
+  // ── 6. Create linear sampler for bilinear resize (on ORT device) ──
   {
     wgpu::SamplerDescriptor sampDesc{};
     sampDesc.magFilter = wgpu::FilterMode::Linear;
@@ -199,25 +212,25 @@ bool ModelRunner::setup(const ModelSpec& spec) {
     sampDesc.addressModeU = wgpu::AddressMode::ClampToEdge;
     sampDesc.addressModeV = wgpu::AddressMode::ClampToEdge;
     sampDesc.addressModeW = wgpu::AddressMode::ClampToEdge;
-    _resizeSampler = _device.CreateSampler(&sampDesc);
+    _resizeSampler = _ortDevice.CreateSampler(&sampDesc);
   }
 
-  // ── 7. Allocate model input buffer (NCHW float32) ──
-  // This buffer is shared: resize shader writes to it, ORT reads from it via IO binding.
+  // ── 7. Allocate model input buffer on ORT device ──
   {
     uint32_t inputElements = 1 * 3 * _modelH * _modelW;
     uint32_t inputBytes = inputElements * sizeof(float);
 
+    // ORT device: resize shader writes here, ORT reads via IO binding
     wgpu::BufferDescriptor bufDesc{};
     bufDesc.size = inputBytes;
     bufDesc.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc;
     bufDesc.label = "ModelInputNCHW";
-    _modelInputBuffer = _device.CreateBuffer(&bufDesc);
+    _modelInputBuffer = _ortDevice.CreateBuffer(&bufDesc);
 
-    NSLog(@"[ModelRunner] Input buffer: %u elements (%u bytes)", inputElements, inputBytes);
+    NSLog(@"[ModelRunner] Input buffer: %u elements (%u bytes, on ORT device)", inputElements, inputBytes);
   }
 
-  // ── 8. Upload resize params to uniform buffer ──
+  // ── 8. Upload resize params to uniform buffer (on ORT device) ──
   {
     ResizeParams params{};
     params.modelW = (uint32_t)_modelW;
@@ -233,36 +246,33 @@ bool ModelRunner::setup(const ModelSpec& spec) {
     paramBufDesc.size = sizeof(ResizeParams);
     paramBufDesc.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
     paramBufDesc.label = "ModelResizeParams";
-    _paramBuffer = _device.CreateBuffer(&paramBufDesc);
-    _device.GetQueue().WriteBuffer(_paramBuffer, 0, &params, sizeof(params));
+    _paramBuffer = _ortDevice.CreateBuffer(&paramBufDesc);
+    _ortDevice.GetQueue().WriteBuffer(_paramBuffer, 0, &params, sizeof(params));
   }
 
-  // ── 9. Create output buffer + texture ──
+  // ── 9. Create output buffers ──
   {
     _outputElements = (size_t)_outputW * _outputH;
     uint32_t outputBytes = (uint32_t)(_outputElements * sizeof(float));
 
-    // Pre-allocate output GPU buffer — ORT writes here via IO binding
+    // ORT output on secondary device — MapRead for CPU bridge to primary
     wgpu::BufferDescriptor outBufDesc{};
     outBufDesc.size = outputBytes;
-    outBufDesc.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc;
+    outBufDesc.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc
+                     | wgpu::BufferUsage::CopyDst;
     outBufDesc.label = "ModelOutputBuffer";
-    _modelOutputBuffer = _device.CreateBuffer(&outBufDesc);
+    _ortBuffer = _ortDevice.CreateBuffer(&outBufDesc);
 
-    NSLog(@"[ModelRunner] Output buffer: %u bytes", outputBytes);
+    // Read buffer on PRIMARY device — shader binds this
+    wgpu::BufferDescriptor readDesc{};
+    readDesc.size = outputBytes;
+    readDesc.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
+    readDesc.label = "ModelReadBuffer";
+    _readBuffer = _device.CreateBuffer(&readDesc);
 
-    wgpu::TextureDescriptor outTexDesc{};
-    outTexDesc.size = {(uint32_t)_outputW, (uint32_t)_outputH, 1};
-    outTexDesc.format = wgpu::TextureFormat::R16Float;
-    outTexDesc.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst;
-    outTexDesc.dimension = wgpu::TextureDimension::e2D;
-    outTexDesc.mipLevelCount = 1;
-    outTexDesc.sampleCount = 1;
-    outTexDesc.label = "ModelOutput";
-    _outputTexture = _device.CreateTexture(&outTexDesc);
-    _outputView = _outputTexture.CreateView();
+    NSLog(@"[ModelRunner] Output buffers: %u bytes (triple-buffered)", outputBytes);
 
-    NSLog(@"[ModelRunner] Output: %dx%d (%u elements, texture=R16Float)",
+    NSLog(@"[ModelRunner] Output: %dx%d (%u elements, buffer=f32)",
           _outputW, _outputH, (uint32_t)_outputElements);
   }
 
@@ -295,12 +305,34 @@ bool ModelRunner::setup(const ModelSpec& spec) {
     auto outTensorInfo2 = outputInfo2.GetTensorTypeAndShapeInfo();
     auto outShape2 = outTensorInfo2.GetShape();
     std::vector<int64_t> outputShapeVec;
-    for (auto d : outShape2) {
-      outputShapeVec.push_back(d > 0 ? d : _outputH);  // replace dynamic dims
+    for (size_t i = 0; i < outShape2.size(); i++) {
+      int64_t d = outShape2[i];
+      if (d > 0) {
+        outputShapeVec.push_back(d);
+      } else if (i == 0) {
+        outputShapeVec.push_back(1);  // batch dim
+      } else if (i == outShape2.size() - 1) {
+        outputShapeVec.push_back(_outputW);
+      } else {
+        outputShapeVec.push_back(_outputH);
+      }
     }
+    // Log the resolved shape for debugging
+    {
+      std::string shapeStr;
+      size_t totalElements = 1;
+      for (size_t i = 0; i < outputShapeVec.size(); i++) {
+        if (i > 0) shapeStr += "x";
+        shapeStr += std::to_string(outputShapeVec[i]);
+        totalElements *= outputShapeVec[i];
+      }
+      NSLog(@"[ModelRunner] Output shape resolved: [%s] = %zu elements (buffer has %zu)",
+            shapeStr.c_str(), totalElements, _outputElements);
+    }
+
     auto* outputTensor = new Ort::Value(Ort::Value::CreateTensor(
       *gpuMem,
-      (void*)_modelOutputBuffer.Get(),
+      (void*)_ortBuffer.Get(),
       _outputElements * sizeof(float),
       outputShapeVec.data(), outputShapeVec.size(),
       ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT));
@@ -311,7 +343,7 @@ bool ModelRunner::setup(const ModelSpec& spec) {
     _ioBinding = binding;
     NSLog(@"[ModelRunner] IO binding created — fully pre-allocated, zero-copy GPU path");
   } catch (const Ort::Exception& e) {
-    NSLog(@"[ModelRunner] IO binding setup FAILED: %{public}s", e.what());
+    fprintf(stderr, "[ModelRunner] IO binding setup FAILED: %s\n", e.what());
     return false;
   }
 
@@ -329,24 +361,54 @@ bool ModelRunner::setup(const ModelSpec& spec) {
 
 // ── Resize shader dispatch ──
 
-void ModelRunner::runResizeShader(wgpu::Texture inputTexture) {
-  if (!_running && !_spec.sync) return;  // shutting down
+void ModelRunner::runResizeShader(IOSurfaceRef ioSurface) {
+  if (!_running && !_spec.sync) return;
+  if (!ioSurface) return;
 
-  // Create bind group for this frame's input texture
+  // Import the camera IOSurface on the ORT device — zero-copy shared memory
+  wgpu::SharedTextureMemoryIOSurfaceDescriptor ioDesc{};
+  ioDesc.ioSurface = ioSurface;
+
+  wgpu::SharedTextureMemoryDescriptor sharedDesc{};
+  sharedDesc.nextInChain = &ioDesc;
+
+  auto sharedMemory = _ortDevice.ImportSharedTextureMemory(&sharedDesc);
+  if (!sharedMemory) {
+    static int failCount = 0;
+    if (failCount++ < 3) NSLog(@"[ModelRunner] FAILED to import IOSurface on ORT device");
+    return;
+  }
+
+  // Create texture from shared memory — use raw IOSurface dimensions (unrotated)
+  uint32_t ioW = (uint32_t)IOSurfaceGetWidth(ioSurface);
+  uint32_t ioH = (uint32_t)IOSurfaceGetHeight(ioSurface);
+
+  wgpu::TextureDescriptor texDesc{};
+  texDesc.format = wgpu::TextureFormat::BGRA8Unorm;
+  texDesc.dimension = wgpu::TextureDimension::e2D;
+  texDesc.usage = wgpu::TextureUsage::TextureBinding;
+  texDesc.size = {ioW, ioH, 1};
+
+  auto inputTexture = sharedMemory.CreateTexture(&texDesc);
+
+  wgpu::SharedTextureMemoryBeginAccessDescriptor beginDesc{};
+  beginDesc.initialized = true;
+  beginDesc.fenceCount = 0;
+  if (!sharedMemory.BeginAccess(inputTexture, &beginDesc)) {
+    return;
+  }
+
+  // Create bind group and dispatch resize shader
   wgpu::TextureView inputView = inputTexture.CreateView();
 
   std::vector<wgpu::BindGroupEntry> entries(4);
-
   entries[0].binding = 0;
   entries[0].textureView = inputView;
-
   entries[1].binding = 1;
   entries[1].sampler = _resizeSampler;
-
   entries[2].binding = 2;
   entries[2].buffer = _modelInputBuffer;
   entries[2].size = _modelInputBuffer.GetSize();
-
   entries[3].binding = 3;
   entries[3].buffer = _paramBuffer;
   entries[3].size = _paramBuffer.GetSize();
@@ -356,14 +418,14 @@ void ModelRunner::runResizeShader(wgpu::Texture inputTexture) {
   bgDesc.entryCount = entries.size();
   bgDesc.entries = entries.data();
 
-  auto bindGroup = _device.CreateBindGroup(&bgDesc);
+  auto bindGroup = _ortDevice.CreateBindGroup(&bgDesc);
   if (!bindGroup) {
-    NSLog(@"[ModelRunner] FAILED to create resize bind group");
+    wgpu::SharedTextureMemoryEndAccessState endState{};
+    sharedMemory.EndAccess(inputTexture, &endState);
     return;
   }
 
-  // Dispatch compute shader
-  auto encoder = _device.CreateCommandEncoder();
+  auto encoder = _ortDevice.CreateCommandEncoder();
   auto pass = encoder.BeginComputePass();
   pass.SetPipeline(_resizePipeline);
   pass.SetBindGroup(0, bindGroup);
@@ -374,7 +436,11 @@ void ModelRunner::runResizeShader(wgpu::Texture inputTexture) {
   pass.End();
 
   auto commands = encoder.Finish();
-  _device.GetQueue().Submit(1, &commands);
+  _ortDevice.GetQueue().Submit(1, &commands);
+
+  // End shared access
+  wgpu::SharedTextureMemoryEndAccessState endState{};
+  sharedMemory.EndAccess(inputTexture, &endState);
 }
 
 // ── GPU-native inference via IO binding ──
@@ -391,128 +457,113 @@ void ModelRunner::runInference() {
     // Input and output are pre-bound at setup — just Run().
     auto startTime = std::chrono::high_resolution_clock::now();
 
+    auto tRun0 = std::chrono::high_resolution_clock::now();
     session->Run(Ort::RunOptions{nullptr}, *binding);
+    auto tRun1 = std::chrono::high_resolution_clock::now();
 
-    auto endTime = std::chrono::high_resolution_clock::now();
-    double inferMs = std::chrono::duration<double, std::milli>(endTime - startTime).count();
-
-    static std::atomic<int> logCounter{0};
-    if (logCounter.fetch_add(1) % 60 == 0) {
-      NSLog(@"[ModelRunner] Inference: %.1fms (GPU IO binding)", inferMs);
-    }
-
-    // ── Copy pre-allocated output buffer → staging → CPU for f32→f16 ──
-    // Output is in _modelOutputBuffer (bound at setup, written by ORT).
-    // TODO: replace f32→f16 with a compute shader for fully zero-copy.
-    size_t outputElements = _outputElements;
-
-    wgpu::BufferDescriptor stagingDesc{};
-    stagingDesc.size = outputElements * sizeof(float);
-    stagingDesc.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
-    stagingDesc.label = "ModelOutputStaging";
-    auto stagingBuf = _device.CreateBuffer(&stagingDesc);
-
-    auto encoder = _device.CreateCommandEncoder();
-    encoder.CopyBufferToBuffer(_modelOutputBuffer, 0, stagingBuf, 0, outputElements * sizeof(float));
-    auto commands = encoder.Finish();
-    _device.GetQueue().Submit(1, &commands);
-
-    // Sync map on inference thread
-    auto& ctx = RNSkia::DawnContext::getInstance();
-    bool mapSuccess = false;
-    auto future = stagingBuf.MapAsync(
-      wgpu::MapMode::Read, 0, outputElements * sizeof(float),
-      wgpu::CallbackMode::WaitAnyOnly,
-      [&mapSuccess](wgpu::MapAsyncStatus status, wgpu::StringView) {
-        mapSuccess = (status == wgpu::MapAsyncStatus::Success);
-      }
-    );
-    ctx.getWGPUInstance().WaitAny(future, UINT64_MAX);
-
-    if (!mapSuccess) {
-      NSLog(@"[ModelRunner] FAILED to map output staging buffer");
-      return;
-    }
-
-    const float* outputData = static_cast<const float*>(
-      stagingBuf.GetConstMappedRange(0, outputElements * sizeof(float)));
-
-    // Convert float32 → float16 for R16Float texture
-    std::vector<uint16_t> f16Data(outputElements);
-    for (size_t i = 0; i < outputElements; i++) {
-      float val = outputData[i];
-      uint32_t f32;
-      std::memcpy(&f32, &val, 4);
-      uint32_t sign = (f32 >> 16) & 0x8000;
-      int32_t exponent = ((f32 >> 23) & 0xFF) - 127 + 15;
-      uint32_t mantissa = (f32 >> 13) & 0x3FF;
-      if (exponent <= 0) {
-        f16Data[i] = (uint16_t)sign;
-      } else if (exponent >= 31) {
-        f16Data[i] = (uint16_t)(sign | 0x7C00);
-      } else {
-        f16Data[i] = (uint16_t)(sign | (exponent << 10) | mantissa);
-      }
-    }
-    stagingBuf.Unmap();
-
-    // Upload to output texture
-    wgpu::TexelCopyTextureInfo dst{};
-    dst.texture = _outputTexture;
-    dst.mipLevel = 0;
-    dst.origin = {0, 0, 0};
-    dst.aspect = wgpu::TextureAspect::All;
-
-    wgpu::TexelCopyBufferLayout layout{};
-    layout.offset = 0;
-    layout.bytesPerRow = (uint32_t)_outputW * sizeof(uint16_t);
-    layout.rowsPerImage = (uint32_t)_outputH;
-
-    wgpu::Extent3D extent = {(uint32_t)_outputW, (uint32_t)_outputH, 1};
-    _device.GetQueue().WriteTexture(
-      &dst, f16Data.data(), f16Data.size() * sizeof(uint16_t), &layout, &extent);
-
-    // Update output view
+    // ── Bridge ORT output from device B → device A via CPU ──
+    // Map _ortBuffer on ORT device (no contention with camera pipeline).
+    // Then WriteBuffer to _readBuffer on primary device (tiny ~1MB transfer).
     {
-      std::lock_guard<std::mutex> lock(_outputMutex);
-      _outputView = _outputTexture.CreateView();
+      uint32_t bytes = (uint32_t)(_outputElements * sizeof(float));
+
+      // Staging buffer bridge: ORT device → primary device
+      // MapAsync waits for ORT GPU completion (~11ms real GPU time)
+      // then copies 1MB to primary device's _readBuffer
+      wgpu::BufferDescriptor stagingDesc{};
+      stagingDesc.size = bytes;
+      stagingDesc.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
+      stagingDesc.label = "OrtOutputStaging";
+      auto stagingBuf = _ortDevice.CreateBuffer(&stagingDesc);
+
+      auto encoder = _ortDevice.CreateCommandEncoder();
+      encoder.CopyBufferToBuffer(_ortBuffer, 0, stagingBuf, 0, bytes);
+      auto commands = encoder.Finish();
+      _ortDevice.GetQueue().Submit(1, &commands);
+
+      // Use WaitAny with the instance — handles completion callbacks from both devices
+      auto instance = RNSkia::DawnContext::getInstance().getWGPUInstance();
+      bool mapOk = false;
+      auto future = stagingBuf.MapAsync(
+        wgpu::MapMode::Read, 0, bytes,
+        wgpu::CallbackMode::WaitAnyOnly,
+        [&mapOk](wgpu::MapAsyncStatus status, wgpu::StringView) {
+          mapOk = (status == wgpu::MapAsyncStatus::Success);
+        }
+      );
+      // Tick the ORT device to ensure GPU work is flushed
+      _ortDevice.Tick();
+      instance.WaitAny(future, UINT64_MAX);
+      if (mapOk) {
+        const void* mapped = stagingBuf.GetConstMappedRange(0, bytes);
+        _device.GetQueue().WriteBuffer(_readBuffer, 0, mapped, bytes);
+        stagingBuf.Unmap();
+      }
     }
+    auto tBridge1 = std::chrono::high_resolution_clock::now();
     _hasResult = true;
 
-    // Model FPS tracking
+    double runMs = std::chrono::duration<double, std::milli>(tRun1 - tRun0).count();
+    double bridgeMs = std::chrono::duration<double, std::milli>(tBridge1 - tRun1).count();
+    double totalMs = runMs + bridgeMs;
+
+    // Model FPS tracking — count completed inferences per second
     _inferenceCount++;
     double now = CACurrentMediaTime();
     if (_lastFpsTime == 0) {
       _lastFpsTime = now;
     } else if (now - _lastFpsTime >= 1.0) {
-      int fps = (int)(_inferenceCount / (now - _lastFpsTime));
-      NSLog(@"[ModelRunner] %d fps (%.1fms avg)", fps, 1000.0 / std::max(fps, 1));
+      double elapsed = now - _lastFpsTime;
+      double fps = _inferenceCount / elapsed;
+      NSLog(@"[ModelRunner] %.1f fps | run=%.1fms bridge=%.1fms total=%.1fms",
+            fps, runMs, bridgeMs, totalMs);
       _inferenceCount = 0;
       _lastFpsTime = now;
     }
 
   } catch (const Ort::Exception& e) {
-    NSLog(@"[ModelRunner] Inference FAILED: %{public}s", e.what());
+    // Build error string with known-safe characters to bypass iOS log redaction
+    std::string msg = e.what();
+    // Replace any characters that might trigger redaction
+    NSMutableString *safe = [NSMutableString stringWithCapacity:msg.size()];
+    for (char c : msg) {
+      [safe appendFormat:@"%c", c];
+    }
+    NSLog(@"[ModelRunner] Inference FAILED reason=[%@]", safe);
+    // Also write to Documents for retrieval
+    static bool wroteError = false;
+    if (!wroteError) {
+      NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+      NSString *docDir = [paths firstObject];
+      NSString *errFile = [docDir stringByAppendingPathComponent:@"model_error.txt"];
+      NSString *errStr = [NSString stringWithUTF8String:e.what()];
+      [errStr writeToFile:errFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
+      NSLog(@"[ModelRunner] Error written to %@", errFile);
+      wroteError = true;
+    }
   }
 }
 
 // ── Frame submission ──
 
-void ModelRunner::submitFrame(wgpu::Texture cameraTexture) {
+void ModelRunner::submitFrame(wgpu::Texture cameraTexture, IOSurfaceRef ioSurface) {
   if (_spec.sync) {
-    // Sync mode: run resize + inference, block until done
-    runResizeShader(cameraTexture);
+    runResizeShader(ioSurface);
     runInference();
     return;
   }
 
-  // Async: hand off texture to inference thread.
-  // wgpu::Texture is refcounted — the inference thread's copy keeps the
-  // texture alive even if the pipeline ping-pongs to the other buffer.
+  // Async: hand off IOSurface to inference thread.
+  // IOSurface is refcounted by the OS — safe to pass across threads.
   {
     std::lock_guard<std::mutex> lock(_frameMutex);
-    _pendingTexture = cameraTexture;
+    if (_pendingIOSurface) CFRelease(_pendingIOSurface);
+    _pendingIOSurface = (IOSurfaceRef)CFRetain(ioSurface);
     _hasNewFrame = true;
+  }
+  static int submitLog = 0;
+  if (submitLog++ < 5) {
+    NSLog(@"[ModelRunner] submitFrame: queued frame %d (ioSurface=%p)", submitLog, ioSurface);
   }
 }
 
@@ -522,12 +573,11 @@ void ModelRunner::inferenceLoop() {
   NSLog(@"[ModelRunner] Inference thread started");
 
   while (_running) {
-    wgpu::Texture frame;
+    IOSurfaceRef ioSurface = nullptr;
     {
       std::lock_guard<std::mutex> lock(_frameMutex);
       if (!_hasNewFrame) {
         // No new frame — unlock, sleep briefly, and retry.
-        // 1ms sleep keeps CPU usage minimal while allowing ~30fps inference.
       }
     }
 
@@ -539,12 +589,32 @@ void ModelRunner::inferenceLoop() {
     {
       std::lock_guard<std::mutex> lock(_frameMutex);
       if (!_hasNewFrame) continue;
-      frame = _pendingTexture;
+      ioSurface = _pendingIOSurface;
+      _pendingIOSurface = nullptr;  // take ownership
       _hasNewFrame = false;
     }
 
-    runResizeShader(frame);
+    static int loopLog = 0;
+    if (loopLog++ < 5) {
+      NSLog(@"[ModelRunner] inferenceLoop: got frame %d (ioSurface=%p)", loopLog, ioSurface);
+    }
+    auto t0 = std::chrono::high_resolution_clock::now();
+    // Resize shader imports IOSurface on ORT device — no primary device involvement
+    runResizeShader(ioSurface);
+    if (ioSurface) CFRelease(ioSurface);
+    auto t1 = std::chrono::high_resolution_clock::now();
+
     runInference();
+    auto t2 = std::chrono::high_resolution_clock::now();
+
+    double resizeMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    double inferMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
+    double totalMs = std::chrono::duration<double, std::milli>(t2 - t0).count();
+
+    if (loopLog <= 5) {
+      NSLog(@"[ModelRunner] frame %d: resize=%.1fms run=%.1fms total=%.1fms hasResult=%d",
+            loopLog, resizeMs, inferMs, totalMs, _hasResult.load());
+    }
   }
 
   NSLog(@"[ModelRunner] Inference thread stopped");
@@ -585,16 +655,23 @@ void ModelRunner::shutdown() {
     _session = nullptr;
   }
 
-  // Release GPU resources
+  // Release GPU resources (primary device)
+  _readBuffer = nullptr;
+
+  // Release GPU resources (ORT device)
   _resizePipeline = nullptr;
   _resizeBindGroupLayout = nullptr;
   _modelInputBuffer = nullptr;
-  _modelOutputBuffer = nullptr;
   _paramBuffer = nullptr;
   _resizeSampler = nullptr;
-  _outputTexture = nullptr;
-  _outputView = nullptr;
-  _pendingTexture = nullptr;
+  _ortBuffer = nullptr;
+  _ortDevice = nullptr;
+
+  // Release IOSurface ref
+  if (_pendingIOSurface) {
+    CFRelease(_pendingIOSurface);
+    _pendingIOSurface = nullptr;
+  }
 
   NSLog(@"[ModelRunner] Shutdown complete");
 }

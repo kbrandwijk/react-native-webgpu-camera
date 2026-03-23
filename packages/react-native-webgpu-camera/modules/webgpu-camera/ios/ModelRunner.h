@@ -9,6 +9,7 @@
 #include <atomic>
 
 #include <webgpu/webgpu_cpp.h>
+#include <IOSurface/IOSurfaceRef.h>
 
 namespace dawn_pipeline {
 
@@ -29,13 +30,16 @@ public:
   /** Load model, create session, compile resize shader, allocate buffers. */
   bool setup(const ModelSpec& spec);
 
-  /** Submit a new frame for inference (called from processFrame thread).
-   *  For async models, copies the texture ref and returns immediately.
-   *  For sync models, blocks until inference completes. */
-  void submitFrame(wgpu::Texture cameraTexture);
+  /** Submit a new camera frame for inference.
+   *  Takes the IOSurface so the ORT device can import it directly.
+   *  For async models, stores the ref and returns immediately. */
+  void submitFrame(wgpu::Texture cameraTexture, IOSurfaceRef ioSurface);
 
   /** Get the latest output texture view (may be null if no result yet). */
   wgpu::TextureView getOutputView() const;
+
+  /** Get the output buffer for shader binding. Shader reads latest ORT output directly. */
+  wgpu::Buffer getOutputBuffer() const { return _readBuffer; }
 
   /** Get the output dimensions. */
   int outputWidth() const { return _outputW; }
@@ -48,20 +52,24 @@ public:
 
 private:
   void inferenceLoop();
-  void runResizeShader(wgpu::Texture inputTexture);
+  void runResizeShader(IOSurfaceRef ioSurface);
   void runInference();
 
-  wgpu::Device _device;
+  wgpu::Device _device;       // primary device (camera pipeline) — for _readBuffer
+  wgpu::Device _ortDevice;    // secondary device (ORT) — own queue + mutex
   int _cameraW, _cameraH;
   int _modelW = 0, _modelH = 0;  // model input spatial dims
   int _outputW = 0, _outputH = 0;
 
-  // Resize + normalize compute shader
+  // Resize + normalize compute shader (runs on _device / primary)
   wgpu::ComputePipeline _resizePipeline;
   wgpu::BindGroupLayout _resizeBindGroupLayout;
-  wgpu::Buffer _modelInputBuffer;  // NCHW float32 storage buffer — shared with ORT via IO binding
+  wgpu::Buffer _modelInputBuffer;  // on _device — resize shader output, mapped for CPU read
   wgpu::Buffer _paramBuffer;       // uniform buffer for resize params
   wgpu::Sampler _resizeSampler;    // linear sampler for bilinear resize
+
+  // ORT input buffer on _ortDevice — CPU-written from mapped _modelInputBuffer
+  wgpu::Buffer _ortInputBuffer;
 
   // ONNX Runtime session and IO binding (opaque — ort headers only in .mm)
   void* _session = nullptr;       // Ort::Session*
@@ -70,8 +78,10 @@ private:
   void* _boundInputTensor = nullptr;   // Ort::Value* — must outlive binding
   void* _boundOutputTensor = nullptr;  // Ort::Value* — must outlive binding
 
-  // Pre-allocated output GPU buffer — bound to IO binding at setup, reused every frame
-  wgpu::Buffer _modelOutputBuffer;
+  // ORT output buffer on _ortDevice — mapped for CPU read via BufferMapExtendedUsages
+  wgpu::Buffer _ortBuffer;
+  // Read buffer on _device (primary) — shader binds this, never contends with ORT
+  wgpu::Buffer _readBuffer;
   size_t _outputElements = 0;
 
   // Input/output names (cached from model metadata)
@@ -90,7 +100,7 @@ private:
   std::atomic<bool> _hasNewFrame{false};
 
   // Frame handoff: processFrame writes, inference thread reads
-  wgpu::Texture _pendingTexture;
+  IOSurfaceRef _pendingIOSurface = nullptr;
   std::mutex _frameMutex;
 
   ModelSpec _spec;

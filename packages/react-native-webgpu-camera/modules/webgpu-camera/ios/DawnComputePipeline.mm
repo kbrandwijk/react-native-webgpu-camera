@@ -185,7 +185,17 @@ struct DawnComputePipeline::Impl {
         break;
 
       case InputBindingType::StorageBufferRead:
-        if (ib.resourceHandle >= 0 && (size_t)ib.resourceHandle < uploadedResources.size()
+        if (ib.modelOutput >= 0 && (size_t)ib.modelOutput < models.size()) {
+          // Model output buffer — only bind when result is available
+          if (models[ib.modelOutput]->hasResult()) {
+            auto buf = models[ib.modelOutput]->getOutputBuffer();
+            if (buf) {
+              entry.buffer = buf;
+              entry.size = buf.GetSize();
+              entries.push_back(entry);
+            }
+          }
+        } else if (ib.resourceHandle >= 0 && (size_t)ib.resourceHandle < uploadedResources.size()
             && uploadedResources[ib.resourceHandle].buffer) {
           entry.buffer = uploadedResources[ib.resourceHandle].buffer;
           entry.size = uploadedResources[ib.resourceHandle].buffer.GetSize();
@@ -1248,6 +1258,12 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
     ctx.getWGPUInstance().ProcessEvents();
   }
 
+  static int pfLog = 0;
+  if (pfLog < 20 && !impl->models.empty()) {
+    NSLog(@"[DawnPipeline] processFrame compute path entered (frame %d)", pfLog);
+    pfLog++;
+  }
+
   double tAfterBindGroup = tAfterImport; // updated after loop
 
   auto encoder = device.CreateCommandEncoder();
@@ -1364,11 +1380,11 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
       bindGroup = device.CreateBindGroup(&bgDesc);
 
       static int dynLogCount = 0;
-      if (dynLogCount < 3) {
-        NSLog(@"[DawnPipeline] Dynamic pass %zu: %zu entries, bindGroup=%s, depthView=%s",
+      if (dynLogCount < 5) {
+        NSLog(@"[DawnPipeline] Dynamic pass %zu: %zu entries, bindGroup=%s, modelHasResult=%d",
               i, entries.size(),
               bindGroup ? "OK" : "FAILED",
-              impl->depthView ? "OK" : "nil");
+              !impl->models.empty() ? impl->models[0]->hasResult() : -1);
         dynLogCount++;
       }
 
@@ -1433,8 +1449,10 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   if (!impl->models.empty()) {
     bool finalIsA = (impl->passes.size() % 2 != 0);
     wgpu::Texture& currentOutput = finalIsA ? impl->texA : impl->texB;
+    // Pass IOSurface so model runner can import it on its own device
+    IOSurfaceRef ioSurfaceForModel = CVPixelBufferGetIOSurface(pixelBuffer);
     for (auto& model : impl->models) {
-      model->submitFrame(currentOutput);
+      model->submitFrame(currentOutput, ioSurfaceForModel);
     }
   }
 

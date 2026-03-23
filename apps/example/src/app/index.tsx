@@ -56,8 +56,8 @@ type ShaderMode =
   | { name: string; type: 'depth-model' }
   | { name: string; type: 'hdr-lut' };
 
-const DEPTH_MODEL_URL = 'https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx';
-const DEPTH_MODEL_PATH = `${Paths.document.uri}/depth-anything-v2-small.onnx`;
+const DEPTH_MODEL_URL = 'https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model_q4.onnx';
+const DEPTH_MODEL_PATH = `${Paths.document.uri}/depth-anything-v2-small-q4.onnx`;
 
 const SHADERS: ShaderMode[] = [
   { name: 'Depth Model', type: 'depth-model' },
@@ -393,7 +393,7 @@ function DepthPreview({ format, colorSpace }: { format?: CameraFormat; colorSpac
 }
 
 function DepthModelPreview({ format, colorSpace, modelPath }: { format?: CameraFormat; colorSpace?: ColorSpace; modelPath: string }) {
-  const { width: screenW, height: screenH } = useWindowDimensions();
+  const canvasRef = useRef<WebGPUCanvasRef>(null);
 
   const camera = useCamera({
     device: 'back',
@@ -408,7 +408,8 @@ function DepthModelPreview({ format, colorSpace, modelPath }: { format?: CameraF
     [modelPath],
   );
 
-  const { currentFrame, fps, displayFps, metrics, error } = useGPUFrameProcessor(camera, {
+  const { fps, displayFps, metrics, error } = useGPUFrameProcessor(camera, {
+    canvasRef,
     resources: { depth: depthResource },
     pipeline: (frame, res: any) => {
       'worklet';
@@ -428,10 +429,14 @@ function DepthModelPreview({ format, colorSpace, modelPath }: { format?: CameraF
 
   return (
     <>
-      <Canvas style={StyleSheet.absoluteFill}>
-        <Fill color="black" />
-        <SkImage image={currentFrame} x={0} y={0} width={screenW} height={screenH} fit="cover" />
-      </Canvas>
+      <View style={{ flex: 1, backgroundColor: '#000', justifyContent: 'center', alignItems: 'center' }}>
+        <WebGPUCanvas ref={canvasRef} style={{
+          width: '100%',
+          aspectRatio: camera.height / camera.width,
+          borderWidth: 1,
+          borderColor: 'white',
+        }} />
+      </View>
 
       <View style={styles.statusBar}>
         <Text style={styles.statusText}>
