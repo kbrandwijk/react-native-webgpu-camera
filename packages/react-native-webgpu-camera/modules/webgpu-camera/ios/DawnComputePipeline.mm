@@ -1453,7 +1453,7 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
     if (surfaceInfo) {
       auto surfaceTex = surfaceInfo->getCurrentTexture();
       if (surfaceTex) {
-        // Always copy camera frame to surface
+        // Copy camera frame to surface
         wgpu::TexelCopyTextureInfo src{};
         src.texture = finalOutput;
         wgpu::TexelCopyTextureInfo dst{};
@@ -1464,25 +1464,12 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
           1
         };
         encoder.CopyTextureToTexture(&src, &dst, &extent);
-      }
-    }
-  }
 
-  // Submit compute + camera copy
-  auto commands = encoder.Finish();
-  device.GetQueue().Submit(1, &commands);
+        // Alpha-blend overlay on top (same encoder, same surface texture)
+        if (impl->overlayReady.load() && impl->overlayBlitPipeline) {
+          int front = impl->overlayFront.load();
+          wgpu::Texture& frontTex = (front == 0) ? impl->overlayTexA : impl->overlayTexB;
 
-  // Alpha-blend overlay (canvasTex) on top of camera frame, then present
-  if (_canvasContextId >= 0) {
-    auto& registry = rnwgpu::SurfaceRegistry::getInstance();
-    auto surfaceInfo = registry.getSurfaceInfo(_canvasContextId);
-    if (surfaceInfo) {
-      // Alpha-blend overlay (front buffer) on top of camera frame
-      if (impl->overlayReady.load() && impl->overlayBlitPipeline) {
-        int front = impl->overlayFront.load();
-        wgpu::Texture& frontTex = (front == 0) ? impl->overlayTexA : impl->overlayTexB;
-        auto surfaceTex = surfaceInfo->getCurrentTexture();
-        if (surfaceTex) {
           wgpu::BindGroupEntry entries[2] = {};
           entries[0].binding = 0;
           entries[0].textureView = frontTex.CreateView();
@@ -1492,28 +1479,37 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
           bgDesc.layout = impl->overlayBlitPipeline.GetBindGroupLayout(0);
           bgDesc.entryCount = 2;
           bgDesc.entries = entries;
-          auto overlayBindGroup = device.CreateBindGroup(&bgDesc);
+          auto overlayBG = device.CreateBindGroup(&bgDesc);
 
           wgpu::RenderPassColorAttachment colorAttach{};
           colorAttach.view = surfaceTex.CreateView();
-          colorAttach.loadOp = wgpu::LoadOp::Load; // keep camera frame
+          colorAttach.loadOp = wgpu::LoadOp::Load;
           colorAttach.storeOp = wgpu::StoreOp::Store;
           wgpu::RenderPassDescriptor rpDesc{};
           rpDesc.colorAttachmentCount = 1;
           rpDesc.colorAttachments = &colorAttach;
 
-          auto blendEncoder = device.CreateCommandEncoder();
-          auto renderPass = blendEncoder.BeginRenderPass(&rpDesc);
+          auto renderPass = encoder.BeginRenderPass(&rpDesc);
           renderPass.SetPipeline(impl->overlayBlitPipeline);
-          renderPass.SetBindGroup(0, overlayBindGroup);
+          renderPass.SetBindGroup(0, overlayBG);
           renderPass.Draw(3);
           renderPass.End();
-
-          auto blendCmd = blendEncoder.Finish();
-          device.GetQueue().Submit(1, &blendCmd);
         }
       }
+    }
+  }
 
+  // Single submit: compute + camera copy + overlay blend
+  auto commands = encoder.Finish();
+  device.GetQueue().Submit(1, &commands);
+
+  double tAfterCompute = CACurrentMediaTime();
+
+  // Present
+  if (_canvasContextId >= 0) {
+    auto& registry = rnwgpu::SurfaceRegistry::getInstance();
+    auto surfaceInfo = registry.getSurfaceInfo(_canvasContextId);
+    if (surfaceInfo) {
       surfaceInfo->present();
     }
   }
@@ -1522,14 +1518,11 @@ bool DawnComputePipeline::processFrame(CVPixelBufferRef pixelBuffer) {
   if (!impl->models.empty()) {
     bool finalIsA = (impl->passes.size() % 2 != 0);
     wgpu::Texture& currentOutput = finalIsA ? impl->texA : impl->texB;
-    // Pass IOSurface so model runner can import it on its own device
     IOSurfaceRef ioSurfaceForModel = CVPixelBufferGetIOSurface(pixelBuffer);
     for (auto& model : impl->models) {
       model->submitFrame(currentOutput, ioSurfaceForModel);
     }
   }
-
-  double tAfterCompute = CACurrentMediaTime();
 
   // Copy output buffers to staging in a separate submission
   if (hasShaderBuffers) {
