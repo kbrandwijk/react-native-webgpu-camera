@@ -48,11 +48,11 @@ struct Params {
 fn main(@builtin(global_invocation_id) id: vec3u) {
   if (id.x >= params.modelW || id.y >= params.modelH) { return; }
 
-  // Letterbox: fit rotated source into model input, preserving aspect ratio.
-  // Raw IOSurface is landscape (inputW × inputH). After 90° CW rotation → portrait.
-  // Portrait dims: width = inputH (1080), height = inputW (1920).
-  let srcW = f32(params.inputH);  // portrait width = landscape height
-  let srcH = f32(params.inputW);  // portrait height = landscape width
+  // Letterbox: fit portrait source into model input, preserving aspect ratio.
+  // inputW/inputH are already portrait dims (set from _cameraW/_cameraH after rotation).
+  // inputW = 1080 (portrait width), inputH = 1920 (portrait height).
+  let srcW = f32(params.inputW);  // portrait width (1080)
+  let srcH = f32(params.inputH);  // portrait height (1920)
   let dstW = f32(params.modelW);
   let dstH = f32(params.modelH);
 
@@ -486,6 +486,7 @@ void ModelRunner::runResizeShader(IOSurfaceRef ioSurface) {
   // End shared access
   wgpu::SharedTextureMemoryEndAccessState endState{};
   sharedMemory.EndAccess(inputTexture, &endState);
+
 }
 
 // ── GPU-native inference via IO binding ──

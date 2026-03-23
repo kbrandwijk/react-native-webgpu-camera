@@ -481,7 +481,10 @@ function YoloPreview({ format, colorSpace, modelPath }: { format?: CameraFormat;
   });
 
   const yoloResource = useMemo(
-    () => GPUResource.model(modelPath, { inputShape: [1, 3, 1280, 736] }),  // NCHW: H=1280, W=736 (portrait)
+    () => GPUResource.model(modelPath, {
+      inputShape: [1, 3, 1280, 736],
+      normalization: { mean: [0, 0, 0], std: [1, 1, 1] },  // YOLO expects 0-1, not ImageNet
+    }),
     [modelPath],
   );
 
@@ -535,7 +538,6 @@ function YoloPreview({ format, colorSpace, modelPath }: { format?: CameraFormat;
 
         // Parse NMS model output: [300, 6] = [x1, y1, x2, y2, confidence, classId]
         if (detections && detections !== cachedBoxes.lastData) {
-          console.log(`[YOLO] frame=${frame.width}x${frame.height}`);
           cachedBoxes.lastData = detections;
           cachedBoxes.count = 0;
           const CONF_THRESHOLD = 0.25;
